@@ -183,8 +183,11 @@ NEAR_VISUALS = ("mesh", "terrain", "detail", "photoreal")
 # photoreal (personal fork, 2026-10-23): the mesh layout with the near levels' tiles replaced by Google's
 # Photorealistic 3D Tiles (photoreal.py), render only: the physics stays the graded block, compute sharing is off.
 MESH_LAYOUT = ("mesh", "detail", "photoreal")
-PHOTOREAL_MAX_LEVEL = int(os.environ.get("BNGE_PHOTOREAL_LEVEL", "0"))     # photogrammetry on the levels up to this
-PHOTOREAL_TEX_PX = int(os.environ.get("BNGE_PHOTOREAL_TEX", "2048"))      # its atlas per tile at most this
+# photogrammetry on the levels up to this (L-2: 64 m within 150 m, L-1: 128 m within 400 m)
+PHOTOREAL_MAX_LEVEL = int(os.environ.get("BNGE_PHOTOREAL_LEVEL", "-1"))
+# its atlas per tile at most this on the finest level, halved per level above (2026-10-23, Felix's PC: 2048 on every
+# level <= 0 ran the GPU out of video memory; the DEM tiles' own textures are 256)
+PHOTOREAL_TEX_PX = int(os.environ.get("BNGE_PHOTOREAL_TEX", "1024"))
 # the tiles' geometric error asked per m of tile edge: 1 m on the 64 m L-2 (32 cells). Coarser when its vertices do not
 # fit one shape (Munich, 2026-10-23: 70 100 vertices at 1 m on a 128 m tile, 21 474 at 8 m; a 64 m one fits at 1 m)
 PHOTOREAL_ERR_PER_M = 1.0 / 64.0
@@ -2009,7 +2012,7 @@ class Server:
                                                tile.size * PHOTOREAL_ERR_PER_M, farfield.VERTS_MAX)
             if mesh is None:
                 return None
-            rgb, uv = mesh.atlas(PHOTOREAL_TEX_PX)
+            rgb, uv = mesh.atlas(max(256, PHOTOREAL_TEX_PX >> max(0, tile.level - self.min_level)))
         except (photorealmod.PhotorealError, OSError, ValueError) as e:
             log.debug("photoreal: tile %s: %s", tile.key, e)
             return None
