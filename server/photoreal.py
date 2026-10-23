@@ -419,6 +419,7 @@ class Photoreal:
         self._root = None
         self._params = {}               # query parameters every request carries (key, session)
         self._json = {}                 # url path -> parsed subtree
+        self._file_locks = {}           # cache path -> Lock (one fetch / write per file)
         self.fetched = self.cached = 0
 
     # urls
@@ -441,26 +442,42 @@ class Photoreal:
         return url.split("?")[0], q
 
     def _get(self, url):
-        """Bytes of url (absolute, with its own query), from the disk cache when there."""
+        """Bytes of url (absolute, with its own query), from the disk cache when there. One fetch per file at a time:
+        parallel tiles share contents, and on Windows two threads replacing (or one reading while another replaces)
+        the same cache file fail with PermissionError (Felix's PC, 2026-10-24: 16 tiles fell back to the DEM)."""
         parts = urllib.parse.urlsplit(url)
         name = hashlib.sha1(parts.path.encode()).hexdigest()
         path = os.path.join(self.cache_dir, name[:2], name)
-        if os.path.exists(path):
-            with self._lock:
-                self.cached += 1
-            with open(path, "rb") as f:
-                return f.read()
-        q = dict(urllib.parse.parse_qsl(parts.query))
-        q.update({k: v for k, v in self._params.items() if k not in q})
-        data = self._open(urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(q))))
         with self._lock:
-            self.fetched += 1
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        tmp = path + ".tmp%d" % threading.get_ident()
-        with open(tmp, "wb") as f:
-            f.write(data)
-        os.replace(tmp, path)
-        return data
+            flock = self._file_locks.setdefault(path, threading.Lock())
+        with flock:
+            if os.path.exists(path):
+                try:
+                    with open(path, "rb") as f:
+                        data = f.read()
+                    with self._lock:
+                        self.cached += 1
+                    return data
+                except OSError:         # being replaced by another process (two servers): fetch it again
+                    pass
+            q = dict(urllib.parse.parse_qsl(parts.query))
+            q.update({k: v for k, v in self._params.items() if k not in q})
+            data = self._open(urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(q))))
+            with self._lock:
+                self.fetched += 1
+            try:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                tmp = path + ".tmp%d" % threading.get_ident()
+                with open(tmp, "wb") as f:
+                    f.write(data)
+                os.replace(tmp, path)
+            except OSError as e:        # the cache is only a cache: the bytes are in hand
+                log.debug("photoreal: cache write %s: %s", path, e)
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+            return data
 
     def root(self):
         with self._lock:
