@@ -376,6 +376,18 @@ def _overlaps(a, b):
     return a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
 
 
+def _urlopen(url):
+    import ssl
+    try:
+        return urllib.request.urlopen(url, timeout=TIMEOUT_S).read()
+    except urllib.error.URLError as e:
+        if not isinstance(e.reason, ssl.SSLCertVerificationError):
+            raise
+        import certifi     # the packaged app's CA certificates where the system has none it finds (launcher.py)
+        ctx = ssl.create_default_context(cafile=certifi.where())
+        return urllib.request.urlopen(url, timeout=TIMEOUT_S, context=ctx).read()
+
+
 class Photoreal:
     """The tileset, fetched lazily, its subtrees and contents cached on disk (by URL path, without key/session)."""
 
@@ -385,7 +397,7 @@ class Photoreal:
         # neither: Cesium ion without a token of ours (a proxy that adds the Authorization header, the cloud sessions)
         self.cache_dir = os.path.join(cache_dir, "photoreal")
         os.makedirs(self.cache_dir, exist_ok=True)
-        self._open = opener or (lambda url: urllib.request.urlopen(url, timeout=TIMEOUT_S).read())
+        self._open = opener or _urlopen
         self._lock = threading.Lock()
         self._root = None
         self._params = {}               # query parameters every request carries (key, session)
@@ -522,3 +534,33 @@ def ground_offset(mesh, box, drive_u, step=2.0, pct=10.0):
     # mesh above ground (roofs, canopies) makes d more negative: the open ground is the upper part of d
     cut = np.percentile(d, 100.0 - pct)
     return float(np.median(d[d >= cut - 1.0]))
+
+
+# --- the near tiles (earthd --near-visual photoreal) ----------------------------------------------------------------
+
+def normals(positions, tris):
+    """Area-weighted vertex normals (n, 3), unit length (straight up where a vertex has no area)."""
+    V = positions[tris]
+    fn = np.cross(V[:, 1] - V[:, 0], V[:, 2] - V[:, 0])
+    out = np.zeros_like(positions)
+    for k in range(3):
+        np.add.at(out, tris[:, k], fn)
+    ln = np.linalg.norm(out, axis=1)
+    out[ln == 0] = (0.0, 0.0, 1.0)
+    ln[ln == 0] = 1.0
+    return out / ln[:, None]
+
+
+def tile_mesh(pr, frame, box, offset, target_err, verts_max=65535, coarsest=64.0):
+    """(Mesh shifted up by offset, the geometric error used) over box, the finest from target_err (doubled) whose
+    vertices fit one 16-bit-index shape; (None, err) where the tileset has nothing there or nothing fits."""
+    err = target_err
+    while err <= coarsest:
+        m = pr.mesh(frame, box, err)
+        if m is None:
+            return None, err
+        if len(m.positions) <= verts_max:
+            m.positions = m.positions + (0.0, 0.0, offset)
+            return m, err
+        err *= 2.0
+    return None, err / 2.0

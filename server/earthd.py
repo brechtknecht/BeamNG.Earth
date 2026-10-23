@@ -102,6 +102,7 @@ import pacer  # noqa: E402
 import peerwork as peerworkmod  # noqa: E402
 import deshadow as deshadowmod  # noqa: E402
 import farfield  # noqa: E402
+import photoreal as photorealmod  # noqa: E402
 import terraincache  # noqa: E402
 import terrainpatch as terrainpatchmod  # noqa: E402
 import geodesy  # noqa: E402
@@ -170,14 +171,24 @@ def resolve_cells(cells, near_visual):
     """The --cells value to use: the given one, else 64 in mesh mode and 32 in terrain mode."""
     if cells is not None:
         return cells
+    if near_visual == "photoreal":      # its finest tiles 64 m: a city's photogrammetry fits one 16-bit shape
+        return 32
     return CLI_CELLS_MESH if near_visual in MESH_LAYOUT else 32
 SERVER_VERSION = netfetch.SERVER_VERSION      # one place: the User-Agent carries it too
-NEAR_VISUALS = ("mesh", "terrain", "detail")
+NEAR_VISUALS = ("mesh", "terrain", "detail", "photoreal")
 # detail (2026-10-12, docs/research/2026-10-12-engine-limits-and-worldgen.md §6-7): the mesh layout
 # (64 cells, the 512² block, the horizon) with the physics block drawn as the near ground: aerial photo
 # as its base colour, the surface materials' own detail textures; far tiles under it are hidden or sunk
 # as in terrain mode. MESH_LAYOUT: the modes on the mesh-mode tile layout; BLOCK_DRAWN: the block is seen.
-MESH_LAYOUT = ("mesh", "detail")
+# photoreal (personal fork, 2026-10-23): the mesh layout with the near levels' tiles replaced by Google's
+# Photorealistic 3D Tiles (photoreal.py), render only: the physics stays the graded block, compute sharing is off.
+MESH_LAYOUT = ("mesh", "detail", "photoreal")
+PHOTOREAL_MAX_LEVEL = int(os.environ.get("BNGE_PHOTOREAL_LEVEL", "0"))     # photogrammetry on the levels up to this
+PHOTOREAL_TEX_PX = int(os.environ.get("BNGE_PHOTOREAL_TEX", "2048"))      # its atlas per tile at most this
+# the tiles' geometric error asked per m of tile edge: 1 m on the 64 m L-2 (32 cells). Coarser when its vertices do not
+# fit one shape (Munich, 2026-10-23: 70 100 vertices at 1 m on a 128 m tile, 21 474 at 8 m; a 64 m one fits at 1 m)
+PHOTOREAL_ERR_PER_M = 1.0 / 64.0
+PHOTOREAL_OFFSET_R = 128.0              # m: the geoid offset is measured over this half side around the anchor
 BLOCK_DRAWN = ("terrain", "detail")
 TUNNEL_FLOOR_UNDER_M = 2.0     # a tunnel floor this far under the ground at a teleport's origin: the car goes on the floor
 SEA_CHECK_S = 15.0          # sea (--sea on): the water tiles planned again when the player enters another
@@ -537,7 +548,7 @@ class Server:
         # mesh: the TerrainBlock is physics only, the ground is drawn by the finest tiles (§B)
         self.near_visual = near_visual
         # the near tiles' asphalt layer (mesh mode: the tiles are the ground seen; surface.road_mask)
-        self.road_masks = roadsmod.ROADS_IN_GROUND and near_visual not in BLOCK_DRAWN
+        self.road_masks = roadsmod.ROADS_IN_GROUND and near_visual not in BLOCK_DRAWN and near_visual != "photoreal"
         if tex is None and cells == 32:
             tex = (tex_near, tex_near, tex_far)         # the v1.3.1 rule: the two finest levels are near
         # Every layout-dependent rule reads self.layout (terrain mode: frozen at 32 cells)
@@ -588,6 +599,10 @@ class Server:
                                            deshadow=self.deshadow, colormatch=self.colormatch, fetcher=self.net,
                                            leaf_on=leaf_on, season_mode=season_mode)
                         if imagery else None)
+        # --near-visual photoreal: the tileset (photoreal.py), the geoid offset per anchor id (measured once)
+        self.photoreal = photorealmod.Photoreal(cache_dir) if near_visual == "photoreal" else None
+        self.photoreal_offsets = {}
+        self.photoreal_lock = threading.Lock()
         self.imagery_failures = 0           # tiles that fell back to the palette (network trouble)
         self.imagery_worker = 0             # far textures the far-tile processes rendered (blockworker.far_tile)
         self.base_worker = 0                # base photos the block processes rendered (blockworker.base_photo)
@@ -1905,7 +1920,17 @@ class Server:
         tex_bytes = 0
         ck = (anchor.id, tile.key)
         pending = set() if self.colormatch is not None or self.deshadow is not None else None
-        if done is not None:
+        photo = self.photoreal_tile(anchor, tile, built) if self.photoreal is not None and lvl <= PHOTOREAL_MAX_LEVEL \
+            else None
+        if photo is not None:
+            built, rgb = photo
+            texture = self.texture_name(anchor.id, tile.key, self.tex_rev.get(ck, 0))
+            tex_bytes = imagerymod.write_dds(os.path.join(self.out_dir, texture), rgb)
+            material = self.matslots.take(ck)
+            self.degraded.discard(ck)
+            pending = None
+            done = None
+        elif done is not None:
             texture, tex_bytes, used = done
             material = self.matslots.take(ck)
             self.degraded.discard(ck)
@@ -1932,7 +1957,7 @@ class Server:
                                 tile.key, anchor.id, e, self.imagery_failures)
         t2 = time.perf_counter()
         size = farfield.write_built(path, built, self.far_format, material or farfield.MATERIAL,
-                                    textured=material is not None, tex_px=self.tex_size(lvl))
+                                    textured=material is not None, tex_px=None if photo is not None else self.tex_size(lvl))
         dt = time.perf_counter() - t0
         self.build_stats.append(dt)
         self.level_stats.setdefault(lvl, deque(maxlen=200)).append((dt - (t2 - t1), t2 - t1, size, tex_bytes))
@@ -1949,6 +1974,50 @@ class Server:
             info.rev = self.tex_rev.get((anchor.id, tile.key), 0)
             info.cm_pending = frozenset(pending or ())
         return info
+
+    def photoreal_offset(self, anchor):
+        """m to raise the photogrammetry by at anchor (photoreal.ground_offset over PHOTOREAL_OFFSET_R around its
+        origin, measured once; the geoid undulation varies by centimetres over a few km), None if it has none."""
+        with self.photoreal_lock:
+            if anchor.id in self.photoreal_offsets:
+                return self.photoreal_offsets[anchor.id]
+            r, step = PHOTOREAL_OFFSET_R, 2.0
+            box = (-r, -r, r, r)
+            off = None
+            try:
+                mesh = self.photoreal.mesh(anchor.frame, box, 4.0)
+                if mesh is not None:
+                    cs = -r + (np.arange(int(2 * r / step)) + 0.5) * step
+                    la, lo, _ = anchor.frame.enu_to_geodetic(*np.meshgrid(cs, cs), 0.0)
+                    la, lo = np.asarray(la), np.asarray(lo)
+                    u = np.asarray(anchor.frame.geodetic_to_enu(la, lo, self.dem.sample(la, lo, anchor.hm_zoom))[2])
+                    off = photorealmod.ground_offset(mesh, box, u, step)
+            except (photorealmod.PhotorealError, OSError, ValueError) as e:
+                log.warning("photoreal: anchor %d: no offset (%s): the DEM tiles stay", anchor.id, e)
+            log.info("photoreal: anchor %d: geoid offset %s", anchor.id, "none" if off is None else f"{off:+.2f} m")
+            self.photoreal_offsets[anchor.id] = off
+            return off
+
+    def photoreal_tile(self, anchor, tile, built):
+        """(built with the photogrammetry's triangles over tile, its atlas rgb) or None (no coverage, too many
+        vertices, a network error: the DEM tile and its imagery stay). The grid / sink / skirt stay the DEM's."""
+        off = self.photoreal_offset(anchor)
+        if off is None:
+            return None
+        try:
+            mesh, err = photorealmod.tile_mesh(self.photoreal, anchor.frame, tile.bbox, off,
+                                               tile.size * PHOTOREAL_ERR_PER_M, farfield.VERTS_MAX)
+            if mesh is None:
+                return None
+            rgb, uv = mesh.atlas(PHOTOREAL_TEX_PX)
+        except (photorealmod.PhotorealError, OSError, ValueError) as e:
+            log.debug("photoreal: tile %s: %s", tile.key, e)
+            return None
+        pos = np.asarray(built.pos, np.float64)
+        P = mesh.positions - pos
+        tris = mesh.tris.astype(np.int64)
+        return replace(built, positions=P, normals=photorealmod.normals(mesh.positions, tris),
+                       uvs=np.zeros((len(P), 2)), planar=uv, tris=tris), rgb
 
     def rock_faces(self, anchor, tile, px, rgb, grid):
         """The far tile's photo with its steep ground drawn as rock (rockface.py: cliffs were the photo's top
@@ -3812,7 +3881,7 @@ async def main_async(args):
                       args.grading == "on" and args.roads == "on",
                       args.road_widths == "on" and args.roads == "on", False, ctx.Queue(maxsize=1),
                       logging.getLogger().level, args.airports == "on", args.sea == "on", NICE_FAR))
-    if far_pool is not None:
+    if far_pool is not None and args.near_visual != "photoreal":
         # compute sharing: far tiles to helpers (--peers) and, in a BeamMP group, split with the players on our anchor,
         # built with the same settings as these workers (peerwork.py)
         far_pool = peerworkmod.SharedFarPool(
@@ -4062,7 +4131,9 @@ def main():
                     help="mesh: the ground near the player is drawn by 64/128 m tiles and the terrain block is "
                          "physics only (default); terrain: the v1.2 look (the terrain block is drawn); detail: the "
                          "mesh layout with the physics block drawn as the near ground (aerial photo base colour, "
-                         "surface detail textures)")
+                         "surface detail textures); photoreal (personal fork): mesh mode with Google's "
+                         "Photorealistic 3D Tiles as the near tiles (32 cells, render only, compute sharing off; "
+                         "CESIUM_ION_TOKEN or GOOGLE_MAPS_API_KEY)")
     ap.add_argument("--cells", type=int, choices=farfield.CELL_COUNTS, default=None,
                     help="tile cells per edge: 64 = docs/V1_4_SPEC.md M1 (FORMAT 4, exact level L-1; the "
                          "default in mesh mode), 32 = the v1.3.1 layout (FORMAT 3; terrain mode always)")
