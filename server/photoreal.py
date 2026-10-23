@@ -1,7 +1,7 @@
 """Photorealistic ground: Google's Photorealistic 3D Tiles as the render-only near ground (personal fork spike,
 2026-10-23). The physics stays the TerrainBlock; this module only fetches, decodes and places the photogrammetry.
 
-    pr = Photoreal(cache_dir)                       # key: GOOGLE_MAPS_API_KEY, or CESIUM_ION_TOKEN (asset 2275207)
+    pr = Photoreal(cache_dir)                       # GOOGLE_MAPS_API_KEY, or CESIUM_ION_TOKEN (asset 2275207), or none: ion through an authenticating proxy
     mesh = pr.mesh(frame, (x0, y0, x1, y1), target_err=1.0)   # Mesh in frame's ENU metres, or None
     mesh.chunks(VERTS_MAX)                          # pieces a 16-bit-index shape can hold
     mesh.atlas(4096)                                # one RGB image for all its source textures, UVs remapped
@@ -27,6 +27,7 @@ import logging
 import os
 import struct
 import threading
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -36,7 +37,7 @@ log = logging.getLogger("earthd.photoreal")
 
 GOOGLE_ROOT = "https://tile.googleapis.com/v1/3dtiles/root.json"
 ION_ASSET = 2275207                 # Cesium ion's "Google Photorealistic 3D Tiles" asset (EEA accounts: no direct API)
-ION_ENDPOINT = "https://api.cesium.com/v1/assets/{}/endpoint?access_token={}"
+ION_ENDPOINT = "https://api.cesium.com/v1/assets/{}/endpoint"
 TIMEOUT_S = 30
 MAX_DEPTH = 40
 # glTF is y-up; 3D Tiles' content frame is z-up (3D Tiles spec, "glTF transforms")
@@ -381,8 +382,7 @@ class Photoreal:
     def __init__(self, cache_dir, key=None, ion_token=None, opener=None):
         self.key = key or os.environ.get("GOOGLE_MAPS_API_KEY")
         self.ion_token = ion_token or os.environ.get("CESIUM_ION_TOKEN")
-        if not self.key and not self.ion_token:
-            raise PhotorealError("set GOOGLE_MAPS_API_KEY or CESIUM_ION_TOKEN")
+        # neither: Cesium ion without a token of ours (a proxy that adds the Authorization header, the cloud sessions)
         self.cache_dir = os.path.join(cache_dir, "photoreal")
         os.makedirs(self.cache_dir, exist_ok=True)
         self._open = opener or (lambda url: urllib.request.urlopen(url, timeout=TIMEOUT_S).read())
@@ -396,7 +396,14 @@ class Photoreal:
     def _root_url(self):
         if self.key:
             return GOOGLE_ROOT, {"key": self.key}
-        ep = json.loads(self._open(ION_ENDPOINT.format(ION_ASSET, self.ion_token)))
+        url = ION_ENDPOINT.format(ION_ASSET)
+        if self.ion_token:
+            url += "?" + urllib.parse.urlencode({"access_token": self.ion_token})
+        try:
+            ep = json.loads(self._open(url))
+        except urllib.error.HTTPError as e:
+            raise PhotorealError(f"Cesium ion: {e.code} {e.read()[:200]!r} (CESIUM_ION_TOKEN, scope assets:read, "
+                                 f"asset {ION_ASSET} in My Assets)") from e
         opts = ep.get("options", {})
         url = opts.get("url") or ep.get("url")
         q = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query))
