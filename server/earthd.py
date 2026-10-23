@@ -605,6 +605,7 @@ class Server:
         # --near-visual photoreal: the tileset (photoreal.py), the geoid offset per anchor id (measured once)
         self.photoreal = photorealmod.Photoreal(cache_dir) if near_visual == "photoreal" else None
         self.photoreal_offsets = {}
+        self.photoreal_errs = {}            # level -> the geometric error its last photoreal tile fitted at
         self.photoreal_lock = threading.Lock()
         self.imagery_failures = 0           # tiles that fell back to the palette (network trouble)
         self.imagery_worker = 0             # far textures the far-tile processes rendered (blockworker.far_tile)
@@ -2011,7 +2012,10 @@ class Server:
         n0 = self.photoreal.fetched
         try:
             mesh, err = photorealmod.tile_mesh(self.photoreal, anchor.frame, tile.bbox, off,
-                                               tile.size * PHOTOREAL_ERR_PER_M, farfield.VERTS_MAX)
+                                               tile.size * PHOTOREAL_ERR_PER_M, farfield.VERTS_MAX,
+                                               start_err=self.photoreal_errs.get(tile.level))
+            if mesh is not None:
+                self.photoreal_errs[tile.level] = err
             if mesh is None:
                 log.info("photoreal: tile %s: no photogrammetry that fits (error up to %g m), the DEM tile stays",
                          tile.key, err)

@@ -39,6 +39,9 @@ GOOGLE_ROOT = "https://tile.googleapis.com/v1/3dtiles/root.json"
 ION_ASSET = 2275207                 # Cesium ion's "Google Photorealistic 3D Tiles" asset (EEA accounts: no direct API)
 ION_ENDPOINT = "https://api.cesium.com/v1/assets/{}/endpoint"
 TIMEOUT_S = 30
+# requests at once (one tileset level's subtrees, one box's contents): one at a time a 64 m tile was ~90 requests and
+# ~20 s (2026-10-23, Felix: "in mapng we loaded the tiles much faster": the browser fetched in parallel)
+FETCH_THREADS = int(os.environ.get("BNGE_PHOTOREAL_FETCH", "16"))
 MAX_DEPTH = 40
 # glTF is y-up; 3D Tiles' content frame is z-up (3D Tiles spec, "glTF transforms")
 Y_UP_TO_Z_UP = np.array([[1, 0, 0, 0], [0, 0, -1, 0], [0, 1, 0, 0], [0, 0, 0, 1]], np.float64)
@@ -50,6 +53,20 @@ NCOMP = {"SCALAR": 1, "VEC2": 2, "VEC3": 3, "VEC4": 4, "MAT4": 16}
 
 class PhotorealError(IOError):
     pass
+
+
+_pool = None
+_pool_lock = threading.Lock()
+
+
+def _fetch_pool():
+    """The module's fetch threads (shared by every Photoreal: the server's tile workers all fetch through it)."""
+    global _pool
+    with _pool_lock:
+        if _pool is None:
+            from concurrent.futures import ThreadPoolExecutor
+            _pool = ThreadPoolExecutor(FETCH_THREADS, thread_name_prefix="photoreal-fetch")
+        return _pool
 
 
 # --- geometry -----------------------------------------------------------------------------------------------------
@@ -429,13 +446,15 @@ class Photoreal:
         name = hashlib.sha1(parts.path.encode()).hexdigest()
         path = os.path.join(self.cache_dir, name[:2], name)
         if os.path.exists(path):
-            self.cached += 1
+            with self._lock:
+                self.cached += 1
             with open(path, "rb") as f:
                 return f.read()
         q = dict(urllib.parse.parse_qsl(parts.query))
         q.update({k: v for k, v in self._params.items() if k not in q})
         data = self._open(urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(q))))
-        self.fetched += 1
+        with self._lock:
+            self.fetched += 1
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = path + ".tmp%d" % threading.get_ident()
         with open(tmp, "wb") as f:
@@ -470,13 +489,20 @@ class Photoreal:
         return ts
 
     def contents(self, frame, box, target_err):
-        """[(glb url, 4x4 transform)] of the nodes that cover box at target_err (REPLACE refinement)."""
+        """[(glb url, 4x4 transform)] of the nodes that cover box at target_err (REPLACE refinement). The tree is
+        walked a subtree level at a time, each level's subtree files fetched at once."""
         url, ts = self.root()
         out = []
-        self._walk(ts["root"], url, np.eye(4), frame, box, target_err, out, 0)
+        frontier = [(ts["root"], url, np.eye(4), 0)]
+        while frontier:
+            subs = []           # (subtree url, transform, depth) to fetch for the next level
+            for node, base, T, depth in frontier:
+                self._walk(node, base, T, frame, box, target_err, out, depth, subs)
+            got = list(_fetch_pool().map(lambda sub: self._subtree(sub[0]), subs)) if subs else []
+            frontier = [(g["root"], u, T, d + 1) for g, (u, T, d) in zip(got, subs)]
         return out
 
-    def _walk(self, node, base, parent_T, frame, box, target_err, out, depth):
+    def _walk(self, node, base, parent_T, frame, box, target_err, out, depth, subs):
         if depth > MAX_DEPTH:
             return
         T = parent_T @ (np.array(node["transform"], np.float64).reshape(4, 4).T if "transform" in node else np.eye(4))
@@ -492,30 +518,27 @@ class Photoreal:
         uri = content and (content.get("uri") or content.get("url"))
         children = node.get("children") or []
         if uri is not None and uri.split("?")[0].endswith(".json"):
-            sub_url = self._child_url(base, uri)
-            sub = self._subtree(sub_url)
-            self._walk(sub["root"], sub_url, T, frame, box, target_err, out, depth + 1)
+            subs.append((self._child_url(base, uri), T, depth))
             return
         fine_enough = node.get("geometricError", 0.0) <= target_err
         if uri is not None and (fine_enough or not children):
             out.append((self._child_url(base, uri), T))
             return
         for c in children:
-            self._walk(c, base, T, frame, box, target_err, out, depth + 1)
+            self._walk(c, base, T, frame, box, target_err, out, depth + 1, subs)
 
     def mesh(self, frame, box, target_err=1.0, margin=0.0):
         """Mesh of the photogrammetry over box (ENU of frame), clipped to it, or None (no coverage)."""
         x0, y0, x1, y1 = box
         q = (x0 - margin, y0 - margin, x1 + margin, y1 + margin)
-        parts = []
-        for url, T in self.contents(frame, q, target_err):
-            m = decode_glb(self._get(url), T)
+        def part(c):
+            m = decode_glb(self._get(c[0]), c[1])
             if m is None:
-                continue
+                return None
             x, y, z = frame.ecef_to_enu(m.positions[:, 0], m.positions[:, 1], m.positions[:, 2])
             m.positions = np.stack([x, y, z], -1)
-            parts.append(m.clip(box))
-        return Mesh.concat(parts)
+            return m.clip(box)
+        return Mesh.concat(list(_fetch_pool().map(part, self.contents(frame, q, target_err))))
 
 
 # --- placing it on the drive ground -------------------------------------------------------------------------------
@@ -551,10 +574,11 @@ def normals(positions, tris):
     return out / ln[:, None]
 
 
-def tile_mesh(pr, frame, box, offset, target_err, verts_max=65535, coarsest=64.0):
+def tile_mesh(pr, frame, box, offset, target_err, verts_max=65535, coarsest=64.0, start_err=None):
     """(Mesh shifted up by offset, the geometric error used) over box, the finest from target_err (doubled) whose
-    vertices fit one 16-bit-index shape; (None, err) where the tileset has nothing there or nothing fits."""
-    err = target_err
+    vertices fit one 16-bit-index shape; (None, err) where the tileset has nothing there or nothing fits.
+    start_err: begin there instead (what fitted the last tile of this size: a finer try is a download thrown away)."""
+    err = max(target_err, start_err or 0.0)
     while err <= coarsest:
         m = pr.mesh(frame, box, err)
         if m is None:
