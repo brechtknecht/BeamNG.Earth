@@ -2007,15 +2007,22 @@ class Server:
         off = self.photoreal_offset(anchor)
         if off is None:
             return None
+        t0 = time.perf_counter()
+        n0 = self.photoreal.fetched
         try:
             mesh, err = photorealmod.tile_mesh(self.photoreal, anchor.frame, tile.bbox, off,
                                                tile.size * PHOTOREAL_ERR_PER_M, farfield.VERTS_MAX)
             if mesh is None:
+                log.info("photoreal: tile %s: no photogrammetry that fits (error up to %g m), the DEM tile stays",
+                         tile.key, err)
                 return None
             rgb, uv = mesh.atlas(max(256, PHOTOREAL_TEX_PX >> max(0, tile.level - self.min_level)))
-        except (photorealmod.PhotorealError, OSError, ValueError) as e:
-            log.debug("photoreal: tile %s: %s", tile.key, e)
+        except Exception as e:      # the DEM tile rather than none (the in-game test sees why in the log)
+            log.warning("photoreal: tile %s: %s: %s, the DEM tile stays", tile.key, type(e).__name__, e,
+                        exc_info=not isinstance(e, (photorealmod.PhotorealError, OSError)))
             return None
+        log.info("photoreal: tile %s: %d triangles at %g m, %dx%d px, %d fetched, %.1f s", tile.key, len(mesh.tris),
+                 err, rgb.shape[1], rgb.shape[0], self.photoreal.fetched - n0, time.perf_counter() - t0)
         pos = np.asarray(built.pos, np.float64)
         P = mesh.positions - pos
         tris = mesh.tris.astype(np.int64)
