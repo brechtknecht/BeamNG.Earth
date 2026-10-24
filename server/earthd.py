@@ -191,6 +191,13 @@ PHOTOREAL_TEX_PX = int(os.environ.get("BNGE_PHOTOREAL_TEX", "1024"))
 # the tiles' geometric error asked per m of tile edge: 1 m on the 64 m L-2 (32 cells). Coarser when its vertices do not
 # fit one shape (Munich, 2026-10-23: 70 100 vertices at 1 m on a 128 m tile, 21 474 at 8 m; a 64 m one fits at 1 m)
 PHOTOREAL_ERR_PER_M = 1.0 / 64.0
+# processes building the photoreal tiles (fetch, Draco, atlas, DDS): in the server's threads ~1.5 tiles were built at
+# once (the interpreter lock; Felix's log 2026-10-24: 4 tiles/s, outrun from ~100 km/h)
+PHOTOREAL_PROCS = int(os.environ.get("BNGE_PHOTOREAL_PROCS", "0")) or max(2, min(6, (os.cpu_count() or 4) // 2))
+PHOTOREAL_AHEAD_S = (2.0, 4.0, 6.0)     # photoreal tiles built ahead: around where the car is in this many seconds
+PHOTOREAL_AHEAD_MAX = 300.0             # m at most ahead
+PHOTOREAL_AHEAD_JOBS = 4                # ahead jobs queued at once (the tiles asked for come first)
+PHOTOREAL_LEAD_S = 3.0                  # the near tiles' build order: distance to the path this far ahead
 PHOTOREAL_OFFSET_R = 128.0              # m: the geoid offset is measured over this half side around the anchor
 BLOCK_DRAWN = ("terrain", "detail")
 TUNNEL_FLOOR_UNDER_M = 2.0     # a tunnel floor this far under the ground at a teleport's origin: the car goes on the floor
@@ -606,7 +613,10 @@ class Server:
         self.photoreal = photorealmod.Photoreal(cache_dir) if near_visual == "photoreal" else None
         self.photoreal_offsets = {}
         self.photoreal_errs = {}            # level -> the geometric error its last photoreal tile fitted at
+        self.photoreal_pool = None          # ProcessPoolExecutor (photoreal.build_tile), made on first use
+        self.photoreal_jobs = {}            # (anchor id, key) -> (future, texture file): asked for or built ahead
         self.photoreal_lock = threading.Lock()
+        self.photoreal_offset_lock = threading.Lock()   # (held for a measurement: never taken on the event loop)
         self.imagery_failures = 0           # tiles that fell back to the palette (network trouble)
         self.imagery_worker = 0             # far textures the far-tile processes rendered (blockworker.far_tile)
         self.base_worker = 0                # base photos the block processes rendered (blockworker.base_photo)
@@ -856,6 +866,8 @@ class Server:
             self.deshadow.prepare(lat, lon)         # the regions around it, in the background
         if self.colormatch is not None:
             self.colormatch.prepare(lat, lon)
+        if self.photoreal is not None:              # measured now, not when the first tile asks (after the block)
+            threading.Thread(target=self.photoreal_offset, args=(a,), name="photoreal-offset", daemon=True).start()
         self._next_anchor += 1
         return a
 
@@ -1108,7 +1120,8 @@ class Server:
                 blockworker.roads_tile, aid, anchor.lat, anchor.lon, anchor.zooms[0], tx, ty, self.out_dir,
                 self.vfs_dir, self.sidewalks, DETAIL_ROAD_LIFT if self.near_visual == "detail" else 0.0,
                 self.buildings, self.left_hand(anchor), self.mph(anchor), self.anchor_q(anchor)).result()
-            log.debug("road tile %d_%d: %.2f s (queue + build)", tx, ty, time.perf_counter() - t0)
+            (log.info if self.photoreal is not None else log.debug)(
+                "road tile %d_%d: %.2f s (queue + build)", tx, ty, time.perf_counter() - t0)
             return res
         cells = [self.mapdata.cell(k, layers=("roads",), kind="demand").layers.get("roads")
                  for k in roadsmod.cells_of_tile(anchor.frame, tx, ty)]
@@ -1891,6 +1904,7 @@ class Server:
         q = self.anchor_q(anchor) if lvl <= 0 else None
         ref_zoom = anchor.zooms[lvl - 1] if lvl > 0 else None
         path = os.path.join(self.out_dir, self.tile_name(anchor.id, tile.key))
+        job = self.photoreal_job(anchor, tile) if self.photoreal is not None and lvl <= PHOTOREAL_MAX_LEVEL else None
         g = self.grader_for(anchor) if lvl <= 0 and self.far_pool is None else None   # graded like the block
         base = self.airports.wrap(self.dem) if self.airports is not None else self.dem
         if self.sea is not None:
@@ -1924,12 +1938,9 @@ class Server:
         tex_bytes = 0
         ck = (anchor.id, tile.key)
         pending = set() if self.colormatch is not None or self.deshadow is not None else None
-        photo = self.photoreal_tile(anchor, tile, built) if self.photoreal is not None and lvl <= PHOTOREAL_MAX_LEVEL \
-            else None
+        photo = self.photoreal_tile(anchor, tile, built, job) if job is not None else None
         if photo is not None:
-            built, rgb = photo
-            texture = self.texture_name(anchor.id, tile.key, self.tex_rev.get(ck, 0))
-            tex_bytes = imagerymod.write_dds(os.path.join(self.out_dir, texture), rgb)
+            built, texture, tex_bytes = photo
             material = self.matslots.take(ck)
             self.degraded.discard(ck)
             pending = None
@@ -1982,7 +1993,7 @@ class Server:
     def photoreal_offset(self, anchor):
         """m to raise the photogrammetry by at anchor (photoreal.ground_offset over PHOTOREAL_OFFSET_R around its
         origin, measured once; the geoid undulation varies by centimetres over a few km), None if it has none."""
-        with self.photoreal_lock:
+        with self.photoreal_offset_lock:
             if anchor.id in self.photoreal_offsets:
                 return self.photoreal_offsets[anchor.id]
             r, step = PHOTOREAL_OFFSET_R, 2.0
@@ -2002,36 +2013,111 @@ class Server:
             self.photoreal_offsets[anchor.id] = off
             return off
 
-    def photoreal_tile(self, anchor, tile, built):
-        """(built with the photogrammetry's triangles over tile, its atlas rgb) or None (no coverage, too many
-        vertices, a network error: the DEM tile and its imagery stay). The grid / sink / skirt stay the DEM's."""
-        off = self.photoreal_offset(anchor)
+    def _photoreal_submit(self, *args):
+        with self.photoreal_lock:
+            for attempt in (0, 1):
+                if self.photoreal_pool is None:
+                    import multiprocessing
+                    self.photoreal_pool = concurrent.futures.ProcessPoolExecutor(
+                        PHOTOREAL_PROCS, mp_context=multiprocessing.get_context("spawn"),
+                        initializer=photorealmod.worker_init, initargs=(self.cache_dir, logging.getLogger().level))
+                try:
+                    return self.photoreal_pool.submit(photorealmod.build_tile, *args)
+                except concurrent.futures.process.BrokenProcessPool:
+                    log.warning("photoreal: its worker processes died: starting them again")
+                    self.photoreal_pool = None
+            raise RuntimeError("photoreal worker processes")
+
+    def photoreal_job(self, anchor, tile, ahead=False):
+        """(future of photoreal.build_tile, texture file) for the tile: the one built ahead, or a new one; None when
+        the anchor has no offset (no coverage, no token). ahead: never waits for the offset, never a second job."""
+        ck = (anchor.id, tile.key)
+        with self.photoreal_lock:
+            got = self.photoreal_jobs.get(ck)
+            if got is not None:
+                if ahead or not got[0].done() or got[0].exception() is None:
+                    return got
+        off = self.photoreal_offsets.get(anchor.id) if ahead else self.photoreal_offset(anchor)
         if off is None:
             return None
-        t0 = time.perf_counter()
-        n0 = self.photoreal.fetched
+        texture = self.texture_name(anchor.id, tile.key, self.tex_rev.get(ck, 0))
         try:
-            mesh, err = photorealmod.tile_mesh(self.photoreal, anchor.frame, tile.bbox, off,
-                                               tile.size * PHOTOREAL_ERR_PER_M, farfield.VERTS_MAX,
-                                               start_err=self.photoreal_errs.get(tile.level))
-            if mesh is not None:
-                self.photoreal_errs[tile.level] = err
-            if mesh is None:
-                log.info("photoreal: tile %s: no photogrammetry that fits (error up to %g m), the DEM tile stays",
-                         tile.key, err)
-                return None
-            rgb, uv = mesh.atlas(max(256, PHOTOREAL_TEX_PX >> max(0, tile.level - self.min_level)))
-        except Exception as e:      # the DEM tile rather than none (the in-game test sees why in the log)
-            log.warning("photoreal: tile %s: %s: %s, the DEM tile stays", tile.key, type(e).__name__, e,
-                        exc_info=not isinstance(e, (photorealmod.PhotorealError, OSError)))
+            fut = self._photoreal_submit(
+                anchor.lat, anchor.lon, tile.bbox, off, tile.size * PHOTOREAL_ERR_PER_M, farfield.VERTS_MAX,
+                self.photoreal_errs.get(tile.level), max(256, PHOTOREAL_TEX_PX >> max(0, tile.level - self.min_level)),
+                os.path.join(self.out_dir, texture))
+        except Exception as e:      # the DEM tile
+            log.warning("photoreal: tile %s: %s", tile.key, e)
             return None
-        log.info("photoreal: tile %s: %d triangles at %g m, %dx%d px, %d fetched, %.1f s", tile.key, len(mesh.tris),
-                 err, rgb.shape[1], rgb.shape[0], self.photoreal.fetched - n0, time.perf_counter() - t0)
-        pos = np.asarray(built.pos, np.float64)
-        P = mesh.positions - pos
-        tris = mesh.tris.astype(np.int64)
-        return replace(built, positions=P, normals=photorealmod.normals(mesh.positions, tris),
-                       uvs=np.zeros((len(P), 2)), planar=uv, tris=tris), rgb
+        fut.t0, fut.ahead = time.perf_counter(), ahead
+        with self.photoreal_lock:
+            self.photoreal_jobs[ck] = (fut, texture)
+        return fut, texture
+
+    def photoreal_ahead(self, anchor, x, y, vx, vy, built):
+        """Queue photoreal tiles around where the car will be (PHOTOREAL_AHEAD_S), the near levels' 64 / 128 m
+        squares the layout will ask for there, at most PHOTOREAL_AHEAD_JOBS waiting. built(key): already a tile."""
+        if self.photoreal is None or anchor.id not in self.photoreal_offsets or math.hypot(vx, vy) < 3.0:
+            return
+        with self.photoreal_lock:
+            waiting = sum(1 for f, _ in self.photoreal_jobs.values() if f.ahead and not f.done())
+        if waiting >= PHOTOREAL_AHEAD_JOBS:
+            return
+        sp = math.hypot(vx, vy)
+        want = []
+        for t_s in PHOTOREAL_AHEAD_S:
+            d = min(sp * t_s, PHOTOREAL_AHEAD_MAX)
+            px, py = x + vx / sp * d, y + vy / sp * d
+            for lvl in range(self.min_level, PHOTOREAL_MAX_LEVEL + 1):
+                r = self.near_radii.get(lvl)
+                if r is None:
+                    continue
+                size = farfield.level_size(lvl)
+                lo = self.near_radii.get(lvl - 1, 0.0)
+                for i in range(int(math.floor((px - r) / size)), int(math.floor((px + r) / size)) + 1):
+                    for j in range(int(math.floor((py - r) / size)), int(math.floor((py + r) / size)) + 1):
+                        t = farfield.Tile(lvl, i, j)
+                        dt = t.distance(px, py)
+                        if dt <= r and (dt >= lo or lvl == self.min_level):
+                            want.append((t_s, dt, t))
+        want.sort(key=lambda w: (w[0], w[1]))
+        for _, _, t in want:
+            if waiting >= PHOTOREAL_AHEAD_JOBS:
+                break
+            ck = (anchor.id, t.key)
+            if built(t.key) or ck in self.photoreal_jobs:
+                continue
+            if self.photoreal_job(anchor, t, ahead=True) is not None:
+                waiting += 1
+        with self.photoreal_lock:           # jobs never asked for (the car turned): only the latest few hundred
+            if len(self.photoreal_jobs) > 600:
+                for k in [k for k, (f, _) in self.photoreal_jobs.items() if f.done()][:200]:
+                    del self.photoreal_jobs[k]
+
+    def photoreal_tile(self, anchor, tile, built, job):
+        """(built with the photogrammetry's triangles over tile, texture file, its bytes) from the tile's job, or None
+        (no coverage, too many vertices, a network error: the DEM tile and its imagery stay). The grid / sink / skirt
+        stay the DEM's."""
+        fut, texture = job
+        try:
+            r = fut.result()
+        except Exception as e:      # the DEM tile rather than none (the in-game test sees why in the log)
+            log.warning("photoreal: tile %s: %s: %s, the DEM tile stays", tile.key, type(e).__name__, e)
+            return None
+        finally:
+            with self.photoreal_lock:
+                self.photoreal_jobs.pop((anchor.id, tile.key), None)
+        if "positions" not in r:
+            log.info("photoreal: tile %s: no photogrammetry that fits (error up to %g m), the DEM tile stays",
+                     tile.key, r["err"])
+            return None
+        self.photoreal_errs[tile.level] = r["err"]
+        log.info("photoreal: tile %s: %d triangles at %g m, %dx%d px, %d fetched, %.1f s build%s, %.1f s since asked",
+                 tile.key, len(r["tris"]), r["err"], r["px"][0], r["px"][1], r["fetched"], r["seconds"],
+                 " (built ahead)" if fut.ahead else "", time.perf_counter() - fut.t0)
+        P = r["positions"] - np.asarray(built.pos, np.float64)
+        return (replace(built, positions=P, normals=r["normals"], uvs=np.zeros((len(P), 2)), planar=r["uv"],
+                        tris=r["tris"]), texture, r["tex_bytes"])
 
     def rock_faces(self, anchor, tile, px, rgb, grid):
         """The far tile's photo with its steep ground drawn as rock (rockface.py: cliffs were the photo's top
@@ -3257,6 +3343,9 @@ class Connection:
             self.update_eye(self.s.anchors[aid].frame, *(self.view_at or (x, y)), msg)
         self.gravity.on_pose(self, self.s.anchors[aid].frame, x, y, _num(msg, "z", 0.0))
         self.ground_ahead(aid, x, y, vx, vy)
+        if self.s.photoreal is not None and aid == self.active and aid in self.s.anchors:
+            self.s.photoreal_ahead(self.s.anchors[aid], *self.focus, vx, vy,
+                                   lambda key: (aid, key) in self.s.tiles or key in self.sent)
         if self.s.sea is not None:
             self.sea_tiles(aid, x, y)
         # the mod's altitude rule: high above the ground it does not move its block, so no block is
@@ -3630,6 +3719,11 @@ class Connection:
         cone = (farfield.view_cone(self.cam)
                 if isinstance(self.cam, dict) and getattr(self, "cam_aid", None) == aid else None)
         dist = farfield.view_distances(todo, cone, fx, fy)
+        vx, vy = self.vel
+        if self.s.photoreal is not None and math.hypot(vx, vy) > 3.0:
+            # photoreal: the tiles on the way first (the near ones take a while; the car outran them at speed)
+            ahead = farfield.view_distances(todo, cone, fx + vx * PHOTOREAL_LEAD_S, fy + vy * PHOTOREAL_LEAD_S)
+            dist = [min(a, b) for a, b in zip(dist, ahead)]
 
         def prio(k):
             t = todo[k]
@@ -3869,6 +3963,10 @@ async def main_async(args):
     if args.near_radii is not None:
         ml = farfield.MESH_MIN_LEVEL[args.cells]
         radii = {ml: args.near_radii[0], ml + 1: args.near_radii[1]}
+    if args.near_visual == "photoreal":
+        # the near buildings and sidewalks collision-only (the photogrammetry draws them): this process and the
+        # worker processes started below (they inherit the environment)
+        os.environ.setdefault("BNGE_OSM_DRAWN", "0")
     net = netfetch.Fetcher(stats_dir=os.path.join(args.cache_dir, "netstats"), offline=args.offline)
     disk = cachemod.Cache(args.cache_dir, args.cache_cap)
     # map data (mapdata.py): land cover for the surfaces, roads; one instance shares its cache locks
@@ -3925,7 +4023,9 @@ async def main_async(args):
             initargs=(args.cache_dir, args.offline, True, args.grading == "on", args.road_widths == "on",
                       args.surface == "on", ctx.Queue(maxsize=1), logging.getLogger().level,
                       args.airports == "on", args.sea == "on", NICE_FAR_BUILDINGS))
-    server = Server(args.user_dir, args.cache_dir, args.workers, kfun, args.hysteresis, args.far_radius, fmt,
+    # photoreal: a far thread mostly waits for its tile's photoreal process; as many more threads as processes
+    workers = args.workers + (PHOTOREAL_PROCS if args.near_visual == "photoreal" else 0)
+    server = Server(args.user_dir, args.cache_dir, workers, kfun, args.hysteresis, args.far_radius, fmt,
                     imagery=args.imagery, near_visual=args.near_visual, tex_near=args.tex_near,
                     tex_far=args.tex_far, tone=args.tone, near_radii=radii,
                     leaf_on=args.leaf_on == "on", season_mode=args.season,

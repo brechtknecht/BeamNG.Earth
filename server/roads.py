@@ -3950,6 +3950,11 @@ def shape_files(aid, tx, ty):
     return out
 
 
+def bld_drawn():
+    import buildings
+    return buildings.osm_drawn()
+
+
 def write_tile(out_dir, vfs_dir, aid, tx, ty, chunks, walks=None, road_mesh=None, deck_mesh=None, bld=None,
                props=None, wires=None, park=None, tunnel_mesh=None):
     """Write a tile's chunks (atomically), its sidewalk mesh (walks: build_tile's runs, if any:
@@ -3992,15 +3997,20 @@ def write_tile(out_dir, vfs_dir, aid, tx, ty, chunks, walks=None, road_mesh=None
             b.add_run(curb, out, ww, caps=wk["caps"], ramps=wk.get("ramps", ()),
                       slab=sidewalks.BRICK if wk.get("brick") else 1)
         if not b.empty():
+            import buildings
             shape = f"walks_{aid}_{tx}_{ty}.cdae"
-            b.write(os.path.join(out_dir, shape))
-            data["walk"] = {"shape": f"{vfs_dir}/{shape}", "pos": [x0, y0, 0.0]}
+            if buildings.osm_drawn():       # (photoreal: only the collision mesh below)
+                b.write(os.path.join(out_dir, shape))
+                data["walk"] = {"shape": f"{vfs_dir}/{shape}", "pos": [x0, y0, 0.0]}
             shape = f"walkcol_{aid}_{tx}_{ty}.cdae"     # the lean physics-only mesh (the drawn one then only renders)
             b.write_collision(os.path.join(out_dir, shape))
             data["walkcol"] = {"shape": f"{vfs_dir}/{shape}", "pos": [x0, y0, 0.0]}
-    boxes = collider_boxes(walks if data.get("walk") else None, chunks if data.get("deck") else None)
+    boxes = collider_boxes(walks if data.get("walk") or data.get("walkcol") else None,
+                           chunks if data.get("deck") else None)
     if "walk" in boxes and data.get("walkcol"):
         boxes["walkcol"] = boxes["walk"]
+        if not data.get("walk"):
+            del boxes["walk"]
     if bld is not None:             # buildings.road_tile: the tile's buildings, colliding ("bld")
         import buildings
         x0, y0, _, _ = tile_bbox(tx, ty)
@@ -4018,7 +4028,7 @@ def write_tile(out_dir, vfs_dir, aid, tx, ty, chunks, walks=None, road_mesh=None
             boxes["bldcol"] = bld[1]
     if boxes:
         data["colliders"] = boxes
-    if wires:                       # utility pole wires (furniture.wire_mesh), render-only
+    if wires and bld_drawn():       # utility pole wires (furniture.wire_mesh), render-only
         import cdae
         import furniture
         x0, y0, _, _ = tile_bbox(tx, ty)

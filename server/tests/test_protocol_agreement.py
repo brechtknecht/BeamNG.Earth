@@ -643,9 +643,9 @@ class ConstantsTest(unittest.TestCase):
     def test_near_visual_values(self):
         """hello.nearVisual: the mod draws the ground with tiles for 'mesh', with tiles plus the drawn
         block for 'detail' (2026-10-12) and with the TerrainBlock for anything else (an older server
-        sends none: the v1.2 look)."""
-        self.assertEqual(set(earthd.NEAR_VISUALS), {"mesh", "terrain", "detail"})
-        self.assertEqual(set(earthd.MESH_LAYOUT), {"mesh", "detail"})
+        sends none: the v1.2 look). 'photoreal' (personal fork) is server-side only: its hello says 'mesh'."""
+        self.assertEqual(set(earthd.NEAR_VISUALS), {"mesh", "terrain", "detail", "photoreal"})
+        self.assertEqual(set(earthd.MESH_LAYOUT), {"mesh", "detail", "photoreal"})
         self.assertEqual(set(earthd.BLOCK_DRAWN), {"terrain", "detail"})
         core = (LUA / "core.lua").read_text(encoding="utf-8")
         self.assertIn("nearVisual = (mode == 'mesh' or mode == 'detail') and mode or 'terrain'", lua_function(core, "setNearVisual"))

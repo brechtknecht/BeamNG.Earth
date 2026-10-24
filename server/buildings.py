@@ -2766,6 +2766,13 @@ def centres(items, tx, ty):
     return [(float(s.ring[:, 0].mean() + x0), float(s.ring[:, 1].mean() + y0)) for s, _, _ in items]
 
 
+def osm_drawn():
+    """False with BNGE_OSM_DRAWN=0 (earthd --near-visual photoreal sets it for itself and its worker processes): the
+    near map geometry the photogrammetry already shows (buildings, sidewalks, wires) is written collision-only."""
+    import os
+    return os.environ.get("BNGE_OSM_DRAWN", "1") != "0"
+
+
 def road_tile(frame, tx, ty, md, ground, lines=None, props=None, items=None):
     """The buildings of road tile (tx, ty) (roads.TILE squares of the anchor frame): (mesh, collider boxes) or
     None. md: mapdata.MapData; ground(lat, lon): the physics ground without the road lift. lines (the road
@@ -2777,6 +2784,10 @@ def road_tile(frame, tx, ty, md, ground, lines=None, props=None, items=None):
         items = road_tile_items(frame, tx, ty, md, ground)
     if props is not None and lines:
         props.extend(doors(items, lines, x0, y0))
+    if not osm_drawn():         # photoreal near ground: the photogrammetry draws them, these only collide
+        col = collision_mesh(items) if items else None
+        if col is not None:
+            return [], collider_boxes(items, x0, y0), col
     meshes = build_parts(items, with_lod=True)
     if not meshes:
         return None

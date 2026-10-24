@@ -605,3 +605,35 @@ def tile_mesh(pr, frame, box, offset, target_err, verts_max=65535, coarsest=64.0
             return m, err
         err *= 2.0
     return None, err / 2.0
+
+
+# --- worker processes (earthd: the near tiles built off the server's interpreter lock) -----------------------------
+
+_worker = None
+
+
+def worker_init(cache_dir, level=logging.INFO):
+    """ProcessPoolExecutor initializer: this process's Photoreal (its own fetch threads; the disk cache is shared)."""
+    global _worker
+    logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    _worker = Photoreal(cache_dir)
+
+
+def build_tile(lat0, lon0, bbox, offset, target_err, verts_max, start_err, tex_px, dds_path):
+    """Worker process: the photoreal tile over bbox (ENU of the frame at lat0, lon0) with its atlas written to
+    dds_path. -> dict: err, and when there is a mesh: positions (ENU, shifted by offset), tris, uv, normals,
+    tex_bytes, px (w, h), fetched, seconds."""
+    import time
+    import geodesy
+    import imagery
+    t0 = time.perf_counter()
+    n0 = _worker.fetched
+    mesh, err = tile_mesh(_worker, geodesy.EnuFrame(lat0, lon0), bbox, offset, target_err, verts_max,
+                          start_err=start_err)
+    if mesh is None:
+        return {"err": err}
+    rgb, uv = mesh.atlas(tex_px)
+    tris = mesh.tris.astype(np.int64)
+    return {"err": err, "positions": mesh.positions, "tris": tris, "uv": uv, "normals": normals(mesh.positions, tris),
+            "tex_bytes": imagery.write_dds(dds_path, rgb), "px": (rgb.shape[1], rgb.shape[0]),
+            "fetched": _worker.fetched - n0, "seconds": time.perf_counter() - t0}
