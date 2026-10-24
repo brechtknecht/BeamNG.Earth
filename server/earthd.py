@@ -199,6 +199,8 @@ PHOTOREAL_AHEAD_MAX = 300.0             # m at most ahead
 PHOTOREAL_AHEAD_JOBS = 4                # ahead jobs queued at once (the tiles asked for come first)
 PHOTOREAL_LEAD_S = 3.0                  # the near tiles' build order: distance to the path this far ahead
 PHOTOREAL_OFFSET_R = 128.0              # m: the geoid offset is measured over this half side around the anchor
+# GB the downloaded photogrammetry may take (<cache-dir>/photoreal, least recently used out first): ~1 GB per km driven
+PHOTOREAL_CACHE_GB = float(os.environ.get("BNGE_PHOTOREAL_CACHE_GB", "3"))
 BLOCK_DRAWN = ("terrain", "detail")
 TUNNEL_FLOOR_UNDER_M = 2.0     # a tunnel floor this far under the ground at a teleport's origin: the car goes on the floor
 SEA_CHECK_S = 15.0          # sea (--sea on): the water tiles planned again when the player enters another
@@ -611,6 +613,10 @@ class Server:
                         if imagery else None)
         # --near-visual photoreal: the tileset (photoreal.py), the geoid offset per anchor id (measured once)
         self.photoreal = photorealmod.Photoreal(cache_dir) if near_visual == "photoreal" else None
+        self.photoreal_disk = None
+        if self.photoreal is not None:
+            self.photoreal_disk = photorealmod.DiskBudget(self.photoreal.cache_dir, int(PHOTOREAL_CACHE_GB * 1e9))
+            self.photoreal.on_file = self.photoreal_disk.touch
         self.photoreal_offsets = {}
         self.photoreal_errs = {}            # level -> the geometric error its last photoreal tile fitted at
         self.photoreal_pool = None          # ProcessPoolExecutor (photoreal.build_tile), made on first use
@@ -2036,6 +2042,8 @@ class Server:
             got = self.photoreal_jobs.get(ck)
             if got is not None:
                 if ahead or not got[0].done() or got[0].exception() is None:
+                    if not ahead:
+                        got[0].claimed = True       # make_tile's now: never pruned
                     return got
         off = self.photoreal_offsets.get(anchor.id) if ahead else self.photoreal_offset(anchor)
         if off is None:
@@ -2049,10 +2057,18 @@ class Server:
         except Exception as e:      # the DEM tile
             log.warning("photoreal: tile %s: %s", tile.key, e)
             return None
-        fut.t0, fut.ahead = time.perf_counter(), ahead
+        fut.t0, fut.ahead, fut.claimed = time.perf_counter(), ahead, not ahead
+        fut.add_done_callback(self._photoreal_files)
         with self.photoreal_lock:
             self.photoreal_jobs[ck] = (fut, texture)
         return fut, texture
+
+    def _photoreal_files(self, fut):
+        """A finished build_tile: the cache files it read or wrote into the disk budget's LRU."""
+        if fut.cancelled() or fut.exception() is not None:
+            return
+        for path, n in fut.result().get("files", ()):
+            self.photoreal_disk.touch(path, n)
 
     def photoreal_ahead(self, anchor, x, y, vx, vy, built):
         """Queue photoreal tiles around where the car will be (PHOTOREAL_AHEAD_S), the near levels' 64 / 128 m
@@ -2090,9 +2106,12 @@ class Server:
             if self.photoreal_job(anchor, t, ahead=True) is not None:
                 waiting += 1
         with self.photoreal_lock:           # jobs never asked for (the car turned): only the latest few hundred
+            stale = []
             if len(self.photoreal_jobs) > 600:
-                for k in [k for k, (f, _) in self.photoreal_jobs.items() if f.done()][:200]:
-                    del self.photoreal_jobs[k]
+                for k in [k for k, (f, _) in self.photoreal_jobs.items() if f.done() and not f.claimed][:200]:
+                    stale.append(self.photoreal_jobs.pop(k)[1])
+        for texture in stale:                   # built ahead, never asked for: its atlas goes too
+            self._remove(os.path.join(self.out_dir, texture))
 
     def photoreal_tile(self, anchor, tile, built, job):
         """(built with the photogrammetry's triangles over tile, texture file, its bytes) from the tile's job, or None

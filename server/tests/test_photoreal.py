@@ -2,6 +2,7 @@
 a fake opener serves a synthetic tileset of plain (not Draco) glTF quads."""
 import io
 import json
+import os
 import struct
 import sys
 import tempfile
@@ -157,6 +158,45 @@ class PhotorealTest(unittest.TestCase):
         self.assertTrue(all(len(p.positions) <= 30 for p in parts))
         n = pr.normals(m.positions, m.tris)
         self.assertTrue((n[:, 2] > 0.99).all())                 # flat ground, counter-clockwise from above
+
+    def test_cache_files_reported(self):
+        seen = []
+        self.p.on_file = lambda path, n: seen.append((path, n))
+        self.p.mesh(self.frame, (10, 10, 50, 50), target_err=1.0)
+        self.assertTrue(seen and all(p.startswith(self.p.cache_dir) and n > 0 for p, n in seen))
+
+
+class DiskBudgetTest(unittest.TestCase):
+    def test_lru_over_cap(self):
+        with tempfile.TemporaryDirectory() as d:
+            clock = [1000.0]
+            paths = []
+            for i in range(10):
+                sub = Path(d, "%02x" % i)
+                sub.mkdir()
+                p = sub / ("f%d" % i)
+                p.write_bytes(b"x" * 100)
+                paths.append(str(p))
+            b = pr.DiskBudget(d, 1000, protect_s=50.0, now=lambda: clock[0], start=False)
+            b.scan()
+            self.assertEqual(b.used, 1000)
+            for i, p in enumerate(paths):          # used in order: f0 oldest
+                clock[0] = 1000.0 + i
+                b.touch(p, 100)
+            clock[0] = 2000.0
+            b.touch(paths[0], 100)                 # f0 used again just now: protected
+            new = Path(d, "0a", "new")
+            new.parent.mkdir()
+            new.write_bytes(b"x" * 300)
+            b.cap = 1000
+            with b._lock:
+                b._files[str(new)] = [300, 2000.0]
+                b.used += 300
+            b.check(wait=True)
+            self.assertLessEqual(b.used, 800)
+            self.assertTrue(os.path.exists(paths[0]) and new.exists())
+            self.assertFalse(os.path.exists(paths[1]))
+            self.assertEqual(b.used, sum(os.path.getsize(p) for p in [*paths, str(new)] if os.path.exists(p)))
 
 
 if __name__ == "__main__":

@@ -421,6 +421,7 @@ class Photoreal:
         self._json = {}                 # url path -> parsed subtree
         self._file_locks = {}           # cache path -> Lock (one fetch / write per file)
         self.fetched = self.cached = 0
+        self.on_file = None             # (path, bytes) of every cache file read or written: DiskBudget's LRU
 
     # urls
     def _root_url(self):
@@ -457,6 +458,8 @@ class Photoreal:
                         data = f.read()
                     with self._lock:
                         self.cached += 1
+                    if self.on_file is not None:
+                        self.on_file(path, len(data))
                     return data
                 except OSError:         # being replaced by another process (two servers): fetch it again
                     pass
@@ -471,6 +474,8 @@ class Photoreal:
                 with open(tmp, "wb") as f:
                     f.write(data)
                 os.replace(tmp, path)
+                if self.on_file is not None:
+                    self.on_file(path, len(data))
             except OSError as e:        # the cache is only a cache: the bytes are in hand
                 log.debug("photoreal: cache write %s: %s", path, e)
                 try:
@@ -628,12 +633,116 @@ def build_tile(lat0, lon0, bbox, offset, target_err, verts_max, start_err, tex_p
     import imagery
     t0 = time.perf_counter()
     n0 = _worker.fetched
+    files = []                          # (path, bytes): the server's DiskBudget (one task at a time per process)
+    _worker.on_file = lambda path, n: files.append((path, n))
     mesh, err = tile_mesh(_worker, geodesy.EnuFrame(lat0, lon0), bbox, offset, target_err, verts_max,
                           start_err=start_err)
     if mesh is None:
-        return {"err": err}
+        return {"err": err, "files": files}
     rgb, uv = mesh.atlas(tex_px)
     tris = mesh.tris.astype(np.int64)
     return {"err": err, "positions": mesh.positions, "tris": tris, "uv": uv, "normals": normals(mesh.positions, tris),
             "tex_bytes": imagery.write_dds(dds_path, rgb), "px": (rgb.shape[1], rgb.shape[0]),
-            "fetched": _worker.fetched - n0, "seconds": time.perf_counter() - t0}
+            "fetched": _worker.fetched - n0, "seconds": time.perf_counter() - t0, "files": files}
+
+
+class DiskBudget:
+    """LRU cap on the photoreal disk cache (Felix's PC, 2026-10-24: ~10 GB right away; the photogrammetry is
+    ~1 GB per km driven, its own budget rather than the shared cache's 20 GB, whose files are protected for an
+    hour). touch() marks files used (the server's offsets, the worker processes' results); over the cap, the
+    least recently used files not touched within protect_s go, in a thread, down to LOW of the cap."""
+
+    LOW = 0.8
+
+    def __init__(self, root, cap_bytes, protect_s=300.0, now=None, start=True):
+        import time
+        self.root, self.cap, self.protect_s = root, cap_bytes, protect_s
+        self.now = now or time.time
+        self._lock = threading.Lock()
+        self._files = {}                # path -> [bytes, last use]
+        self.used = 0
+        self._busy = False
+        self.evicted = 0
+        if start:
+            threading.Thread(target=self._start, name="photoreal-budget", daemon=True).start()
+
+    def scan(self):
+        """The files already there (an earlier run's), their mtime as the last use."""
+        found = {}
+        try:
+            subs = [d.path for d in os.scandir(self.root) if d.is_dir()]
+        except OSError:
+            subs = []
+        for d in subs:
+            try:
+                with os.scandir(d) as it:
+                    for e in it:
+                        if e.is_file() and ".tmp" not in e.name:
+                            st = e.stat()
+                            found[e.path] = [st.st_size, st.st_mtime]
+            except OSError:
+                continue
+        with self._lock:
+            for path, e in found.items():
+                if path not in self._files:
+                    self._files[path] = e
+                    self.used += e[0]
+
+    def _start(self):
+        self.scan()
+        log.info("photoreal: disk cache %.1f GB of %.1f GB", self.used / 1e9, self.cap / 1e9)
+        self.check()
+
+    def touch(self, path, size):
+        t = self.now()
+        with self._lock:
+            e = self._files.get(path)
+            if e is None:
+                self._files[path] = [size, t]
+                self.used += size
+            else:
+                self.used += size - e[0]
+                e[0], e[1] = size, t
+        self.check()
+
+    def check(self, wait=False):
+        with self._lock:
+            if not self.cap or self.used <= self.cap or self._busy:
+                return
+            self._busy = True
+        if wait:
+            self.evict()
+        else:
+            threading.Thread(target=self.evict, name="photoreal-evict", daemon=True).start()
+
+    def evict(self):
+        try:
+            floor = self.now() - self.protect_s
+            with self._lock:
+                order = sorted((e[1], p) for p, e in self._files.items() if e[1] < floor)
+            target = int(self.cap * self.LOW)
+            n = b = 0
+            for t, path in order:
+                if self.used <= target:
+                    break
+                with self._lock:
+                    e = self._files.get(path)
+                    if e is None or e[1] != t:      # used again since
+                        continue
+                try:
+                    os.remove(path)
+                except FileNotFoundError:
+                    pass
+                except OSError:                     # open in a worker (Windows): next time
+                    continue
+                with self._lock:
+                    if self._files.pop(path, None) is not None:
+                        self.used -= e[0]
+                n, b = n + 1, b + e[0]
+            self.evicted += n
+            if n:
+                log.info("photoreal: disk cache: %d least recently used files removed (%.2f GB), %.1f GB of %.1f GB",
+                         n, b / 1e9, self.used / 1e9, self.cap / 1e9)
+        finally:
+            with self._lock:
+                self._busy = False
