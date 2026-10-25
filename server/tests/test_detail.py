@@ -224,6 +224,43 @@ class DetailFastPhotoLaterTest(ServerHarness):
         self.assertEqual(s.hm[(aid, 512.0, 0.0)]["base"], os.path.basename(m["base"]))
 
 
+class DetailPhotoBudgetTest(ServerHarness):
+    """A moving player near its block's edge (earthd _base_wait_s): a block whose photo would come too late goes
+    without it; with time to spare it waits for the photo."""
+    near_visual = "detail"
+    with_imagery = True
+    cells = 64
+    block = 512
+
+    def slow_photos(self):
+        orig = self.server.write_base
+
+        def slow(*a, **kw):
+            time.sleep(1.0)
+            return orig(*a, **kw)
+        self.server.write_base = slow
+
+    def test_photo_follows_near_the_edge(self):
+        self.hello()
+        aid = self.prepare_anchor(1, LAT, LON)["anchorId"]
+        self.slow_photos()
+        self.server.edge_at = time.monotonic() + 1.2
+        self.c.send({"type": "prepare_terrain", "requestId": 3, "anchorId": aid, "cx": 512.0, "cy": 0.0})
+        tr, _ = self.c.until(lambda m: m["type"] == "terrain_ready", timeout=60)
+        self.assertNotIn("base", tr, "sent without its photo")
+        m, _ = self.c.until(lambda m: m["type"] == "block_base", timeout=30)
+        self.assertEqual((m["cx"], m["cy"]), (512.0, 0.0))
+
+    def test_waits_with_time_to_spare(self):
+        self.hello()
+        aid = self.prepare_anchor(1, LAT, LON)["anchorId"]
+        self.slow_photos()
+        self.server.edge_at = time.monotonic() + 60.0
+        self.c.send({"type": "prepare_terrain", "requestId": 3, "anchorId": aid, "cx": 512.0, "cy": 0.0})
+        tr, _ = self.c.until(lambda m: m["type"] == "terrain_ready", timeout=60)
+        self.assertIn("base", tr)
+
+
 class DetailNoImageryTest(ServerHarness):
     near_visual = "detail"
     with_imagery = False

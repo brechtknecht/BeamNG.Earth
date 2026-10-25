@@ -116,6 +116,7 @@ def pin_game(cpus):
 # server's processes may also run on half of the game's cores (the last ones); they keep their idle scheduling, so a
 # game thread that wants a CPU still gets it. Then they go back to their own cores.
 LEND_SHARE = 0.5            # of the game's physical cores
+SPEED_SHARE = 1 / 3         # of the game's physical cores while the player drives fast (earthd speed_boost)
 
 
 def boosted(server_cpus, game_cpus, share=LEND_SHARE):

@@ -229,6 +229,14 @@ AHEAD_LAYERS = ("roads", "buildings", "building_parts", "infrastructure", "water
 FAST_BASE_V = 70.0              # m/s (157 mph): faster, a block waits at most BASE_FAST_WAIT_S for its photo after its
 BASE_FAST_WAIT_S = 0.15         # heights, then goes without it (block_base later): blocks took 0.6-3 s at 600 mph on a
                                 # Steam Deck, mostly the photo (heights 0.1-0.4 s), and the game paused 11 times a minute
+# Slower than that, a moving player's block waits for its photo only as long as the drive to its block's edge allows
+# (_base_wait_s), then goes without it the same way: at 110-130 mph on an i7-9700K (2026-10-25) the photo took 3-7.5 s
+# of blocks that had ~6 s, and the game paused at the edge ("Waiting for collision to load here").
+BASE_BUDGET_MIN_V = 20.0        # m/s: slower, the block waits for its photo
+BASE_EDGE_STOP_M = 15.0         # edgeguard.lua: the game pauses this far inside the block's edge ...
+BASE_EDGE_LEAD_S = 0.5          # ... this long before it gets there
+BASE_MARGIN_S = 1.0             # s kept for sending the block and the game loading it before the pause
+EDGE_KEEP_S = 30.0              # a stopped player's last edge time is kept this long past it
 PROGRESS_S = 0.5            # load_progress at most this often (Connection.send_progress)
 GROUND_WAIT_S = 90.0        # a block's photo still to be drawn again counts as loading this long at most
 PERF_LOG_LINES, PERF_LOG_CHARS = 40, 2000   # a perf_log message's lines and characters a line, at most
@@ -692,6 +700,7 @@ class Server:
         self.ter_serial = itertools.count()
         self.base_stale = set()         # blocks whose base photo lacks lazy imagery (NAIP) still to come
         self.fast = False               # the player faster than FAST_BASE_V (the latest pose): photos follow blocks
+        self.edge_at = None             # time.monotonic() the moving player gets to its block's edge (_base_wait_s)
         self.base_pending = {}          # block -> the analysis regions its base photo was rendered without
         self.base_rev = itertools.count(1)
         self.hm_committed = deque(maxlen=HM_KEEP_COMMITTED)
@@ -1048,8 +1057,8 @@ class Server:
                  time.perf_counter() - t0)
         return path, len(graph["nodes"]), len(graph["edges"])
 
-    boost_on = False
-    boost_cpus = server_cpus = None
+    boost_on = speed_on = False
+    boost_cpus = speed_cpus = server_cpus = None
 
     def load_boost(self, on, why=""):
         """The loading boost (cpupin.boosted): the server's processes also on half of the game's cores while the
@@ -1057,18 +1066,28 @@ class Server:
         if on and not self.boost_cpus:
             log.debug("load boost (%s): no cores to lend (--pin / --load-boost off, or too few cores)", why)
         on = bool(on) and bool(self.boost_cpus)
-        if on == self.boost_on:
-            return
-        cpus = self.boost_cpus if on else self.server_cpus
+        if on != self.boost_on:
+            self._repin(on, self.speed_on, "load boost", on, why)
+
+    def speed_boost(self, on, why=""):
+        """The speed boost (cpupin.boosted, SPEED_SHARE): the server's processes also on a third of the game's cores
+        while the player drives fast (SPEED_BOOST_V): at 110-130 mph on an i7-9700K (2026-10-25) every stage of a
+        block took 2-3x as long as at 80 mph on the server's 2 cores, and the game paused at the blocks' edges."""
+        on = bool(on) and bool(self.speed_cpus)
+        if on != self.speed_on:
+            self._repin(self.boost_on, on, "speed boost", on, why)
+
+    def _repin(self, boost, speed, what, on, why):
+        cpus = self.boost_cpus if boost else self.speed_cpus if speed else self.server_cpus
         if not cpus:
             return
         try:
             n = cpupin.pin_tree(cpus)
         except OSError as e:
-            log.warning("load boost: %s", e)
+            log.warning("%s: %s", what, e)
             return
-        self.boost_on = on
-        log.info("load boost %s (%s): %d threads on CPUs %s", "on" if on else "off", why, n,
+        self.boost_on, self.speed_on = boost, speed
+        log.info("%s %s (%s): %d threads on CPUs %s", what, "on" if on else "off", why, n,
                  ",".join(map(str, sorted(cpus))))
 
     def build_far_bld_tile(self, aid, tx, ty):
@@ -1583,10 +1602,11 @@ class Server:
         future from _base_photo, started with the heights), the timings."""
         if base is not None:
             t1 = time.perf_counter()
-            if self.fast and not base.done():
-                concurrent.futures.wait([base], timeout=BASE_FAST_WAIT_S)
-            if self.fast and not base.done():
-                # a fast player (FAST_BASE_V): the block goes now and its photo when done (block_base)
+            wait = self._base_wait_s()
+            if wait is not None and not base.done():
+                concurrent.futures.wait([base], timeout=wait)
+            if wait is not None and not base.done():
+                # a fast player (FAST_BASE_V, _base_wait_s): the block goes now and its photo when done (block_base)
                 info["base"] = None
                 info["stages"]["baseWait"] = time.perf_counter() - t1
                 info["stages"]["baseLater"] = 1.0
@@ -1604,6 +1624,15 @@ class Server:
         info["seconds"] = time.perf_counter() - t0
         info["zoom"] = anchor.hm_zoom
         return info
+
+    def _base_wait_s(self):
+        """How long a block waits for its photo before it goes without it (None: until the photo is done): up to
+        BASE_MARGIN_S before the moving player gets to its block's edge (edge_at, from the latest pose)."""
+        if self.fast:
+            return BASE_FAST_WAIT_S
+        if self.edge_at is None:
+            return None
+        return max(BASE_FAST_WAIT_S, self.edge_at - time.monotonic() - BASE_MARGIN_S)
 
     def _base_later(self, key, fut, tries=4):
         """A block sent without its photo (a fast player): the photo, once rendered, onto the block's entry (later
@@ -2488,6 +2517,9 @@ TELEPORT_PAUSE_MAX_S = 120.0  # ... at most this long (the mod may never commit 
 BOOST_MOVE_MS = 3.0         # the loading boost ends when the player moves faster than this (m/s) ...
 BOOST_MAX_S = 120.0         # ... or this long after the teleport
 BOOST_GRACE_S = 5.0         # (the car dropped into place moves a little at first)
+SPEED_BOOST_V = 40.0        # m/s (144 km/h): faster, the speed boost (Server.speed_boost) ...
+SPEED_BOOST_OFF_V = 30.0    # ... until the player is slower than this (108 km/h) ...
+SPEED_BOOST_HOLD_S = 20.0   # ... for this long
 
 ANCHOR_TILE_FILES = ("roads", "road", "walks", "walkcol", "deck", "bld", "bldcol", "bldfar", "wire", "veg", "navgraph")
 
@@ -3334,11 +3366,23 @@ class Connection:
             return
         self.vel = (vx, vy)
         self.s.fast = math.hypot(vx, vy) > FAST_BASE_V
+        if aid == self.active:
+            at = self.edge_at(x, y, vx, vy)
+            if at is not None or self.s.edge_at is None or time.monotonic() - self.s.edge_at > EDGE_KEEP_S:
+                self.s.edge_at = at     # (kept a while: the game paused at the edge stands too)
         if self.s.boost_on:
             since = time.monotonic() - getattr(self, "boost_t0", 0.0)
             moving = math.hypot(vx, vy) > BOOST_MOVE_MS and since > BOOST_GRACE_S     # (the car settling: not moving)
             if moving or since > BOOST_MAX_S:
                 self.s.load_boost(False, "moving" if moving else "timeout")
+        if aid == self.active:
+            v, now = math.hypot(vx, vy), time.monotonic()
+            if v > SPEED_BOOST_OFF_V:
+                self.fast_t = now
+            if v > SPEED_BOOST_V:
+                self.s.speed_boost(True, f"{v * 3.6:.0f} km/h")
+            elif self.s.speed_on and now - getattr(self, "fast_t", 0.0) > SPEED_BOOST_HOLD_S:
+                self.s.speed_boost(False, "slower")
         if isinstance(msg.get("cam"), dict):
             self.cam, self.cam_aid = msg["cam"], aid
         self.view_at = self.camera_away(msg.get("cam")) if aid == self.active else None
@@ -3458,6 +3502,21 @@ class Connection:
             finally:
                 self.base_busy = False
         self.spawn(run())
+
+    def edge_at(self, x, y, vx, vy):
+        """time.monotonic() the game pauses at the committed block's edge at this velocity (edgeguard.lua: STOP_M
+        inside, LEAD_S ahead), None standing, slow or without a block."""
+        v = math.hypot(vx, vy)
+        if self.block is None or v < BASE_BUDGET_MIN_V:
+            return None
+        x0, y0, x1, y1 = self.block.bbox
+        t = math.inf
+        for p, w, lo, hi in ((x, vx, x0, x1 - heightmap.SQUARE), (y, vy, y0, y1 - heightmap.SQUARE)):
+            if w > 0:
+                t = min(t, (hi - BASE_EDGE_STOP_M - p) / w)
+            elif w < 0:
+                t = min(t, (p - lo - BASE_EDGE_STOP_M) / -w)
+        return time.monotonic() + max(0.0, t - BASE_EDGE_LEAD_S)
 
     def ground_ahead(self, aid, x, y, vx, vy):
         """Send the mod the highest ground near its straight path (groundahead.py; its altitude rule), one
@@ -4052,6 +4111,8 @@ async def main_async(args):
     server.game_cpus = getattr(args, "game_cpus", None)    # (cpupin.py: the game pinned at each hello)
     server.server_cpus = getattr(args, "server_cpus", None)
     server.boost_cpus = (cpupin.boosted(server.server_cpus, server.game_cpus)
+                         if getattr(args, "load_boost", "on") == "on" else None)
+    server.speed_cpus = (cpupin.boosted(server.server_cpus, server.game_cpus, cpupin.SPEED_SHARE)
                          if getattr(args, "load_boost", "on") == "on" else None)
 
     async def net_log():
