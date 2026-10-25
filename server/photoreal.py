@@ -393,6 +393,54 @@ def _overlaps(a, b):
     return a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
 
 
+_conns = threading.local()
+
+
+def _keepalive_open(url):
+    """GET url over this thread's kept-alive HTTPS connection to its host (urllib opens a new TCP + TLS connection
+    per request: ~3 round trips more for each of a tile's 20-90 files). Through HTTPS_PROXY when set (CONNECT)."""
+    import http.client
+    import ssl
+    parts = urllib.parse.urlsplit(url)
+    host = parts.hostname
+    pool = getattr(_conns, "pool", None)
+    if pool is None:
+        pool = _conns.pool = {}
+    path = parts.path + ("?" + parts.query if parts.query else "")
+    for attempt in (0, 1, 2):
+        conn = pool.get(host)
+        if conn is None:
+            ctx = getattr(_conns, "ctx", None) or ssl.create_default_context()
+            proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+            if proxy:
+                pp = urllib.parse.urlsplit(proxy if "://" in proxy else "http://" + proxy)
+                conn = http.client.HTTPSConnection(pp.hostname, pp.port or 80, timeout=TIMEOUT_S, context=ctx)
+                conn.set_tunnel(host, parts.port or 443)
+            else:
+                conn = http.client.HTTPSConnection(host, parts.port or 443, timeout=TIMEOUT_S, context=ctx)
+            pool[host] = conn
+        try:
+            conn.request("GET", path, headers={"Accept-Encoding": "identity"})
+            r = conn.getresponse()
+            data = r.read()
+        except ssl.SSLCertVerificationError:
+            import certifi     # the packaged app's CA certificates where the system has none it finds (launcher.py)
+            _conns.ctx = ssl.create_default_context(cafile=certifi.where())
+            pool.pop(host, None).close()
+            continue
+        except (http.client.HTTPException, OSError):
+            pool.pop(host, None).close()        # the server closed the idle connection: once more on a new one
+            if attempt == 2:
+                raise
+            continue
+        if r.status >= 400:
+            raise urllib.error.HTTPError(url, r.status, r.reason, r.headers, io.BytesIO(data))
+        if r.status in (301, 302, 303, 307, 308) and r.getheader("Location"):
+            return _keepalive_open(urllib.parse.urljoin(url, r.getheader("Location")))
+        return data
+    raise OSError(f"photoreal: {url}: no connection")
+
+
 def _urlopen(url):
     import ssl
     try:
@@ -414,7 +462,7 @@ class Photoreal:
         # neither: Cesium ion without a token of ours (a proxy that adds the Authorization header, the cloud sessions)
         self.cache_dir = os.path.join(cache_dir, "photoreal")
         os.makedirs(self.cache_dir, exist_ok=True)
-        self._open = opener or _urlopen
+        self._open = opener or _keepalive_open
         self._lock = threading.Lock()
         self._root = None
         self._params = {}               # query parameters every request carries (key, session)
@@ -549,6 +597,14 @@ class Photoreal:
         for c in children:
             self._walk(c, base, T, frame, box, target_err, out, depth + 1, subs)
 
+    def prefetch(self, frame, box, target_err):
+        """Fetch into the disk cache what mesh(frame, box, target_err) will read (no decoding): the server, for
+        the tiles on the car's way, so their builds find everything on disk. -> files fetched."""
+        n0 = self.fetched
+        for _ in _fetch_pool().map(lambda c: self._get(c[0]), self.contents(frame, box, target_err)):
+            pass
+        return self.fetched - n0
+
     def mesh(self, frame, box, target_err=1.0, margin=0.0):
         """Mesh of the photogrammetry over box (ENU of frame), clipped to it, or None (no coverage)."""
         x0, y0, x1, y1 = box
@@ -644,6 +700,26 @@ def build_tile(lat0, lon0, bbox, offset, target_err, verts_max, start_err, tex_p
     return {"err": err, "positions": mesh.positions, "tris": tris, "uv": uv, "normals": normals(mesh.positions, tris),
             "tex_bytes": imagery.write_dds(dds_path, rgb), "px": (rgb.shape[1], rgb.shape[0]),
             "fetched": _worker.fetched - n0, "seconds": time.perf_counter() - t0, "files": files}
+
+
+def prefetch_tiles(lat0, lon0, boxes):
+    """Worker process: Photoreal.prefetch of each (bbox, target_err) in boxes (ENU of the frame at lat0, lon0), all
+    at once (each walk is a chain of round trips). -> dict: fetched, files."""
+    import geodesy
+    from concurrent.futures import ThreadPoolExecutor
+    frame = geodesy.EnuFrame(lat0, lon0)
+    files = []
+    _worker.on_file = lambda path, n: files.append((path, n))
+
+    def one(b):
+        try:
+            return _worker.prefetch(frame, *b)
+        except Exception as e:      # the build fetches what is missing
+            log.debug("photoreal: prefetch %s: %s", b[0], e)
+            return 0
+    with ThreadPoolExecutor(max(1, len(boxes))) as ex:
+        n = sum(ex.map(one, boxes))
+    return {"fetched": n, "files": files}
 
 
 class DiskBudget:

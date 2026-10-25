@@ -10,4 +10,6 @@ echo then open a new window and double-click this file again.
 pause
 exit /b 1
 :run
+rem the server's log also goes to photoreal.log next to this file (to send after a drive)
+set "BNGE_LOG_FILE=%~dp0photoreal.log"
 call "%~dp0run_server.bat" -- --near-visual photoreal %*

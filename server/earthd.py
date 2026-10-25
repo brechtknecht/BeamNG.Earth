@@ -194,9 +194,12 @@ PHOTOREAL_ERR_PER_M = 1.0 / 64.0
 # processes building the photoreal tiles (fetch, Draco, atlas, DDS): in the server's threads ~1.5 tiles were built at
 # once (the interpreter lock; Felix's log 2026-10-24: 4 tiles/s, outrun from ~100 km/h)
 PHOTOREAL_PROCS = int(os.environ.get("BNGE_PHOTOREAL_PROCS", "0")) or max(2, min(6, (os.cpu_count() or 4) // 2))
-PHOTOREAL_AHEAD_S = (2.0, 4.0, 6.0)     # photoreal tiles built ahead: around where the car is in this many seconds
-PHOTOREAL_AHEAD_MAX = 300.0             # m at most ahead
-PHOTOREAL_AHEAD_JOBS = 4                # ahead jobs queued at once (the tiles asked for come first)
+PHOTOREAL_PREFETCH_S = 25.0             # the photogrammetry downloaded for the tiles the car reaches within this
+PHOTOREAL_PREFETCH_MAX = 800.0          # m at most ahead (along its heading)
+PHOTOREAL_PREFETCH_TILES = 6            # tiles downloaded at once (network-bound: cold, a tile is ~1-3 s of
+                                        # round trips through the tree, ~1.3 MB; a build from disk ~0.2 s)
+# in a process of its own: in the server's threads the tree walks took the interpreter lock from the physics blocks
+# (a block's grading 1 s -> 70 s in a simulated drive, 2026-10-25)
 PHOTOREAL_LEAD_S = 3.0                  # the near tiles' build order: distance to the path this far ahead
 PHOTOREAL_OFFSET_R = 128.0              # m: the geoid offset is measured over this half side around the anchor
 # GB the downloaded photogrammetry may take (<cache-dir>/photoreal, least recently used out first): ~1 GB per km driven
@@ -622,6 +625,8 @@ class Server:
         self.photoreal_pool = None          # ProcessPoolExecutor (photoreal.build_tile), made on first use
         self.photoreal_jobs = {}            # (anchor id, key) -> (future, texture file): asked for or built ahead
         self.photoreal_lock = threading.Lock()
+        self.photoreal_prefetch_pool = None  # ProcessPoolExecutor (photoreal.prefetch_tiles), made on first use
+        self.photoreal_prefetched = {}      # (anchor id, key) -> Future of the download (insertion order: oldest out)
         self.photoreal_offset_lock = threading.Lock()   # (held for a measurement: never taken on the event loop)
         self.imagery_failures = 0           # tiles that fell back to the palette (network trouble)
         self.imagery_worker = 0             # far textures the far-tile processes rendered (blockworker.far_tile)
@@ -2034,18 +2039,11 @@ class Server:
                     self.photoreal_pool = None
             raise RuntimeError("photoreal worker processes")
 
-    def photoreal_job(self, anchor, tile, ahead=False):
-        """(future of photoreal.build_tile, texture file) for the tile: the one built ahead, or a new one; None when
-        the anchor has no offset (no coverage, no token). ahead: never waits for the offset, never a second job."""
+    def photoreal_job(self, anchor, tile):
+        """(future of photoreal.build_tile, texture file) for the tile; None when the anchor has no offset (no
+        coverage, no token)."""
         ck = (anchor.id, tile.key)
-        with self.photoreal_lock:
-            got = self.photoreal_jobs.get(ck)
-            if got is not None:
-                if ahead or not got[0].done() or got[0].exception() is None:
-                    if not ahead:
-                        got[0].claimed = True       # make_tile's now: never pruned
-                    return got
-        off = self.photoreal_offsets.get(anchor.id) if ahead else self.photoreal_offset(anchor)
+        off = self.photoreal_offset(anchor)
         if off is None:
             return None
         texture = self.texture_name(anchor.id, tile.key, self.tex_rev.get(ck, 0))
@@ -2057,7 +2055,7 @@ class Server:
         except Exception as e:      # the DEM tile
             log.warning("photoreal: tile %s: %s", tile.key, e)
             return None
-        fut.t0, fut.ahead, fut.claimed = time.perf_counter(), ahead, not ahead
+        fut.t0 = time.perf_counter()
         fut.add_done_callback(self._photoreal_files)
         with self.photoreal_lock:
             self.photoreal_jobs[ck] = (fut, texture)
@@ -2070,20 +2068,11 @@ class Server:
         for path, n in fut.result().get("files", ()):
             self.photoreal_disk.touch(path, n)
 
-    def photoreal_ahead(self, anchor, x, y, vx, vy, built):
-        """Queue photoreal tiles around where the car will be (PHOTOREAL_AHEAD_S), the near levels' 64 / 128 m
-        squares the layout will ask for there, at most PHOTOREAL_AHEAD_JOBS waiting. built(key): already a tile."""
-        if self.photoreal is None or anchor.id not in self.photoreal_offsets or math.hypot(vx, vy) < 3.0:
-            return
-        with self.photoreal_lock:
-            waiting = sum(1 for f, _ in self.photoreal_jobs.values() if f.ahead and not f.done())
-        if waiting >= PHOTOREAL_AHEAD_JOBS:
-            return
-        sp = math.hypot(vx, vy)
-        want = []
-        for t_s in PHOTOREAL_AHEAD_S:
-            d = min(sp * t_s, PHOTOREAL_AHEAD_MAX)
-            px, py = x + vx / sp * d, y + vy / sp * d
+    def _photoreal_near(self, points):
+        """[(point index, distance, Tile)] of the near levels' tiles the layout shows around each (x, y) of points
+        (L-2 within its radius, L-1 in its ring), nearest point first, then nearest tile."""
+        out = []
+        for n, (px, py) in enumerate(points):
             for lvl in range(self.min_level, PHOTOREAL_MAX_LEVEL + 1):
                 r = self.near_radii.get(lvl)
                 if r is None:
@@ -2095,23 +2084,68 @@ class Server:
                         t = farfield.Tile(lvl, i, j)
                         dt = t.distance(px, py)
                         if dt <= r and (dt >= lo or lvl == self.min_level):
-                            want.append((t_s, dt, t))
-        want.sort(key=lambda w: (w[0], w[1]))
-        for _, _, t in want:
-            if waiting >= PHOTOREAL_AHEAD_JOBS:
+                            out.append((n, dt, t))
+        out.sort(key=lambda w: (w[0], w[1]))
+        return out
+
+    def photoreal_ahead(self, anchor, x, y, vx, vy, built):
+        """On the car's way: the photogrammetry of the near tiles it reaches within PHOTOREAL_PREFETCH_S downloaded
+        into the disk cache (PHOTOREAL_PREFETCH_TILES at once), so their builds read it from disk (cold, a tile
+        waited seconds for its round trips; from disk it builds in ~0.2 s). built(key): already a tile."""
+        sp = math.hypot(vx, vy)
+        if self.photoreal is None or anchor.id not in self.photoreal_offsets or sp < 3.0:
+            return
+        now = time.monotonic()
+        if now - getattr(self, "photoreal_ahead_t", 0.0) < 0.5:      # (poses come ~10 a second)
+            return
+        self.photoreal_ahead_t = now
+        ux, uy = vx / sp, vy / sp
+        # downloads: every 32 m along the heading
+        reach = min(sp * PHOTOREAL_PREFETCH_S, PHOTOREAL_PREFETCH_MAX)
+        pts = [(x + ux * d, y + uy * d) for d in np.arange(0.0, reach + 1.0, 32.0)]
+        with self.photoreal_lock:
+            # two batches at a time: the next one queued while one downloads
+            if sum(1 for f in set(self.photoreal_prefetched.values()) if not f.done()) >= 2:
+                return
+            batch = []
+            for _, _, t in self._photoreal_near(pts):
+                if len(batch) >= PHOTOREAL_PREFETCH_TILES:
+                    break
+                ck = (anchor.id, t.key)
+                if ck in self.photoreal_prefetched or ck in self.photoreal_jobs or built(t.key) or t in batch:
+                    continue
+                batch.append(t)
+            if not batch:
+                return
+            fut = self._photoreal_prefetch(anchor, batch)
+            if fut is None:
+                return
+            for t in batch:
+                self.photoreal_prefetched[(anchor.id, t.key)] = fut
+            if len(self.photoreal_prefetched) > 5000:
+                for ck in list(self.photoreal_prefetched)[:1000]:
+                    if self.photoreal_prefetched[ck].done():
+                        del self.photoreal_prefetched[ck]
+
+    def _photoreal_prefetch(self, anchor, tiles):
+        """Future of photoreal.prefetch_tiles for the tiles in the prefetch process (None: it cannot start).
+        (Called under photoreal_lock.)"""
+        boxes = [(t.bbox, self.photoreal_errs.get(t.level, t.size * PHOTOREAL_ERR_PER_M)) for t in tiles]
+        for attempt in (0, 1):
+            if self.photoreal_prefetch_pool is None:
+                import multiprocessing
+                self.photoreal_prefetch_pool = concurrent.futures.ProcessPoolExecutor(
+                    1, mp_context=multiprocessing.get_context("spawn"),
+                    initializer=photorealmod.worker_init, initargs=(self.cache_dir, logging.getLogger().level))
+            try:
+                fut = self.photoreal_prefetch_pool.submit(photorealmod.prefetch_tiles, anchor.lat, anchor.lon, boxes)
                 break
-            ck = (anchor.id, t.key)
-            if built(t.key) or ck in self.photoreal_jobs:
-                continue
-            if self.photoreal_job(anchor, t, ahead=True) is not None:
-                waiting += 1
-        with self.photoreal_lock:           # jobs never asked for (the car turned): only the latest few hundred
-            stale = []
-            if len(self.photoreal_jobs) > 600:
-                for k in [k for k, (f, _) in self.photoreal_jobs.items() if f.done() and not f.claimed][:200]:
-                    stale.append(self.photoreal_jobs.pop(k)[1])
-        for texture in stale:                   # built ahead, never asked for: its atlas goes too
-            self._remove(os.path.join(self.out_dir, texture))
+            except concurrent.futures.process.BrokenProcessPool:
+                self.photoreal_prefetch_pool = None
+        else:
+            return None
+        fut.add_done_callback(self._photoreal_files)
+        return fut
 
     def photoreal_tile(self, anchor, tile, built, job):
         """(built with the photogrammetry's triangles over tile, texture file, its bytes) from the tile's job, or None
@@ -2131,9 +2165,9 @@ class Server:
                      tile.key, r["err"])
             return None
         self.photoreal_errs[tile.level] = r["err"]
-        log.info("photoreal: tile %s: %d triangles at %g m, %dx%d px, %d fetched, %.1f s build%s, %.1f s since asked",
+        log.info("photoreal: tile %s: %d triangles at %g m, %dx%d px, %d fetched, %.1f s build, %.1f s since asked",
                  tile.key, len(r["tris"]), r["err"], r["px"][0], r["px"][1], r["fetched"], r["seconds"],
-                 " (built ahead)" if fut.ahead else "", time.perf_counter() - fut.t0)
+                 time.perf_counter() - fut.t0)
         P = r["positions"] - np.asarray(built.pos, np.float64)
         return (replace(built, positions=P, normals=r["normals"], uvs=np.zeros((len(P), 2)), planar=r["uv"],
                         tris=r["tris"]), texture, r["tex_bytes"])
@@ -3678,7 +3712,8 @@ class Connection:
         new, refined = farfield.select(*self.view_focus, self.forced(), self.refined, self.s.kfun,
                                        self.s.hysteresis, radius, hold=set(self.node_changed),
                                        min_level=self.s.min_level, radii=self.s.near_radii, layout=self.s.layout,
-                                       forced_level=self.s.forced_level, view=self.view(), **extra)
+                                       forced_level=self.s.forced_level, view=self.view(),
+                                       may_split=self.photoreal_may_split(), **extra)
         if self.desired:                # the first selection of an anchor is not a change
             for n in refined ^ self.refined:
                 self.node_changed[n] = now
@@ -3690,6 +3725,36 @@ class Connection:
             self.dirty = True
             self.batch = [time.perf_counter(), 0, 0]
         self.wake.set()
+
+    def photoreal_may_split(self):
+        """Photoreal: the near levels refine one level at a time (the node's photo children are asked for once the
+        node itself is shown). Jumping several levels made one swap group of a coarse tile and every finer tile
+        inside it, and while the car moved over it that group kept changing before all of it was built: in a
+        simulated drive at 54 km/h nothing near the car was swapped in for over a minute (2026-10-25)."""
+        if self.s.photoreal is None:
+            return None
+        aid = self.active
+        shown = {farfield.tile_of(k).node for a, k in self.shown if a == aid}
+        if not shown:
+            return None
+        above = set()                   # strict ancestors of the shown tiles (refined in the shown layout)
+        for lvl, i, j in shown:
+            while lvl < farfield.HORIZON_MAX_LEVEL:
+                lvl, i, j = lvl + 1, i >> 1, j >> 1
+                if (lvl, i, j) in above:
+                    break
+                above.add((lvl, i, j))
+
+        def may_split(node):
+            lvl, i, j = node
+            if lvl - 1 > PHOTOREAL_MAX_LEVEL or node in shown or node in above:
+                return True
+            while lvl < farfield.HORIZON_MAX_LEVEL:      # inside a coarser shown tile: not yet
+                lvl, i, j = lvl + 1, i >> 1, j >> 1
+                if (lvl, i, j) in shown:
+                    return False
+            return True                 # nothing shown here (a new area): any depth
+        return may_split
 
     def view(self):
         """The camera for screen-space LOD (farfield.View) from pose.cam (x, y, z, fovDeg, h: the screen's height px),
@@ -3722,6 +3787,10 @@ class Connection:
         aid = self.active
         cur = {k for a, k in self.shown if a == aid}
         self.groups = farfield.swap_groups(cur, self.desired)
+        if self.s.photoreal is not None:    # photoreal: since when each group is wanted (its far_swap logs the wait)
+            now = time.monotonic()
+            since = getattr(self, "group_since", {})
+            self.group_since = {g: since.get(g, now) for g in (tuple(a) for a, _ in self.groups)}
         # Sent tiles no group needs any more: the mod drops them.
         needed = {k for adds, _ in self.groups for k in adds}
         for k in [k for k in self.sent if k not in needed]:
@@ -3808,6 +3877,15 @@ class Connection:
             self.next_group += 1
             self.send({"type": "far_swap", "anchorId": aid, "id": gid, "add": adds, "remove": removes,
                        "dIn": round(d_in, 2), "dOut": round(d_out, 2)})
+            if self.s.photoreal is not None and adds:
+                lvl = farfield.tile_of(adds[0]).level
+                if lvl <= PHOTOREAL_MAX_LEVEL:
+                    t = getattr(self, "group_since", {}).get(tuple(adds))
+                    dist = min(farfield.tile_of(k).distance(*self.focus) for k in adds)
+                    log.info("photoreal: swap to L%d (%d tiles) at %.0f m from the car, %.1f s after it was wanted, "
+                             "%.0f km/h, %d tiles building, %d queued", lvl, len(adds), dist,
+                             time.monotonic() - t if t is not None else -1.0, 3.6 * math.hypot(*self.vel),
+                             len(self.inflight), len(self.queue) - self.qi)
             if log.isEnabledFor(logging.DEBUG) and adds and removes:   # the pop's size on screen: amplitude / distance
                 dist = min(farfield.tile_of(k).distance(*self.focus) for k in adds + removes)
                 log.debug("far_swap %d L%d->L%d dIn %.1f dOut %.1f at %.0f m (%.2f mrad)", gid,
@@ -3872,6 +3950,10 @@ class Connection:
             # (GIL), and three far workers made a block build 3-10x slower (landcover 1.4 s vs 0.1 s), too slow
             # to follow a car at 58 m/s (2026-10-12). The far tile finishing next refills the workers.
             workers = HM_BUSY_TILE_WORKERS if self.s.hm_here else self.s.tile_workers
+            if self.s.hm_here and self.s.photoreal is not None:
+                # photoreal: the near tiles are built in their own processes (the thread only waits): not held
+                # back to one at a time by each physics block the car's drive builds
+                workers += PHOTOREAL_PROCS
             # plus the helpers' slots (compute sharing): their tiles cost this process only the files (26 ms a
             # tile); kept to the local workers, a Steam Deck sent 2 at a time to 12 idle helper workers (2026-10-22)
             workers += self.s.remote_slots()
@@ -4400,6 +4482,10 @@ def main():
         ap.error("--horizon needs --near-visual mesh (terrain mode is frozen at the v1.3.1 layout)")
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    if os.environ.get("BNGE_LOG_FILE"):         # personal fork: run_photoreal.bat's log, to send after a drive
+        fh = logging.FileHandler(os.environ["BNGE_LOG_FILE"], mode="w", encoding="utf-8")
+        fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+        logging.getLogger().addHandler(fh)
     raise_open_files()
     import fast
     try:

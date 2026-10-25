@@ -367,7 +367,7 @@ SSE_SPACING_CAP = 2.0
 
 def select(px, py, forced=(), prev_refined=frozenset(), kfun=None, h=HYSTERESIS,
            radius=RADIUS, max_level=MAX_LEVEL, hold=frozenset(), min_level=0, radii=None, layout=V131,
-           disc=False, horizon=None, forced_level=0, view=None):
+           disc=False, horizon=None, forced_level=0, view=None, may_split=None):
     """Desired tiles for a player at (px, py).
 
     forced: bboxes (terrain blocks) under which everything is refined to `forced_level` (terrain mode:
@@ -382,6 +382,7 @@ def select(px, py, forced=(), prev_refined=frozenset(), kfun=None, h=HYSTERESIS,
     horizon, with its subtree (the server passes it with disc=True and max_level HORIZON_MAX_LEVEL).
     view: a View (screen-space LOD): nodes whose known geometric error would pop more than view.tau px on
     screen split too (within view.reach x the switch distance), distances from the camera.
+    may_split(node): False keeps a node that would split whole (earthd photoreal: one level at a time).
     Returns ({key: Tile}, set of refined nodes)."""
     kfun = kfun or layout.k
     radii = NEAR_RADII[layout.cells] if radii is None else radii
@@ -417,6 +418,8 @@ def select(px, py, forced=(), prev_refined=frozenset(), kfun=None, h=HYSTERESIS,
                     px_ = view.pixels(node, x0, y0, x1, y1)
                     if px_ is not None:
                         split = px_ > view.tau or (node in prev_refined and px_ > view.tau / (1.0 + view.h))
+            if split and may_split is not None and not may_split(node):
+                split = False
             if split:
                 refined.add(node)
                 i2, j2 = 2 * i, 2 * j

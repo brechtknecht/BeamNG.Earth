@@ -166,6 +166,18 @@ class PhotorealTest(unittest.TestCase):
         self.assertTrue(seen and all(p.startswith(self.p.cache_dir) and n > 0 for p, n in seen))
 
 
+class OneLevelTest(unittest.TestCase):
+    def test_may_split_keeps_nodes_whole(self):
+        import farfield as ff
+        free, _ = ff.select(0.0, 0.0, layout=ff.Layout(32, 1024, mesh=True), min_level=-2)
+        self.assertEqual(min(t.level for t in free.values()), -2)
+        held, _ = ff.select(0.0, 0.0, layout=ff.Layout(32, 1024, mesh=True), min_level=-2,
+                            may_split=lambda node: node[0] > 0)
+        self.assertEqual(min(t.level for t in held.values()), 0)
+        cover = lambda tiles: sum(t.size ** 2 for t in tiles.values())
+        self.assertAlmostEqual(cover(free), cover(held))
+
+
 class DiskBudgetTest(unittest.TestCase):
     def test_lru_over_cap(self):
         with tempfile.TemporaryDirectory() as d:
