@@ -219,6 +219,8 @@ PHOTOREAL_PREFETCH_BATCHES = PHOTOREAL_PREFETCH_PROCS + 1      # in flight (one 
 PHOTOREAL_PREFETCH_WAIT_S = 6.0         # a build whose tile is downloading waits this long for it (not twice)
 PHOTOREAL_BUILD_PATH_M = 400.0          # the near tiles' build order: along the road this far ahead
 PHOTOREAL_SIDE_W = 1.5                  # ... by distance along the road + this x distance from it
+PHOTOREAL_FAR_BUDGET_MS = 4.0           # hello.farBudgetMs: the mod's far-tile import budget (its maximum; default 2)
+PHOTOREAL_GAME_LOG_S = 5.0              # the game's import queue (pose.ffq) logged this often
 PHOTOREAL_FOCUS_S = 3.0                 # the layout centred this far ahead of the car while driving (select_focus)
 PHOTOREAL_FOCUS_M = 90.0                # m at most
 PHOTOREAL_OFFSET_R = 128.0              # m: the geoid offset is measured over this half side around the anchor
@@ -3089,6 +3091,8 @@ class Connection:
             if self.s.imagery is not None:      # the world map credits the sources its view shows
                 m["imageryCredits"] = self.s.imagery.credits_by_area()
                 m["otherCredits"] = self.s.attribution_rest()
+            if self.s.near_visual == "photoreal":    # the heavy photo tiles: the mod's largest far-tile budget
+                m["farBudgetMs"] = PHOTOREAL_FAR_BUDGET_MS
             if lay.format >= 4:         # M1: the tiles' cell count (crossover.defaultErr, the exact level)
                 m["cells"] = lay.cells
             if lay.block != heightmap.SIZE:     # M4: the terrain block size (the mod's lattice / follow table)
@@ -3461,6 +3465,24 @@ class Connection:
         self._set_block(aid, cx, cy)
         self.update_far()
 
+    def log_game_queue(self, q):
+        """photoreal: the game's far-tile import queue (pose.ffq) every PHOTOREAL_GAME_LOG_S: whether the game or the
+        server is behind when the car outruns the photo tiles."""
+        now = time.monotonic()
+        last = getattr(self, "ffq_last", None)
+        if last is not None and now - last[0] < PHOTOREAL_GAME_LOG_S:
+            return
+        try:
+            imp, debt = float(q.get("imp", 0)), float(q.get("debt", 0))
+            if last is not None:
+                dt = now - last[0]
+                log.info("photoreal: game: %d tiles to import, %d swap groups waiting, %.1f imports/s, budget %.1f ms "
+                         "a frame, tokens %.0f ms, engine debt %.0f ms/s", int(q.get("q", 0)), int(q.get("g", 0)),
+                         (imp - last[1]) / dt, float(q.get("b", 0)), float(q.get("tok", 0)), (debt - last[2]) / dt)
+            self.ffq_last = (now, imp, debt)
+        except (TypeError, ValueError):
+            pass
+
     def slots_gone(self, gone):
         """pose.slotsGone [[slot, serial], ...]: the mod's objects (or never-spawned instances) of those far_tile
         messages are gone; a slot whose latest send is among them is no longer held by this game."""
@@ -3482,6 +3504,8 @@ class Connection:
 
     def on_pose(self, msg):
         self.slots_gone(msg.get("slotsGone"))
+        if self.s.photoreal is not None and isinstance(msg.get("ffq"), dict):
+            self.log_game_queue(msg["ffq"])
         held = msg.get("held")
         if isinstance(held, dict):      # an empty Lua table may encode as {}
             held = list(held.values())

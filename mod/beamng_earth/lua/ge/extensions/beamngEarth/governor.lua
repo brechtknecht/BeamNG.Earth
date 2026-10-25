@@ -53,8 +53,13 @@ M.EST_ALPHA = 0.2          -- cost EMA gain
 -- textures cost the NEXT frame's engine "Ticking" 50-250 ms, which no unit's measured Lua cost included, so the bucket
 -- kept importing at full rate and every frame ran 100+ ms): each frame's engine tick beyond ENGINE_FREE_MS is a debt on
 -- the bucket (chargeEngine), at most ENGINE_MAX_DEBT_MS, so imports wait until the budget has paid for it.
+-- Free: ENGINE_FREE_MS over the median tick of the last ENGINE_BASE_FRAMES frames, not over zero: photoreal's scene
+-- (thousands of photogrammetry objects) ticks above a fixed 2 ms + the budget all the time, the bucket never left the
+-- debt and nothing imported any more, far tiles nor roads (Felix's drive, 2026-10-25: "a hard edge, then no photo
+-- tiles, and later no roads either").
 M.ENGINE_FREE_MS = 2.0
 M.ENGINE_MAX_DEBT_MS = 50.0
+M.ENGINE_BASE_FRAMES = 120
 -- Prior cost estimates (ms) per unit kind: in-game P5/P6 (2026-10-10): a 2k-tri .cdae first load
 -- 3.4 ms (8k-tri 1.5 ms; v1.2 drive EMA 1.93), a 2k-tri .dae 7.5-25 ms; unhide is free; setPosition
 -- ~0.006 ms (p6). v1.3 satellite imagery (lead probe p_sat.lua): a Lua-created per-tile Material
@@ -114,6 +119,7 @@ function M.new(opts)
     quiet = 0,          -- quiet frames still to come after a heavy op
     blocked = false,    -- no units this frame (quiet or heavy)
     stats = { heavy = 0, units = 0, maxFrameSpent = 0 },
+    engHist = {}, engN = 0, engineBase = 0, -- recent engine ticks (chargeEngine's baseline: their median)
     frameLog = {},      -- this frame's charges "kind:ms" (the slow-frame record)
   }, Gov)
   if opts.targetMs then g:setTarget(opts.targetMs) end
@@ -222,7 +228,20 @@ end
 -- The previous frame's engine tick (ms, Engine.Debug metrics "Ticking"): its excess is a debt on the bucket.
 function Gov:chargeEngine(tickMs)
   self.lastEngineMs = tickMs and math.floor(tickMs + 0.5) or nil
-  local debt = max(0, (tickMs or 0) - M.ENGINE_FREE_MS)
+  local base = 0
+  if tickMs then
+    local h = self.engHist
+    self.engN = self.engN % M.ENGINE_BASE_FRAMES + 1
+    h[self.engN] = tickMs
+    if #h >= 16 then
+      local sorted = {}
+      for i = 1, #h do sorted[i] = h[i] end
+      table.sort(sorted)
+      base = sorted[math.floor((#sorted + 1) / 2)]
+    end
+  end
+  self.engineBase = base
+  local debt = max(0, (tickMs or 0) - base - M.ENGINE_FREE_MS)
   if debt <= 0 then return 0 end
   self.tokens = max(-M.ENGINE_MAX_DEBT_MS, self.tokens - debt)
   self.stats.engineDebt = (self.stats.engineDebt or 0) + debt
@@ -277,7 +296,8 @@ function Gov:snapshot()
     heavyPending = self.heavyPending, estCdae = self.est.cdae, estDae = self.est.dae, estCdaeTex = self.est.cdaeTex,
     estCdaeTex128 = self.est.cdaeTex128, estCdaeTex256 = self.est.cdaeTex256, estCdaeTex512 = self.est.cdaeTex512,
     estMaterial = self.est.material, estMatDelete = self.est.matDelete, heavy = self.stats.heavy,
-    units = self.stats.units, maxFrameSpent = self.stats.maxFrameSpent, engineDebt = self.stats.engineDebt }
+    units = self.stats.units, maxFrameSpent = self.stats.maxFrameSpent, engineDebt = self.stats.engineDebt,
+    engineBase = self.engineBase }
 end
 
 M.Gov = Gov

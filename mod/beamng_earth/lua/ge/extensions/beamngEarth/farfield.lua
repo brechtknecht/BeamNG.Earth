@@ -1479,6 +1479,15 @@ function M.stats()
     retexStale = counters.retexStale, retexFailed = counters.retexFailed, overBlock = over, overBlockLevel = overLevel, partial = partial }
 end
 
+-- The import queue for the pose's 'ffq' (cheap, every pose; stats() walks every tile): tiles waiting to import, swap
+-- groups waiting for their tiles, imports so far (the server logs the rate; photoreal, 2026-10-25: whether the game or
+-- the server is behind when the car outruns the photo tiles).
+function M.queueInfo()
+  local waiting = 0
+  for _, g in ipairs(groups) do if g.state == 'wait' then waiting = waiting + 1 end end
+  return { q = nQueued, g = waiting, imp = counters.imports }
+end
+
 ------------------------------------------------------------------------------------------
 -- dev tools (dev.lua): see the module header
 

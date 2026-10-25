@@ -117,6 +117,14 @@ local st -- all runtime state, see resetState()
 local rebaseLag = 0 -- frames between a vehicle move request and its visibility (measured, see commitRebase)
 local roadsSession = nil -- the server session whose road tiles are shown (roads.lua)
 local gov = governor.new() -- outlives levels (keeps its target and cost estimates)
+
+-- pose.ffq: the far tiles' import queue (farfield.queueInfo) and the governor's budget now (b, ms per frame), its
+-- tokens (negative: the engine's debt for new tiles) and the engine debt charged so far (ms)
+local function ffQueue()
+  local q = farfield.queueInfo()
+  q.b, q.tok, q.debt = gov.b, gov.tokens, gov.stats.engineDebt or 0
+  return q
+end
 local warned = {}          -- one-time warnings
 local nearVisual = 'terrain' -- from the server's hello; outlives levels like the connection
 local serverAttribution = nil -- hello.attribution (protocol 4): the credits for the sources it uses
@@ -696,6 +704,8 @@ local function onMessage(msg)
     end
     -- M1 (FORMAT 4): the tiles' cells per edge; a FORMAT 3 server sends none (32). It sets the
     -- crossover's fallback error and the exact (physics lattice) level of the exactMiss metric.
+    -- the server's far-tile budget (ms per frame; photoreal's heavy tiles): the governor's target, else the default
+    if msg.farBudgetMs then gov:setTarget(msg.farBudgetMs) end
     local cells = crossover.setCells(msg.cells)
     farfield.setExactLevel(farfield.exactLevelFor(cells))
     -- every far tile references the server's material name; this mod ships (and loads) one
@@ -1092,6 +1102,7 @@ local function updateWorld(dt)
       sessions = farfield.heldSessions(),
       slotsGone = slotsGoneNow(), -- pooled shape slots let go (server/matslots.py)
       foci = poseFoci(),          -- other vehicles' collision islands (collisionfoci.lua; earthd parse_foci)
+      ffq = ffQueue(),            -- the far tiles' import queue and budget (earthd logs it with --near-visual photoreal)
       cam = c and { x = c.x, y = c.y, z = c.z, fx = c.fx, fy = c.fy, fz = c.fz, fovDeg = c.fovDeg, h = c.h } or nil })
   end
 

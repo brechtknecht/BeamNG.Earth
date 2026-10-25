@@ -108,7 +108,9 @@ MOD_TO_SERVER = {
              # pooled far-tile slots whose far_tile's object is gone: [[slot, serial], ...] (matslots.py)
              "slotsGone": F((list, dict), OPT),
              # other vehicles' collision foci [{x, y, r, trees}] (collisionfoci.lua; earthd parse_foci)
-             "foci": F((list, dict), OPT)},
+             "foci": F((list, dict), OPT),
+             # the far tiles' import queue {q, g, imp, b, tok, debt} (farfield.queueInfo; earthd logs it in photoreal)
+             "ffq": F(dict, OPT)},
     # the download cache (cache.py; additive): the page's size cap (GB, 0 = unlimited), a clear, or
     # neither (fresh usage numbers); always answered with a 'cache'
     "cache": {"capGb": F(NUM, OPT), "clear": F(bool, OPT)},
@@ -163,7 +165,8 @@ SERVER_TO_MOD = {
               "prewarm": F(str, OPT),           # the shape listing our shapes' materials (prewarm.py; with map data)
               # the world map's credits for its view: [[credit, w, s, e, n] or [credit]] per imagery source, and
               # the rest (weather, elevation); with imagery on only
-              "imageryCredits": F(list, OPT), "otherCredits": F(str, OPT)},
+              "imageryCredits": F(list, OPT), "otherCredits": F(str, OPT),
+              "farBudgetMs": F(NUM, OPT)},      # the governor's far-tile budget (--near-visual photoreal only)
     "status": {"text": F(str),
                "backlog": F(int),           # v1.4 M0: desired - shown far tiles of the current anchor
                "radius": F(NUM, OPT)},      # v1.4 M1h: the far-field radius (m), --horizon only

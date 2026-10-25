@@ -216,4 +216,19 @@ do
   T.check(g.tokens >= -governor.ENGINE_MAX_DEBT_MS, "the debt is capped")
   T.check(g:chargeEngine(1.5) == 0, 'a normal tick is free')
 end
+
+-- a scene that always ticks slow (photoreal: thousands of objects) is no debt: only a tick above its usual one is
+-- (Felix's drive, 2026-10-25: a steady 10 ms tick kept the bucket in debt, nothing imported any more)
+do
+  local t = 0
+  local g = governor.new({ clock = function() return t end })
+  g:try('cdae')
+  local frames = 0
+  repeat
+    t = t + 16; g:beginFrame(true); g:chargeEngine(10); frames = frames + 1
+  until (frames > 30 and g:try('cdae')) or frames > 600
+  T.check(frames < 200, 'a steady 10 ms engine tick: imports go on (' .. frames .. ' frames)')
+  T.check(g:chargeEngine(10) == 0, 'the usual tick is free')
+  T.check(g:chargeEngine(60) > 40, 'a spike above it is a debt')
+end
 T.done('test_governor')
