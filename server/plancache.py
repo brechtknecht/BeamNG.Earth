@@ -143,6 +143,13 @@ class PlanCache:
     def release(self, key):
         xproc.release(self._path(key) + ".lock")
 
+    def busy(self, key):
+        """True while another process holds cell key's lock (planning it): a lookahead plans another cell meanwhile."""
+        try:
+            return time.time() - os.path.getmtime(self._path(key) + ".lock") <= xproc.STALE_S
+        except OSError:
+            return False
+
 
 def _newest(d, depth=2):
     """The newest mtime of folder d and the folders up to depth levels below it (a run's anchor and signature

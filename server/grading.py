@@ -436,6 +436,7 @@ class Grader:
 
     def _make_cell(self, key):
         """(plans, keeps, covers, opens) of cell key, or None when its roads could not be fetched."""
+        t0 = time.perf_counter()
         try:
             feats = self.md.cell(key, layers=("roads",), kind="demand").layers.get("roads")
         except Exception as e:      # no road data: ungraded (asked again after RETRY_S)
@@ -443,6 +444,7 @@ class Grader:
             with self.lock:
                 self.failed[key] = time.monotonic()
             return None
+        t1 = time.perf_counter()
         plans = []
         if feats is not None and len(feats):
             specs = roadsmod.road_specs(feats, None, self.widths)
@@ -508,6 +510,8 @@ class Grader:
             opens = [(xy, spec) for _f, spec, xy, _z, k in secs if k == 0]
         else:
             covers, opens, keeps = [], [], []
+        log.info("grading: cell %s planned in %.2f s (its roads %.2f s, %d plans)", key, time.perf_counter() - t0,
+                 t1 - t0, len(plans))
         return plans, keeps, covers, opens
 
     def _clip_box(self, key, margin=CLIP_MARGIN_M):

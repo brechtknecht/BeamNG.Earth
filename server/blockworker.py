@@ -183,17 +183,38 @@ def _read_warm(warm_q):
             continue
         with _s.cv:
             _s.want = [(g, k) for k in keys]
-            _s.cv.notify()
+            _s.cv.notify_all()
 
 
-def _warm_loop():
+WARM_THREADS = 3        # cells planned ahead at once: a fresh cell's plan is mostly waiting on its downloads (17-90 s,
+                        # ~1 s of CPU), and one at a time fell behind a car crossing a ~1.6 km cell in 50 s (2026-10-25)
+
+
+def _next_warm(busy):
+    """The most urgent wanted cell not planned, not being planned here (busy) nor by another process; None if none."""
+    for g, k in _s.want:
+        if k in busy or g.planned(k):
+            continue
+        shared = getattr(g, "shared", None)
+        if shared is not None and shared.busy(k):
+            continue
+        return g, k
+    return None
+
+
+def _warm_loop(busy=None):
+    if busy is None:                    # (the first thread starts the others, sharing its busy set)
+        busy = set()
+        for _ in range(WARM_THREADS - 1):
+            threading.Thread(target=_warm_loop, args=(busy,), daemon=True, name="roads-ahead").start()
     while True:
         with _s.cv:
             job = None
             while job is None:
-                job = next(((g, k) for g, k in _s.want if not g.planned(k)), None)
+                job = _next_warm(busy)
                 if job is None:
-                    _s.cv.wait()
+                    _s.cv.wait(WARM_IDLE_S)     # (another process's cell done: look again)
+            busy.add(job[1])
         try:
             t0 = time.perf_counter()
             job[0].warm(job[1])
@@ -202,6 +223,13 @@ def _warm_loop():
             log.exception("road plans ahead for %s", job[1])
             with _s.cv:
                 _s.want = [w for w in _s.want if w[1] != job[1]]
+        finally:
+            with _s.cv:
+                busy.discard(job[1])
+                _s.cv.notify_all()
+
+
+WARM_IDLE_S = 2.0
 
 
 def ground(frame, la, lo, z):

@@ -80,6 +80,7 @@ from dataclasses import dataclass, field, replace  # noqa: E402
 import numpy as np  # noqa: E402
 from PIL import Image  # noqa: E402
 
+import aheadpath  # noqa: E402
 import blockworker  # noqa: E402
 import cache as cachemod  # noqa: E402
 import cdae  # noqa: E402
@@ -266,7 +267,8 @@ HM_BUSY_TILE_WORKERS = 1    # far tiles built at once while a physics block is b
                             # anchor's first, or every one with --block-process off; the block processes' blocks do
                             # not share its interpreter: far tiles one at a time behind them were most of a Steam
                             # Deck's far field time, blocks building nearly all the time while driving, 2026-10-20)
-WARM_STEPS_S = (0.0, 10.0, 20.0, 30.0)   # s ahead on the player's straight path whose road cells are planned early
+WARM_STEPS_S = (0.0, 10.0, 20.0, 30.0)   # s ahead on the player's straight path whose lazy imagery is fetched early
+                                         # (the road plans: aheadpath.points)
 WARM_AROUND = 2000.0        # m: and every cell this close to the player (any heading)
 PREFETCH_START = 200.0      # m (Chebyshev) from the block centre before prefetching
 # The mod's terrain-follow rule (mod follow.lua): it asks once the player is more than
@@ -1232,16 +1234,18 @@ class Server:
                                                               anchor.grader.wet)
             return anchor.grader
 
-    def warm_roads(self, anchor, x, y, vx, vy):
-        """Queue the road plans of the cells the physics block will cover along the player's straight path
-        (WARM_STEPS_S; the block's half width + the grading pad), then those within WARM_AROUND."""
+    def warm_roads(self, anchor, x, y, vx, vy, turn=0.0):
+        """Queue the road plans of the cells the physics block will cover along the player's way ahead
+        (aheadpath.points: LEAD_S of driving, bending with the turn; the block's half width + the grading pad + the
+        path's spread), in the order the player reaches them, then those within WARM_AROUND."""
         g = self.grader_for(anchor)
         if g is None:
             return
         reach = self.layout.block * heightmap.SQUARE / 2 + gradingmod.T_MAX + 40.0
+        path = aheadpath.points(x, y, vx, vy, turn) or [(0.0, x, y, 0.0)]
         keys = []
-        for t, r in [(t, reach) for t in WARM_STEPS_S] + [(0.0, WARM_AROUND)]:
-            la, lo, _ = anchor.frame.enu_to_geodetic(x + vx * t, y + vy * t, 0.0)
+        for px, py, r in [(px, py, reach + sp) for _t, px, py, sp in path] + [(x, y, WARM_AROUND)]:
+            la, lo, _ = anchor.frame.enu_to_geodetic(px, py, 0.0)
             la, lo = float(la), float(lo)
             dlat = r / 111320.0
             dlon = r / (111320.0 * max(0.05, math.cos(math.radians(la))))
@@ -2535,6 +2539,7 @@ class Connection:
         self.view_at = None             # the camera's x, y there when it is VIEW_AWAY_M or more from the car, else None
         self.foci = ()                  # other vehicles' collision foci there ((x, y, r, trees), parse_foci)
         self.vel = (0.0, 0.0)
+        self.track = aheadpath.Track()  # the player's recent headings (its turn: the road plans' lookahead)
         self.cam = None                 # pose.cam (protocol 3), kept for diagnostics
         self.desired = {}               # key -> Tile (active anchor)
         self.refined = set()            # nodes refined by the last selection (hysteresis)
@@ -3370,8 +3375,10 @@ class Connection:
             self.refresh_status()
             return
         self.maybe_prefetch()
+        if aid == self.active:
+            self.track.add(time.monotonic(), *self.focus, *self.vel)
         if aid == self.active and self.following:
-            self.s.warm_roads(self.s.anchors[aid], *self.focus, *self.vel)
+            self.s.warm_roads(self.s.anchors[aid], *self.focus, *self.vel, self.track.turn())
             self.s.warm_imagery(self.s.anchors[aid], *self.focus, *self.vel)
             self.s.download_ahead(self.s.anchors[aid], *self.focus, *self.vel)
             self.base_refresh(aid)
