@@ -80,6 +80,8 @@ class Client:
         self.gone = []
         self.first_l2 = {}          # L-2 key -> first time shown
         self.swaps = 0
+        self.driving = False
+        self.by_level = {}          # far tiles sent while driving, per level
 
     def send(self, m):
         self.w.write(protocol.encode(m))
@@ -96,6 +98,9 @@ class Client:
                 if "slotSerial" in m and "material" in m:
                     slot = [int(m["material"].rsplit("_", 1)[1]), m["slotSerial"]]
                 self.sent[m["key"]] = slot
+                if self.driving:
+                    lv = int(m.get("level", 0))
+                    self.by_level[lv] = self.by_level.get(lv, 0) + 1
             elif t == "far_swap":
                 self.swaps += 1
                 for k in m.get("remove", []):
@@ -209,6 +214,7 @@ async def main_async(a):
     samples = []
     s, req = 0.0, 1
     tstart = time.monotonic()
+    c.driving = True
     tasks = []
     while s < km:
         now = time.monotonic()
@@ -247,7 +253,8 @@ async def main_async(a):
     summ = {"km": round(km / 1000, 2), "speed_ms": a.speed, "cells": len(late),
             "l2_never": sum(1 for v in late if v is None),
             "l2_late_median_s": pct(shown, 0.5), "l2_late_p90_s": pct(shown, 0.9),
-            "l2_on_time": sum(1 for v in shown if v <= 0), "swaps": c.swaps}
+            "l2_on_time": sum(1 for v in shown if v <= 0), "swaps": c.swaps,
+            "tiles_sent_by_level": {str(k): v for k, v in sorted(c.by_level.items())}}
     for d in AHEAD:
         lv = [r[f"lvl{int(d)}"] for r in samples]
         summ[f"under_l2_pct_{int(d)}m"] = round(100 * sum(1 for v in lv if v == -2) / max(1, len(lv)))

@@ -30,4 +30,11 @@ try {
     & $py (Join-Path $repo "tools\photoreal_drive.py") --port $Port --from $From --to $To --speed $Speed --km $Km --out $out
 } finally {
     taskkill /T /F /PID $srv.Id 2>$null | Out-Null     # the server and its worker processes
+    if (-not $Warm) {
+        # a cold run's photogrammetry is ~1 GB: gone with the run (they filled the disk, 2026-10-25)
+        "{0:N0} MB downloaded" -f ((Get-ChildItem $cache -Recurse -File -EA SilentlyContinue | Measure-Object Length -Sum).Sum / 1MB) |
+            Tee-Object -FilePath (Join-Path $out "downloaded.txt")
+        Start-Sleep 2
+        Remove-Item -Recurse -Force $cache -EA SilentlyContinue
+    }
 }

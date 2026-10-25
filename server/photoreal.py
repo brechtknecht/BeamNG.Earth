@@ -788,6 +788,66 @@ def build_tile(lat0, lon0, bbox, offset, target_err, verts_max, start_err, tex_p
             "fetched": _worker.fetched - n0, "seconds": time.perf_counter() - t0, "files": files}
 
 
+def downloader_main(cache_dir, level, session, inq, outq, tiles_at_once, fetch_threads):
+    """The photogrammetry downloads (earthd.PhotorealDownloader): a process of its own that walks up to tiles_at_once
+    tiles' trees at once (fetch_threads requests) and reports each tile as soon as its files are on disk; the builds
+    then only decode (a build that fetched itself held a build process for its 1-5 s of round trips). inq: (priority,
+    job id, lat0, lon0, bbox, err), the lowest priority first (the tiles a build waits for before those ahead), None
+    to stop; outq: (job id, error or None, [(cache path, bytes)] of the files read or written since the last report)."""
+    global FETCH_THREADS
+    import geodesy
+    import heapq
+    FETCH_THREADS = fetch_threads
+    worker_init(cache_dir, level, session)
+    files, lock = [], threading.Lock()
+    heap, cv = [], threading.Condition()
+    stop = []
+
+    def on_file(path, n):
+        with lock:
+            files.append((path, n))
+    _worker.on_file = on_file
+    frames = {}
+
+    def one(job, lat0, lon0, bbox, err):
+        f = frames.get((lat0, lon0))
+        if f is None:
+            f = frames[(lat0, lon0)] = geodesy.EnuFrame(lat0, lon0)
+        e = None
+        try:
+            _worker.prefetch(f, bbox, err)
+        except Exception as ex:     # the build fetches what is missing
+            e = f"{type(ex).__name__}: {ex}"
+        with lock:
+            got = files[:]
+            files.clear()
+        outq.put((job, e, got))
+
+    def walker():
+        while True:
+            with cv:
+                while not heap and not stop:
+                    cv.wait()
+                if stop and not heap:
+                    return
+                _, _, m = heapq.heappop(heap)
+            one(*m)
+    threads = [threading.Thread(target=walker, name="photoreal-download", daemon=True) for _ in range(tiles_at_once)]
+    for t in threads:
+        t.start()
+    n = 0
+    while True:
+        m = inq.get()
+        with cv:
+            if m is None:
+                stop.append(True)
+                cv.notify_all()
+                break
+            n += 1
+            heapq.heappush(heap, (m[0], n, m[1:]))
+            cv.notify()
+
+
 def prefetch_tiles(lat0, lon0, boxes):
     """Worker process: Photoreal.prefetch of each (bbox, target_err) in boxes (ENU of the frame at lat0, lon0), all
     at once (each walk is a chain of round trips). -> dict: fetched, files."""

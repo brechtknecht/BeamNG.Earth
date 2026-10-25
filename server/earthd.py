@@ -62,6 +62,7 @@ import asyncio  # noqa: E402
 import contextlib  # noqa: E402
 import glob  # noqa: E402
 import itertools  # noqa: E402
+import queue  # noqa: E402
 import logging  # noqa: E402
 import math  # noqa: E402
 import re  # noqa: E402
@@ -207,14 +208,15 @@ def photoreal_err(level):
 PHOTOREAL_PROCS = int(os.environ.get("BNGE_PHOTOREAL_PROCS", "0")) or max(2, min(6, (os.cpu_count() or 4) // 2))
 PHOTOREAL_PREFETCH_S = 25.0             # the photogrammetry downloaded for the tiles the car reaches within this
 PHOTOREAL_PREFETCH_MAX = 800.0          # m at most ahead (along its road, roadahead.py)
-PHOTOREAL_PREFETCH_TILES = 6            # tiles per download batch (network-bound: cold, a tile is ~1-3 s of
-                                        # round trips through the tree, ~1.3 MB; a build from disk ~0.2 s)
-# in processes of their own: in the server's threads the tree walks took the interpreter lock from the physics blocks
-# (a block's grading 1 s -> 70 s in a simulated drive, 2026-10-25). One process with two batches of 6 got ahead of
-# nothing: 212 of 213 L-2 tiles of a simulated drive at 90 km/h fetched their files when built (2026-10-25)
-PHOTOREAL_PREFETCH_PROCS = int(os.environ.get("BNGE_PHOTOREAL_PREFETCH_PROCS", "3"))
-PHOTOREAL_PREFETCH_BATCHES = PHOTOREAL_PREFETCH_PROCS + 1      # in flight (one waiting for a process)
-PHOTOREAL_PREFETCH_WAIT_S = 6.0         # a build whose tile is downloading waits this long for it (not twice)
+# tiles whose trees are walked at once (network-bound: cold, a tile is ~1-3 s of round trips through the tree, 0.7-0.9
+# MB; a build from disk ~0.2 s), in a process of its own (PhotorealDownloader): in the server's threads the tree walks
+# took the interpreter lock from the physics blocks (a block's grading 1 s -> 70 s in a simulated drive, 2026-10-25)
+PHOTOREAL_PREFETCH_TILES = int(os.environ.get("BNGE_PHOTOREAL_AHEAD_TILES", "16"))
+PHOTOREAL_PREFETCH_FETCH = 32           # ... and the requests it has open at once
+PHOTOREAL_PREFETCH_QUEUE = 8            # tiles handed to it beyond those it walks (the next ones ready to start)
+PHOTOREAL_URGENT_WAIT_S = 8.0           # a build waits this long for its tile's download (then fetches the rest itself)
+# far-tile slots added for the photo tiles: each waits in its thread for its download, then for its build process
+PHOTOREAL_SLOTS = PHOTOREAL_PREFETCH_TILES
 PHOTOREAL_BUILD_PATH_M = 400.0          # the near tiles' build order: along the road this far ahead
 PHOTOREAL_SIDE_W = 1.5                  # ... by distance along the road + this x distance from it
 PHOTOREAL_OFFSET_R = 128.0              # m: the geoid offset is measured over this half side around the anchor
@@ -505,6 +507,77 @@ def predict_request(px, py, vx, vy, cx, cy, rule=FOLLOW_RULES[1024]):
     return predict_centre(px + vx * t, py + vy * t, vx, vy, lead, reach, rule.grid)
 
 
+class PhotorealDownloader:
+    """The photoreal downloads ahead in a process of their own (photoreal.downloader_main): submit() a tile's box, a
+    Future that is done as soon as that tile's files are on disk (a batch's future waited for its slowest tile: builds
+    held their far-tile slot up to 6 s for it, at 150 km/h 7 slots full and ~320 tiles queued behind, 2026-10-25).
+    on_files(files): the cache files it read or wrote (the disk budget's LRU)."""
+
+    def __init__(self, cache_dir, level, session, on_files, tiles_at_once, fetch_threads):
+        import multiprocessing
+        ctx = multiprocessing.get_context("spawn")
+        self.inq, self.outq = ctx.Queue(), ctx.Queue()
+        self.proc = ctx.Process(target=photorealmod.downloader_main, name="photoreal-ahead", daemon=True,
+                                args=(cache_dir, level, session, self.inq, self.outq, tiles_at_once, fetch_threads))
+        self.proc.start()
+        self.on_files = on_files
+        self.futs = {}
+        self.lock = threading.Lock()
+        self.next_id = itertools.count()
+        self.files = 0                  # files read or written so far
+        threading.Thread(target=self._listen, name="photoreal-ahead-results", daemon=True).start()
+
+    def alive(self):
+        return self.proc.is_alive()
+
+    def submit(self, lat0, lon0, bbox, err, priority=1.0):
+        """Future of the tile's download; the lowest priority first (0: a build waits for it)."""
+        fut = concurrent.futures.Future()
+        job = next(self.next_id)
+        with self.lock:
+            self.futs[job] = fut
+        self.inq.put((priority, job, lat0, lon0, tuple(bbox), err))
+        return fut
+
+    def in_flight(self):
+        with self.lock:
+            return len(self.futs)
+
+    def _listen(self):
+        while True:
+            try:
+                job, err, files = self.outq.get(timeout=5.0)
+            except queue.Empty:
+                if not self.proc.is_alive():        # its futures never come: let their builds go on
+                    with self.lock:
+                        futs, self.futs = list(self.futs.values()), {}
+                    for f in futs:
+                        f.set_exception(RuntimeError("photoreal downloader stopped"))
+                    return
+                continue
+            except (EOFError, OSError):
+                return
+            self.files += len(files)
+            if files:
+                try:
+                    self.on_files(files)
+                except Exception as e:
+                    log.debug("photoreal downloads: %s", e)
+            with self.lock:
+                fut = self.futs.pop(job, None)
+            if fut is not None:
+                if err is None:
+                    fut.set_result(len(files))
+                else:
+                    fut.set_exception(RuntimeError(err))
+
+    def close(self):
+        try:
+            self.inq.put(None)
+        except (OSError, ValueError):
+            pass
+
+
 def _num(msg, name, default=None):
     v = msg.get(name, default)
     if v is None:
@@ -641,10 +714,10 @@ class Server:
         self.photoreal_pool = None          # ProcessPoolExecutor (photoreal.build_tile), made on first use
         self.photoreal_jobs = {}            # (anchor id, key) -> (future, texture file): asked for or built ahead
         self.photoreal_lock = threading.Lock()
-        self.photoreal_prefetch_pool = None  # ProcessPoolExecutor (photoreal.prefetch_tiles), made on first use
+        self.photoreal_downloader = None    # PhotorealDownloader (the downloads ahead), started on first use
         self.photoreal_prefetched = {}      # (anchor id, key) -> Future of the download (insertion order: oldest out)
         self.road_ahead = {}                # anchor id -> roadahead.RoadAhead (photoreal: the car's road ahead)
-        self.photoreal_ahead_stats = {"batches": 0, "tiles": 0, "files": 0}     # the downloads ahead done
+        self.photoreal_ahead_stats = {"tiles": 0}       # the downloads ahead done
         self.photoreal_offset_lock = threading.Lock()   # (held for a measurement: never taken on the event loop)
         self.imagery_failures = 0           # tiles that fell back to the palette (network trouble)
         self.imagery_worker = 0             # far textures the far-tile processes rendered (blockworker.far_tile)
@@ -670,7 +743,9 @@ class Server:
         self.cache_dir = cache_dir
         self.share_lock, self.group_helper = threading.Lock(), None    # (share_start: a BeamMP group's server)
         self.tile_pool = ThreadPoolExecutor(tile_workers + (peerworkmod.MAX_SLOTS if hasattr(far_pool, "remote_slots")
-                                                            else 0), thread_name_prefix="far")
+                                                            else 0)
+                                            + (PHOTOREAL_SLOTS if near_visual == "photoreal" else 0),
+                                            thread_name_prefix="far")
         # Road plans (grading) of the map cells ahead of the player, made before a block needs them: a
         # cell's first plans (and street widths) take 2-10 s, more than a block move allows at speed
         # One thread takes the most urgent cell of the latest pose's list each time (not a FIFO: cells
@@ -2074,14 +2149,24 @@ class Server:
         off = self.photoreal_offset(anchor)
         if off is None:
             return None
-        pre = self.photoreal_prefetched.get(ck)
+        waited = time.perf_counter()
+        with self.photoreal_lock:
+            pre = self.photoreal_prefetched.get(ck)
+            if pre is None or (pre.done() and (pre.cancelled() or pre.exception() is not None)):
+                # not downloaded ahead: downloaded now, before the tiles ahead (a build that fetched itself held one
+                # of the few build processes for its 1-5 s of round trips: at 150 km/h ~4 tiles/s in all, 2026-10-25)
+                dl = self._photoreal_dl()
+                if dl is not None:
+                    pre = self.photoreal_prefetched[ck] = dl.submit(
+                        anchor.lat, anchor.lon, tile.bbox,
+                        max(photoreal_err(tile.level), self.photoreal_errs.get(tile.level, 0.0)), priority=0.0)
         if pre is not None and not pre.done():
-            # its files are downloading in the prefetch processes: wait for them rather than fetch them twice (this
-            # is a far-tile worker thread)
+            # this is a far-tile worker thread (waiting costs a thread, not a build process)
             try:
-                pre.result(timeout=PHOTOREAL_PREFETCH_WAIT_S)
+                pre.result(timeout=PHOTOREAL_URGENT_WAIT_S)
             except Exception:
                 pass
+        waited = time.perf_counter() - waited
         texture = self.texture_name(anchor.id, tile.key, self.tex_rev.get(ck, 0))
         try:
             fut = self._photoreal_submit(
@@ -2092,6 +2177,7 @@ class Server:
             log.warning("photoreal: tile %s: %s", tile.key, e)
             return None
         fut.t0 = time.perf_counter()
+        fut.waited = waited
         fut.add_done_callback(self._photoreal_files)
         with self.photoreal_lock:
             self.photoreal_jobs[ck] = (fut, texture)
@@ -2164,8 +2250,8 @@ class Server:
     def photoreal_ahead(self, anchor, path, built):
         """On the car's way (path: road_path out to PHOTOREAL_PREFETCH_S): the photogrammetry of the near tiles it
         will show downloaded into the disk cache, the road's next tiles first (_photoreal_near), so their builds read
-        it from disk (cold, a tile waited seconds for its round trips; from disk it builds in ~0.2 s). Batches of
-        PHOTOREAL_PREFETCH_TILES in PHOTOREAL_PREFETCH_PROCS processes, PHOTOREAL_PREFETCH_BATCHES in flight.
+        it from disk (cold, a tile waited seconds for its round trips; from disk it builds in ~0.2 s).
+        PHOTOREAL_PREFETCH_TILES at once in the downloader process (+ PHOTOREAL_PREFETCH_QUEUE waiting there).
         built(key): already a tile."""
         if self.photoreal is None or anchor.id not in self.photoreal_offsets or len(path) < 2:
             return
@@ -2177,65 +2263,60 @@ class Server:
             self.photoreal_ahead_log = now
             ra = self.road_ahead.get(anchor.id)
             st = self.photoreal_ahead_stats
-            log.info("photoreal: ahead: path %.0f m from (%.0f, %.0f) to (%.0f, %.0f), %s; downloads %d batches "
-                     "(%d tiles, %d files), %d in flight", path[-1][2], path[0][0], path[0][1], path[-1][0],
-                     path[-1][1], "on a road" if ra is not None and ra.on_road else "straight on", st["batches"],
-                     st["tiles"], st["files"], sum(1 for f in set(self.photoreal_prefetched.values()) if not f.done()))
+            dl = self.photoreal_downloader
+            log.info("photoreal: ahead: path %.0f m from (%.0f, %.0f) to (%.0f, %.0f), %s; downloads %d tiles done "
+                     "(%d files), %d in flight", path[-1][2], path[0][0], path[0][1], path[-1][0], path[-1][1],
+                     "on a road" if ra is not None and ra.on_road else "straight on", st["tiles"],
+                     dl.files if dl is not None else 0, dl.in_flight() if dl is not None else 0)
         with self.photoreal_lock:
-            busy = sum(1 for f in set(self.photoreal_prefetched.values()) if not f.done())
-            if busy >= PHOTOREAL_PREFETCH_BATCHES:
+            dl = self._photoreal_dl()
+            if dl is None:
                 return
-            todo = []
-            for _, s, t in self._photoreal_near(path, step=2):
+            room = PHOTOREAL_PREFETCH_TILES + PHOTOREAL_PREFETCH_QUEUE - dl.in_flight()
+            if room <= 0:
+                return
+            for order, s, t in self._photoreal_near(path, step=2):
                 ck = (anchor.id, t.key)
-                # the tiles wanted already are the builds' (a download of the same files beside a build doubled
-                # them): only those the car reaches next
+                # the tiles wanted already are the builds' (photoreal_job downloads them first): only those the car
+                # reaches next
                 if s <= 0.0 or ck in self.photoreal_prefetched or ck in self.photoreal_jobs or built(t.key):
                     continue
-                todo.append(t)
-                if len(todo) >= PHOTOREAL_PREFETCH_TILES * (PHOTOREAL_PREFETCH_BATCHES - busy):
+                err = max(photoreal_err(t.level), self.photoreal_errs.get(t.level, 0.0))
+                fut = dl.submit(anchor.lat, anchor.lon, t.bbox, err, priority=1.0 + order)
+                fut.add_done_callback(self._photoreal_counted)
+                self.photoreal_prefetched[ck] = fut
+                room -= 1
+                if room <= 0:
                     break
-            for b in range(0, len(todo), PHOTOREAL_PREFETCH_TILES):
-                batch = todo[b:b + PHOTOREAL_PREFETCH_TILES]
-                fut = self._photoreal_prefetch(anchor, batch)
-                if fut is None:
-                    return
-                for t in batch:
-                    self.photoreal_prefetched[(anchor.id, t.key)] = fut
             if len(self.photoreal_prefetched) > 5000:
                 for ck in list(self.photoreal_prefetched)[:1000]:
                     if self.photoreal_prefetched[ck].done():
                         del self.photoreal_prefetched[ck]
 
-    def _photoreal_prefetch(self, anchor, tiles):
-        """Future of photoreal.prefetch_tiles for the tiles in the prefetch process (None: it cannot start).
+    def _photoreal_dl(self):
+        """The downloader process (PhotorealDownloader), started (again) when needed; None when it cannot start.
         (Called under photoreal_lock.)"""
-        boxes = [(t.bbox, max(photoreal_err(t.level), self.photoreal_errs.get(t.level, 0.0))) for t in tiles]
-        for attempt in (0, 1):
-            if self.photoreal_prefetch_pool is None:
-                import multiprocessing
-                self.photoreal_prefetch_pool = concurrent.futures.ProcessPoolExecutor(
-                    PHOTOREAL_PREFETCH_PROCS, mp_context=multiprocessing.get_context("spawn"),
-                    initializer=photorealmod.worker_init,
-                    initargs=(self.cache_dir, logging.getLogger().level, self._photoreal_session()))
-            try:
-                fut = self.photoreal_prefetch_pool.submit(photorealmod.prefetch_tiles, anchor.lat, anchor.lon, boxes)
-                break
-            except concurrent.futures.process.BrokenProcessPool:
-                self.photoreal_prefetch_pool = None
-        else:
-            return None
-        fut.add_done_callback(self._photoreal_files)
-        n = len(tiles)
+        dl = self.photoreal_downloader
+        if dl is not None and dl.alive():
+            return dl
+        if dl is not None:
+            log.warning("photoreal: the downloads ahead stopped: starting them again")
+        try:
+            self.photoreal_downloader = PhotorealDownloader(
+                self.cache_dir, logging.getLogger().level, self._photoreal_session(), self._photoreal_touch,
+                PHOTOREAL_PREFETCH_TILES, PHOTOREAL_PREFETCH_FETCH)
+        except Exception as e:
+            log.warning("photoreal: no downloads ahead: %s: %s", type(e).__name__, e)
+            self.photoreal_downloader = None
+        return self.photoreal_downloader
 
-        def counted(f):
-            if not f.cancelled() and f.exception() is None:
-                st = self.photoreal_ahead_stats
-                st["batches"] += 1
-                st["tiles"] += n
-                st["files"] += f.result().get("fetched", 0)
-        fut.add_done_callback(counted)
-        return fut
+    def _photoreal_touch(self, files):
+        for path, n in files:
+            self.photoreal_disk.touch(path, n)
+
+    def _photoreal_counted(self, fut):
+        if not fut.cancelled() and fut.exception() is None:
+            self.photoreal_ahead_stats["tiles"] += 1
 
     def photoreal_tile(self, anchor, tile, built, job):
         """(built with the photogrammetry's triangles over tile, texture file, its bytes) from the tile's job, or None
@@ -2255,9 +2336,9 @@ class Server:
                      tile.key, r["err"])
             return None
         self.photoreal_errs[tile.level] = r["err"]
-        log.info("photoreal: tile %s: %d triangles at %g m, %dx%d px, %d fetched, %.1f s build, %.1f s since asked",
-                 tile.key, len(r["tris"]), r["err"], r["px"][0], r["px"][1], r["fetched"], r["seconds"],
-                 time.perf_counter() - fut.t0)
+        log.info("photoreal: tile %s: %d triangles at %g m, %dx%d px, %d fetched, %.1f s build, %.1f s since asked, "
+                 "%.1f s waited for its download", tile.key, len(r["tris"]), r["err"], r["px"][0], r["px"][1],
+                 r["fetched"], r["seconds"], time.perf_counter() - fut.t0, fut.waited)
         P = r["positions"] - np.asarray(built.pos, np.float64)
         return (replace(built, positions=P, normals=r["normals"], uvs=np.zeros((len(P), 2)), planar=r["uv"],
                         tris=r["tris"]), texture, r["tex_bytes"])
@@ -4065,17 +4146,24 @@ class Connection:
             # (GIL), and three far workers made a block build 3-10x slower (landcover 1.4 s vs 0.1 s), too slow
             # to follow a car at 58 m/s (2026-10-12). The far tile finishing next refills the workers.
             workers = HM_BUSY_TILE_WORKERS if self.s.hm_here else self.s.tile_workers
-            if self.s.hm_here and self.s.photoreal is not None:
-                # photoreal: the near tiles are built in their own processes (the thread only waits): not held
-                # back to one at a time by each physics block the car's drive builds
-                workers += PHOTOREAL_PROCS
             # plus the helpers' slots (compute sharing): their tiles cost this process only the files (26 ms a
             # tile); kept to the local workers, a Steam Deck sent 2 at a time to 12 idle helper workers (2026-10-22)
             workers += self.s.remote_slots()
-            while anchor is not None and not self.teleport_pending and len(self.inflight) < workers:
+            # photoreal: the near tiles are downloaded and built in other processes (their thread only waits): slots
+            # of their own, never held back by a physics block (in the 3 far workers' slots a photo tile's waits
+            # capped the far field at ~4 tiles/s: outrun at 150 km/h, 2026-10-25); the other tiles keep theirs
+            photo = PHOTOREAL_SLOTS if self.s.photoreal is not None and self.s.photoreal_offsets.get(self.active) \
+                is not None else 0
+            n_photo = sum(1 for _, t in self.inflight.values() if t.level <= PHOTOREAL_MAX_LEVEL) if photo else 0
+            while anchor is not None and not self.teleport_pending and len(self.inflight) < workers + photo:
                 t = self._next_tile()
                 if t is None:
                     break
+                is_photo = photo and t.level <= PHOTOREAL_MAX_LEVEL
+                if (n_photo >= photo) if is_photo else (len(self.inflight) - n_photo >= workers):
+                    self.qi -= 1            # its kind's slots are full: first again when one frees
+                    break
+                n_photo += 1 if is_photo else 0
                 self.inflight[(anchor.id, t.key)] = (self.s.tile(anchor, t), t)
             if anchor is not None and self.s.imagery is not None and not self.teleport_pending:
                 # a tile at most every PREFETCH_AGAIN_S (a prefetch skips sources short of request tokens): the
