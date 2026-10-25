@@ -103,6 +103,7 @@ import peerwork as peerworkmod  # noqa: E402
 import deshadow as deshadowmod  # noqa: E402
 import farfield  # noqa: E402
 import photoreal as photorealmod  # noqa: E402
+import roadahead as roadaheadmod  # noqa: E402
 import terraincache  # noqa: E402
 import terrainpatch as terrainpatchmod  # noqa: E402
 import geodesy  # noqa: E402
@@ -191,23 +192,35 @@ PHOTOREAL_TEX_PX = int(os.environ.get("BNGE_PHOTOREAL_TEX", "1024"))
 # the tiles' geometric error asked per m of tile edge: 1 m on the 64 m L-2 (32 cells). Coarser when its vertices do not
 # fit one shape (Munich, 2026-10-23: 70 100 vertices at 1 m on a 128 m tile, 21 474 at 8 m; a 64 m one fits at 1 m)
 PHOTOREAL_ERR_PER_M = 1.0 / 64.0
+# ... except per level: the tileset's nodes come at a few errors only, and 1, 2 and 4 m read the same finest nodes (0.67
+# MB a 64 m tile, 2.6 MB a 128 m one); 8 m is the next (0.85 MB a 128 m tile). The 128 m L-1 at 2 m downloaded its 2.6
+# MB, did not fit one shape and was built again at 8 m (Munich, 2026-10-25: two thirds of a drive's 800 MB): it asks for
+# 8 m at once
+PHOTOREAL_ERR = {-1: 8.0}
+
+
+def photoreal_err(level):
+    """The geometric error (m) a photoreal tile of level asks for first."""
+    return PHOTOREAL_ERR.get(level, farfield.level_size(level) * PHOTOREAL_ERR_PER_M)
 # processes building the photoreal tiles (fetch, Draco, atlas, DDS): in the server's threads ~1.5 tiles were built at
 # once (the interpreter lock; Felix's log 2026-10-24: 4 tiles/s, outrun from ~100 km/h). One per core (at most 8): a
 # build waits on its downloads part of the time (simulated city drive at 100 km/h, 4 cores, 2026-10-25: 2 processes
 # built 3.1 tiles/s, the road's 64 m tiles came 3 s late (p90 8 s); 4 built 4.7/s, on time (p90 4 s))
 PHOTOREAL_PROCS = int(os.environ.get("BNGE_PHOTOREAL_PROCS", "0")) or max(2, min(8, os.cpu_count() or 4))
 PHOTOREAL_PREFETCH_S = 25.0             # the photogrammetry downloaded for the tiles the car reaches within this
-PHOTOREAL_PREFETCH_MAX = 800.0          # m at most ahead (along its heading)
-# tiles downloaded at once: latency-bound (a request to Google ~0.3 s however small, 2026-10-25; a tile in a new area
-# 2-6 s of them one after the other down the tree, ~1.3 MB; its build from disk ~0.2 s), so many at once
-PHOTOREAL_PREFETCH_TILES = 16
-PHOTOREAL_PREFETCH_FETCH = 64           # the prefetch process's fetch threads
-# in a process of its own: in the server's threads the tree walks took the interpreter lock from the physics blocks
-# (a block's grading 1 s -> 70 s in a simulated drive, 2026-10-25)
+PHOTOREAL_PREFETCH_MAX = 800.0          # m at most ahead (along its road, roadahead.py)
+PHOTOREAL_PREFETCH_TILES = 6            # tiles per download batch (network-bound: cold, a tile is ~1-3 s of
+                                        # round trips through the tree, ~1.3 MB; a build from disk ~0.2 s)
+# in processes of their own: in the server's threads the tree walks took the interpreter lock from the physics blocks
+# (a block's grading 1 s -> 70 s in a simulated drive, 2026-10-25). One process with two batches of 6 got ahead of
+# nothing: 212 of 213 L-2 tiles of a simulated drive at 90 km/h fetched their files when built (2026-10-25)
+PHOTOREAL_PREFETCH_PROCS = int(os.environ.get("BNGE_PHOTOREAL_PREFETCH_PROCS", "3"))
+PHOTOREAL_PREFETCH_BATCHES = PHOTOREAL_PREFETCH_PROCS + 1      # in flight (one waiting for a process)
+PHOTOREAL_PREFETCH_WAIT_S = 6.0         # a build whose tile is downloading waits this long for it (not twice)
+PHOTOREAL_BUILD_PATH_M = 400.0          # the near tiles' build order: along the road this far ahead
+PHOTOREAL_SIDE_W = 1.5                  # ... by distance along the road + this x distance from it
 PHOTOREAL_FOCUS_S = 3.0                 # the layout centred this far ahead of the car while driving (select_focus)
 PHOTOREAL_FOCUS_M = 90.0                # m at most
-PHOTOREAL_SIDE = 3.0                    # m along the road ahead that 1 m beside it is worth (downloads, build order)
-PHOTOREAL_ROAD_S = 10.0                 # the near tiles' build order: distance to the path this far ahead (max 400 m)
 PHOTOREAL_OFFSET_R = 128.0              # m: the geoid offset is measured over this half side around the anchor
 # GB the downloaded photogrammetry may take (<cache-dir>/photoreal, least recently used out first): ~1 GB per km driven
 PHOTOREAL_CACHE_GB = float(os.environ.get("BNGE_PHOTOREAL_CACHE_GB", "3"))
@@ -650,6 +663,8 @@ class Server:
         self.photoreal_lock = threading.Lock()
         self.photoreal_prefetch_pool = None  # ProcessPoolExecutor (photoreal.prefetch_tiles), made on first use
         self.photoreal_prefetched = {}      # (anchor id, key) -> Future of the download (insertion order: oldest out)
+        self.road_ahead = {}                # anchor id -> roadahead.RoadAhead (photoreal: the car's road ahead)
+        self.photoreal_ahead_stats = {"batches": 0, "tiles": 0, "files": 0}     # the downloads ahead done
         self.photoreal_offset_lock = threading.Lock()   # (held for a measurement: never taken on the event loop)
         self.imagery_failures = 0           # tiles that fell back to the palette (network trouble)
         self.imagery_worker = 0             # far textures the far-tile processes rendered (blockworker.far_tile)
@@ -2054,6 +2069,15 @@ class Server:
             self.photoreal_offsets[anchor.id] = off
             return off
 
+    def _photoreal_session(self):
+        """The server's tileset session for its photoreal processes (photoreal.Photoreal.session), None when it cannot
+        be had now (each process then opens its own)."""
+        try:
+            return self.photoreal.session()
+        except Exception as e:
+            log.warning("photoreal: no session to share: %s: %s", type(e).__name__, e)
+            return None
+
     def _photoreal_submit(self, *args):
         with self.photoreal_lock:
             for attempt in (0, 1):
@@ -2061,7 +2085,8 @@ class Server:
                     import multiprocessing
                     self.photoreal_pool = concurrent.futures.ProcessPoolExecutor(
                         PHOTOREAL_PROCS, mp_context=multiprocessing.get_context("spawn"),
-                        initializer=photorealmod.worker_init, initargs=(self.cache_dir, logging.getLogger().level))
+                        initializer=photorealmod.worker_init,
+                    initargs=(self.cache_dir, logging.getLogger().level, self._photoreal_session()))
                 try:
                     return self.photoreal_pool.submit(photorealmod.build_tile, *args)
                 except concurrent.futures.process.BrokenProcessPool:
@@ -2076,10 +2101,18 @@ class Server:
         off = self.photoreal_offset(anchor)
         if off is None:
             return None
+        pre = self.photoreal_prefetched.get(ck)
+        if pre is not None and not pre.done():
+            # its files are downloading in the prefetch processes: wait for them rather than fetch them twice (this
+            # is a far-tile worker thread)
+            try:
+                pre.result(timeout=PHOTOREAL_PREFETCH_WAIT_S)
+            except Exception:
+                pass
         texture = self.texture_name(anchor.id, tile.key, self.tex_rev.get(ck, 0))
         try:
             fut = self._photoreal_submit(
-                anchor.lat, anchor.lon, tile.bbox, off, tile.size * PHOTOREAL_ERR_PER_M, farfield.VERTS_MAX,
+                anchor.lat, anchor.lon, tile.bbox, off, photoreal_err(tile.level), farfield.VERTS_MAX,
                 self.photoreal_errs.get(tile.level), max(256, PHOTOREAL_TEX_PX >> max(0, tile.level - self.min_level)),
                 os.path.join(self.out_dir, texture), self.layout.cells)
         except Exception as e:      # the DEM tile
@@ -2098,62 +2131,104 @@ class Server:
         for path, n in fut.result().get("files", ()):
             self.photoreal_disk.touch(path, n)
 
-    def _photoreal_near(self, points, step=0.0):
-        """[(score, distance, Tile)] of the near levels' tiles the layout shows around each (x, y) of points
-        (L-2 within its radius, L-1 in its ring), the road ahead first: score = the point's distance along the
-        path (index x step) + PHOTOREAL_SIDE x the tile's distance from it (a tile beside the road waits for the
-        road's further ahead), each tile once at its best score."""
+    def road_path(self, anchor, x, y, vx, vy, length):
+        """[(x, y, s)] along the car's road ahead (roadahead.py; straight along its heading where no road is known or
+        without map data), every roadahead.STEP_M m for length m; [(x, y, 0)] when it stands."""
+        sp = math.hypot(vx, vy)
+        if sp < 3.0:
+            return [(x, y, 0.0)]
+        ux, uy = vx / sp, vy / sp
+        ra = None
+        if self.mapdata is not None:
+            ra = self.road_ahead.get(anchor.id)
+            if ra is None:
+                md = self.mapdata
+
+                def roads(key):         # on disk only: never a download from the event loop
+                    if not md.has(key, "roads"):
+                        return None
+                    return md.cell(key, layers=("roads",), kind="demand").layers.get("roads")
+                ra = self.road_ahead[anchor.id] = roadaheadmod.RoadAhead(anchor.frame, roads)
+        if ra is None:
+            n = int(length // roadaheadmod.STEP_M)
+            return [(x + ux * k * roadaheadmod.STEP_M, y + uy * k * roadaheadmod.STEP_M, k * roadaheadmod.STEP_M)
+                    for k in range(n + 1)]
+        try:
+            return ra.path(x, y, ux, uy, length)
+        except Exception as e:          # straight on rather than nothing
+            log.debug("road path: %s: %s", type(e).__name__, e)
+            self.road_ahead.pop(anchor.id, None)
+            return [(x, y, 0.0)]
+
+    def _photoreal_near(self, path, step=1):
+        """[(order, s, Tile)] of the near levels' tiles the layout shows as the car drives the path [(x, y, s)] (L-2
+        within its radius of a point, L-1 within its own), by order = the distance driven before the car first
+        comes within the tile's radius + PHOTOREAL_SIDE_W x its distance from the path: the road's own tiles before
+        those beside it, the next ones before the later ones; s: that distance (0: wanted already). step: every
+        step-th point."""
         best = {}
-        for n, (px, py) in enumerate(points):
+        for px, py, s in path[::step]:
             for lvl in range(self.min_level, PHOTOREAL_MAX_LEVEL + 1):
                 r = self.near_radii.get(lvl)
                 if r is None:
                     continue
                 size = farfield.level_size(lvl)
-                lo = self.near_radii.get(lvl - 1, 0.0)
                 for i in range(int(math.floor((px - r) / size)), int(math.floor((px + r) / size)) + 1):
                     for j in range(int(math.floor((py - r) / size)), int(math.floor((py + r) / size)) + 1):
                         t = farfield.Tile(lvl, i, j)
                         dt = t.distance(px, py)
-                        if dt <= r and (dt >= lo or lvl == self.min_level):
-                            sc = n * step + PHOTOREAL_SIDE * dt
-                            if t.key not in best or sc < best[t.key][0]:
-                                best[t.key] = (sc, dt, t)
-        return sorted(best.values(), key=lambda w: (w[0], w[1]))
+                        if dt > r:
+                            continue
+                        got = best.get(t)
+                        if got is None:
+                            best[t] = [s, dt]           # (s at which it is first wanted, nearest to the path)
+                        elif dt < got[1]:
+                            got[1] = dt
+        out = [(s + PHOTOREAL_SIDE_W * d, s, t) for t, (s, d) in best.items()]
+        out.sort(key=lambda w: (w[0], w[2].level, w[2].key))
+        return out
 
-    def photoreal_ahead(self, anchor, x, y, vx, vy, built, curv=0.0):
-        """On the car's way: the photogrammetry of the near tiles it reaches within PHOTOREAL_PREFETCH_S downloaded
-        into the disk cache (PHOTOREAL_PREFETCH_TILES at once), so their builds read it from disk (cold, a tile
-        waited seconds for its round trips; from disk it builds in ~0.2 s). built(key): already a tile."""
-        sp = math.hypot(vx, vy)
-        if self.photoreal is None or anchor.id not in self.photoreal_offsets or sp < 3.0:
+    def photoreal_ahead(self, anchor, path, built):
+        """On the car's way (path: road_path out to PHOTOREAL_PREFETCH_S): the photogrammetry of the near tiles it
+        will show downloaded into the disk cache, the road's next tiles first (_photoreal_near), so their builds read
+        it from disk (cold, a tile waited seconds for its round trips; from disk it builds in ~0.2 s). Batches of
+        PHOTOREAL_PREFETCH_TILES in PHOTOREAL_PREFETCH_PROCS processes, PHOTOREAL_PREFETCH_BATCHES in flight.
+        built(key): already a tile."""
+        if self.photoreal is None or anchor.id not in self.photoreal_offsets or len(path) < 2:
             return
         now = time.monotonic()
-        if now - getattr(self, "photoreal_ahead_t", 0.0) < 0.5:      # (poses come ~10 a second)
+        if now - getattr(self, "photoreal_ahead_t", 0.0) < 0.25:     # (poses come ~10 a second)
             return
         self.photoreal_ahead_t = now
-        # every 32 m along the way (the arc of the bend the car is in)
-        pts = [(px, py) for _, px, py in photoreal_path(x, y, vx, vy, curv,
-                                                        min(sp * PHOTOREAL_PREFETCH_S, PHOTOREAL_PREFETCH_MAX), 32.0)]
+        if now - getattr(self, "photoreal_ahead_log", 0.0) >= 10.0:
+            self.photoreal_ahead_log = now
+            ra = self.road_ahead.get(anchor.id)
+            st = self.photoreal_ahead_stats
+            log.info("photoreal: ahead: path %.0f m from (%.0f, %.0f) to (%.0f, %.0f), %s; downloads %d batches "
+                     "(%d tiles, %d files), %d in flight", path[-1][2], path[0][0], path[0][1], path[-1][0],
+                     path[-1][1], "on a road" if ra is not None and ra.on_road else "straight on", st["batches"],
+                     st["tiles"], st["files"], sum(1 for f in set(self.photoreal_prefetched.values()) if not f.done()))
         with self.photoreal_lock:
-            # two batches at a time: the next one queued while one downloads
-            if sum(1 for f in set(self.photoreal_prefetched.values()) if not f.done()) >= 2:
+            busy = sum(1 for f in set(self.photoreal_prefetched.values()) if not f.done())
+            if busy >= PHOTOREAL_PREFETCH_BATCHES:
                 return
-            batch = []
-            for _, _, t in self._photoreal_near(pts, 32.0):
-                if len(batch) >= PHOTOREAL_PREFETCH_TILES:
-                    break
+            todo = []
+            for _, s, t in self._photoreal_near(path, step=2):
                 ck = (anchor.id, t.key)
-                if ck in self.photoreal_prefetched or ck in self.photoreal_jobs or built(t.key) or t in batch:
+                # the tiles wanted already are the builds' (a download of the same files beside a build doubled
+                # them): only those the car reaches next
+                if s <= 0.0 or ck in self.photoreal_prefetched or ck in self.photoreal_jobs or built(t.key):
                     continue
-                batch.append(t)
-            if not batch:
-                return
-            fut = self._photoreal_prefetch(anchor, batch)
-            if fut is None:
-                return
-            for t in batch:
-                self.photoreal_prefetched[(anchor.id, t.key)] = fut
+                todo.append(t)
+                if len(todo) >= PHOTOREAL_PREFETCH_TILES * (PHOTOREAL_PREFETCH_BATCHES - busy):
+                    break
+            for b in range(0, len(todo), PHOTOREAL_PREFETCH_TILES):
+                batch = todo[b:b + PHOTOREAL_PREFETCH_TILES]
+                fut = self._photoreal_prefetch(anchor, batch)
+                if fut is None:
+                    return
+                for t in batch:
+                    self.photoreal_prefetched[(anchor.id, t.key)] = fut
             if len(self.photoreal_prefetched) > 5000:
                 for ck in list(self.photoreal_prefetched)[:1000]:
                     if self.photoreal_prefetched[ck].done():
@@ -2162,13 +2237,14 @@ class Server:
     def _photoreal_prefetch(self, anchor, tiles):
         """Future of photoreal.prefetch_tiles for the tiles in the prefetch process (None: it cannot start).
         (Called under photoreal_lock.)"""
-        boxes = [(t.bbox, self.photoreal_errs.get(t.level, t.size * PHOTOREAL_ERR_PER_M)) for t in tiles]
+        boxes = [(t.bbox, max(photoreal_err(t.level), self.photoreal_errs.get(t.level, 0.0))) for t in tiles]
         for attempt in (0, 1):
             if self.photoreal_prefetch_pool is None:
                 import multiprocessing
                 self.photoreal_prefetch_pool = concurrent.futures.ProcessPoolExecutor(
-                    1, mp_context=multiprocessing.get_context("spawn"), initializer=photorealmod.worker_init,
-                    initargs=(self.cache_dir, logging.getLogger().level, PHOTOREAL_PREFETCH_FETCH))
+                    PHOTOREAL_PREFETCH_PROCS, mp_context=multiprocessing.get_context("spawn"),
+                    initializer=photorealmod.worker_init,
+                    initargs=(self.cache_dir, logging.getLogger().level, self._photoreal_session()))
             try:
                 fut = self.photoreal_prefetch_pool.submit(photorealmod.prefetch_tiles, anchor.lat, anchor.lon, boxes)
                 break
@@ -2177,13 +2253,15 @@ class Server:
         else:
             return None
         fut.add_done_callback(self._photoreal_files)
-        t0 = time.perf_counter()
+        n = len(tiles)
 
-        def done(f):
+        def counted(f):
             if not f.cancelled() and f.exception() is None:
-                log.info("photoreal: prefetched %d tiles (%d files) in %.1f s", len(tiles), f.result()["fetched"],
-                         time.perf_counter() - t0)
-        fut.add_done_callback(done)
+                st = self.photoreal_ahead_stats
+                st["batches"] += 1
+                st["tiles"] += n
+                st["files"] += f.result().get("fetched", 0)
+        fut.add_done_callback(counted)
         return fut
 
     def photoreal_tile(self, anchor, tile, job):
@@ -3454,9 +3532,15 @@ class Connection:
         self.gravity.on_pose(self, self.s.anchors[aid].frame, x, y, _num(msg, "z", 0.0))
         self.ground_ahead(aid, x, y, vx, vy)
         if self.s.photoreal is not None and aid == self.active and aid in self.s.anchors:
-            self.s.photoreal_ahead(self.s.anchors[aid], *self.focus, vx, vy,
-                                   lambda key: (aid, key) in self.s.tiles or key in self.sent,
-                                   getattr(self, "curv", 0.0))
+            # the car's road ahead (at most every 0.25 s): the downloads ahead and the near tiles' build order
+            now = time.monotonic()
+            if now - getattr(self, "path_t", 0.0) >= 0.25 or getattr(self, "path_aid", None) != aid:
+                self.path_t, self.path_aid = now, aid
+                sp = math.hypot(vx, vy)
+                reach = max(PHOTOREAL_BUILD_PATH_M, min(sp * PHOTOREAL_PREFETCH_S, PHOTOREAL_PREFETCH_MAX))
+                self.path = self.s.road_path(self.s.anchors[aid], *self.focus, vx, vy, reach)
+                self.s.photoreal_ahead(self.s.anchors[aid], self.path,
+                                       lambda key: (aid, key) in self.s.tiles or key in self.sent)
         if self.s.sea is not None:
             self.sea_tiles(aid, x, y)
         # the mod's altitude rule: high above the ground it does not move its block, so no block is
@@ -3879,37 +3963,29 @@ class Connection:
         cone = (farfield.view_cone(self.cam)
                 if isinstance(self.cam, dict) and getattr(self, "cam_aid", None) == aid else None)
         dist = farfield.view_distances(todo, cone, fx, fy)
-        vx, vy = self.vel
-        sp = math.hypot(vx, vy)
-        if self.s.photoreal is not None and sp > 3.0:
-            # photoreal: the tiles on the road ahead first (Felix, 2026-10-25: "the tiles directly on the road are
-            # the most important ones"): a near tile's distance is its distance along the straight path ahead
-            # (PHOTOREAL_ROAD_S, 400 m at most; on the arc of the bend it is in) plus PHOTOREAL_SIDE x its distance
-            # beside it
-            path = photoreal_path(fx, fy, vx, vy, getattr(self, "curv", 0.0), min(sp * PHOTOREAL_ROAD_S, 400.0), 16.0)
-            for n, t in enumerate(todo):
-                if t.level > PHOTOREAL_MAX_LEVEL:
-                    continue
-                x0, y0, x1, y1 = t.bbox
-                best = math.inf             # (at the car: PHOTOREAL_SIDE x its distance, behind it as beside it)
-                for d, qx, qy in path:
-                    side = math.hypot(max(x0 - qx, 0.0, qx - x1), max(y0 - qy, 0.0, qy - y1))
-                    best = min(best, d + PHOTOREAL_SIDE * side)
-                    if d > best:
-                        break
-                dist[n] = best
-
-        if self.s.photoreal is not None:
-            # a swap group shows when all its tiles are there: each tile at its group's most urgent distance, so
-            # the four children of a tile come together (scored one by one, the one beside the road waited for the
-            # rest of the road, and its group with it: L-1 swaps 40 s late in a simulated drive, 2026-10-25)
-            at = {t.key: n for n, t in enumerate(todo)}
-            for adds, _ in self.groups:
-                ns = [at[k] for k in adds if k in at]
-                if len(ns) > 1:
-                    d = min(dist[n] for n in ns)
-                    for n in ns:
-                        dist[n] = d
+        path = getattr(self, "path", None)
+        if self.s.photoreal is not None and path and len(path) > 1 and todo:
+            # photoreal: the near levels' tiles (and the L0 they refine) by the car's road ahead: distance along it
+            # + PHOTOREAL_SIDE_W x distance from it (the road's next tiles first; the car outran the photo tiles
+            # beside and behind it at speed), the same for every tile of a swap group (its swap waits for all)
+            P = np.array([(p[0], p[1]) for p in path if p[2] <= PHOTOREAL_BUILD_PATH_M], np.float64)
+            S = np.array([p[2] for p in path if p[2] <= PHOTOREAL_BUILD_PATH_M], np.float64)
+            near = [k for k, t in enumerate(todo) if t.level <= 0]
+            if near and len(P):
+                bb = np.array([todo[k].bbox for k in near], np.float64)
+                dx = np.maximum(np.maximum(bb[:, None, 0] - P[None, :, 0], 0.0), P[None, :, 0] - bb[:, None, 2])
+                dy = np.maximum(np.maximum(bb[:, None, 1] - P[None, :, 1], 0.0), P[None, :, 1] - bb[:, None, 3])
+                key = (S[None, :] + PHOTOREAL_SIDE_W * np.hypot(dx, dy)).min(axis=1)
+                pk = dict(zip(near, key.tolist()))
+                group_of = {k: n for n, (adds, _) in enumerate(self.groups) for k in adds}
+                gmin = {}
+                for k, v in pk.items():
+                    g = group_of.get(todo[k].key)
+                    if g is not None and v < gmin.get(g, math.inf):
+                        gmin[g] = v
+                for k, v in pk.items():
+                    g = group_of.get(todo[k].key)
+                    dist[k] = gmin.get(g, v) if g is not None else v
 
         def prio(k):
             t = todo[k]
