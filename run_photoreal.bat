@@ -12,4 +12,6 @@ exit /b 1
 :run
 rem the server's log also goes to photoreal.log next to this file (to send after a drive)
 set "BNGE_LOG_FILE=%~dp0photoreal.log"
-call "%~dp0run_server.bat" -- --near-visual photoreal %*
+rem --deshadow off: the shadow removal renders the far tiles' photos in the server process itself (start.py turns
+rem it on); at speed it held up the photo tiles (simulated drive at 100 km/h: near tiles 5 s late with it, 0 s without)
+call "%~dp0run_server.bat" -- --near-visual photoreal --deshadow off %*

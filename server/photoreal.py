@@ -673,17 +673,21 @@ def tile_mesh(pr, frame, box, offset, target_err, verts_max=65535, coarsest=64.0
 _worker = None
 
 
-def worker_init(cache_dir, level=logging.INFO):
-    """ProcessPoolExecutor initializer: this process's Photoreal (its own fetch threads; the disk cache is shared)."""
-    global _worker
+def worker_init(cache_dir, level=logging.INFO, fetch_threads=None):
+    """ProcessPoolExecutor initializer: this process's Photoreal (its own fetch threads, fetch_threads of them when
+    given; the disk cache is shared)."""
+    global _worker, FETCH_THREADS
+    if fetch_threads:
+        FETCH_THREADS = fetch_threads
     logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     _worker = Photoreal(cache_dir)
 
 
-def build_tile(lat0, lon0, bbox, offset, target_err, verts_max, start_err, tex_px, dds_path):
+def build_tile(lat0, lon0, bbox, offset, target_err, verts_max, start_err, tex_px, dds_path, cells=32):
     """Worker process: the photoreal tile over bbox (ENU of the frame at lat0, lon0) with its atlas written to
     dds_path. -> dict: err, and when there is a mesh: positions (ENU, shifted by offset), tris, uv, normals,
-    tex_bytes, px (w, h), fetched, seconds."""
+    tex_bytes, px (w, h), grid ((cells + 1)² heights of the mesh at the layout's vertices, for the swap deltas: the
+    tile needs no DEM geometry), fetched, seconds."""
     import time
     import geodesy
     import imagery
@@ -697,7 +701,15 @@ def build_tile(lat0, lon0, bbox, offset, target_err, verts_max, start_err, tex_p
         return {"err": err, "files": files}
     rgb, uv = mesh.atlas(tex_px)
     tris = mesh.tris.astype(np.int64)
+    x0, y0, x1, y1 = bbox
+    sp = (x1 - x0) / cells
+    grid = mesh.height_grid((x0 - sp / 2, y0 - sp / 2, x1 + sp / 2, y1 + sp / 2), sp, "max")
+    if np.isfinite(grid).any():
+        grid = np.where(np.isfinite(grid), grid, np.nanmean(np.where(np.isfinite(grid), grid, np.nan)))
+    else:
+        grid = np.full((cells + 1, cells + 1), float(np.mean(mesh.positions[:, 2])))
     return {"err": err, "positions": mesh.positions, "tris": tris, "uv": uv, "normals": normals(mesh.positions, tris),
+            "grid": grid.astype(np.float32),
             "tex_bytes": imagery.write_dds(dds_path, rgb), "px": (rgb.shape[1], rgb.shape[0]),
             "fetched": _worker.fetched - n0, "seconds": time.perf_counter() - t0, "files": files}
 
