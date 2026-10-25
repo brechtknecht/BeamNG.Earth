@@ -30,4 +30,8 @@ try {
     & $py (Join-Path $repo "tools\photoreal_drive.py") --port $Port --from $From --to $To --speed $Speed --km $Km --out $out
 } finally {
     taskkill /T /F /PID $srv.Id 2>$null | Out-Null     # the server and its worker processes
+    if (-not $Warm) {       # the run's cold photogrammetry (~1 GB a km): every run left its own (Felix's disk, 2026-10-25)
+        Start-Sleep -Seconds 2
+        Remove-Item -Recurse -Force $cache -EA SilentlyContinue
+    }
 }
