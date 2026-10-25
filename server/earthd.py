@@ -192,8 +192,10 @@ PHOTOREAL_TEX_PX = int(os.environ.get("BNGE_PHOTOREAL_TEX", "1024"))
 # fit one shape (Munich, 2026-10-23: 70 100 vertices at 1 m on a 128 m tile, 21 474 at 8 m; a 64 m one fits at 1 m)
 PHOTOREAL_ERR_PER_M = 1.0 / 64.0
 # processes building the photoreal tiles (fetch, Draco, atlas, DDS): in the server's threads ~1.5 tiles were built at
-# once (the interpreter lock; Felix's log 2026-10-24: 4 tiles/s, outrun from ~100 km/h)
-PHOTOREAL_PROCS = int(os.environ.get("BNGE_PHOTOREAL_PROCS", "0")) or max(2, min(6, (os.cpu_count() or 4) // 2))
+# once (the interpreter lock; Felix's log 2026-10-24: 4 tiles/s, outrun from ~100 km/h). One per core (at most 8): a
+# build waits on its downloads part of the time (simulated city drive at 100 km/h, 4 cores, 2026-10-25: 2 processes
+# built 3.1 tiles/s, the road's 64 m tiles came 3 s late (p90 8 s); 4 built 4.7/s, on time (p90 4 s))
+PHOTOREAL_PROCS = int(os.environ.get("BNGE_PHOTOREAL_PROCS", "0")) or max(2, min(8, os.cpu_count() or 4))
 PHOTOREAL_PREFETCH_S = 25.0             # the photogrammetry downloaded for the tiles the car reaches within this
 PHOTOREAL_PREFETCH_MAX = 800.0          # m at most ahead (along its heading)
 # tiles downloaded at once: latency-bound (a request to Google ~0.3 s however small, 2026-10-25; a tile in a new area
@@ -277,6 +279,7 @@ HM_KEEP_SENT = 2            # terrains handed to the mod but maybe not committed
 TILE_CACHE = {32: 6000, 64: 2500}
 HM_THREADS = 4
 LAG_TICK_S, LAG_REPORT_S = 0.1, 0.25     # the event-loop stall report (-v)
+LAG_INFO_S = 1.0                # ... and without -v from this long
 ROAD_PROCESSES = 2              # road-tile processes (--block-process on, --roads on)
 WORKERS = 3                     # far-tile workers (--workers)
 TRACE_S = 60.0                  # BNGE_TRACEMALLOC: seconds between the memory reports ...
@@ -673,6 +676,7 @@ class Server:
         self.share_lock, self.group_helper = threading.Lock(), None    # (share_start: a BeamMP group's server)
         # photoreal: the near photo tiles' slots (Connection._stream), threads that wait for photoreal.build_tile
         self.photoreal_slots = 2 * PHOTOREAL_PROCS if near_visual == "photoreal" else 0
+        self.tile_asked = {}            # photoreal: (anchorId, key) -> when its build was asked for (the log)
         self.tile_pool = ThreadPoolExecutor(tile_workers + self.photoreal_slots +
                                             (peerworkmod.MAX_SLOTS if hasattr(far_pool, "remote_slots") else 0),
                                             thread_name_prefix="far")
@@ -2200,9 +2204,10 @@ class Server:
                      tile.key, r["err"])
             return None
         self.photoreal_errs[tile.level] = r["err"]
-        log.info("photoreal: tile %s: %d triangles at %g m, %dx%d px, %d fetched, %.1f s build, %.1f s since asked",
-                 tile.key, len(r["tris"]), r["err"], r["px"][0], r["px"][1], r["fetched"], r["seconds"],
-                 time.perf_counter() - fut.t0)
+        asked = self.tile_asked.pop((anchor.id, tile.key), fut.t0)
+        log.info("photoreal: tile %s: %d triangles at %g m, %dx%d px, %d fetched, %.1f s build, %.1f s since asked "
+                 "(%.1f s for a thread)", tile.key, len(r["tris"]), r["err"], r["px"][0], r["px"][1], r["fetched"],
+                 r["seconds"], time.perf_counter() - asked, fut.t0 - asked)
         x0, y0, _, _ = tile.bbox
         pos = [float(x0), float(y0), float(np.round(r["grid"].mean()))]
         P = r["positions"] - np.asarray(pos, np.float64)
@@ -2298,6 +2303,8 @@ class Server:
             prev = self.tiles[ck]           # --colormatch: its texture is rendered again
         fut = self.tile_inflight.get(ck)
         if fut is None:
+            if tile.level <= PHOTOREAL_MAX_LEVEL:
+                self.tile_asked[ck] = time.perf_counter()
             fut = self.tile_inflight[ck] = loop.run_in_executor(self.tile_pool, self.make_tile, anchor, tile, prev)
             fut.add_done_callback(lambda f: self._tile_done(ck, f))
         return fut
@@ -2352,6 +2359,7 @@ class Server:
 
     def _tile_done(self, ck, fut):
         self.tile_inflight.pop(ck, None)
+        self.tile_asked.pop(ck, None)       # (a tile without photogrammetry)
         if fut.cancelled() or fut.exception() is not None:
             return
         before = self.tiles.get(ck)
@@ -4289,14 +4297,15 @@ async def main_async(args):
             time.sleep(LAG_TICK_S)
             b = beat[0]
             lag = time.perf_counter() - b - LAG_TICK_S
-            if lag > LAG_REPORT_S and reported != b and log.isEnabledFor(logging.DEBUG):
+            if lag > LAG_REPORT_S and reported != b and (log.isEnabledFor(logging.DEBUG) or lag > LAG_INFO_S):
                 reported = b
                 f = sys._current_frames().get(main_ident)
                 stack = []
                 while f is not None and len(stack) < 12:
                     stack.append(f"{os.path.basename(f.f_code.co_filename)}:{f.f_code.co_name}:{f.f_lineno}")
                     f = f.f_back
-                log.debug("event loop stalled > %.2f s in %s", lag, " < ".join(stack))
+                log.log(logging.INFO if lag > LAG_INFO_S else logging.DEBUG, "event loop stalled > %.2f s in %s", lag,
+                        " < ".join(stack))
     threading.Thread(target=watch_lag, daemon=True, name="lag-watch").start()
 
     # Debug: where this process's memory is (BNGE_TRACEMALLOC=1; numpy arrays included): the top allocation sites every

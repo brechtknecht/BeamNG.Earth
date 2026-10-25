@@ -210,6 +210,17 @@ class DiskBudgetTest(unittest.TestCase):
             self.assertFalse(os.path.exists(paths[1]))
             self.assertEqual(b.used, sum(os.path.getsize(p) for p in [*paths, str(new)] if os.path.exists(p)))
 
+    def test_all_protected_backs_off(self):
+        with tempfile.TemporaryDirectory() as d:
+            b = pr.DiskBudget(d, 100, protect_s=50.0, now=lambda: 1000.0, start=False)
+            b.touch(os.path.join(d, "a"), 300)     # over the cap, but used just now
+            b.check(wait=True)
+            self.assertEqual(b.used, 300)
+            calls = []
+            b.evict = lambda: calls.append(1)
+            b.check(wait=True)                      # nothing could go: not tried again at once
+            self.assertEqual(calls, [])
+
 
 if __name__ == "__main__":
     unittest.main()

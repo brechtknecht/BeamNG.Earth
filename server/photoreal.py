@@ -27,6 +27,7 @@ import logging
 import os
 import struct
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -419,6 +420,7 @@ def _keepalive_open(url):
             else:
                 conn = http.client.HTTPSConnection(host, parts.port or 443, timeout=TIMEOUT_S, context=ctx)
             pool[host] = conn
+        t0 = time.monotonic()
         try:
             conn.request("GET", path, headers={"Accept-Encoding": "identity"})
             r = conn.getresponse()
@@ -428,11 +430,15 @@ def _keepalive_open(url):
             _conns.ctx = ssl.create_default_context(cafile=certifi.where())
             pool.pop(host, None).close()
             continue
-        except (http.client.HTTPException, OSError):
+        except (http.client.HTTPException, OSError) as e:
             pool.pop(host, None).close()        # the server closed the idle connection: once more on a new one
+            if time.monotonic() - t0 > 2.0:
+                log.info("photoreal: %s failed after %.1f s: %r", host, time.monotonic() - t0, e)
             if attempt == 2:
                 raise
             continue
+        if time.monotonic() - t0 > 2.0:
+            log.info("photoreal: %s took %.1f s (%d bytes)", host, time.monotonic() - t0, len(data))
         if r.status >= 400:
             raise urllib.error.HTTPError(url, r.status, r.reason, r.headers, io.BytesIO(data))
         if r.status in (301, 302, 303, 307, 308) and r.getheader("Location"):
@@ -681,6 +687,17 @@ def worker_init(cache_dir, level=logging.INFO, fetch_threads=None):
         FETCH_THREADS = fetch_threads
     logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     _worker = Photoreal(cache_dir)
+    # exit with the server (as blockworker's): a stopped server left these processes running, ~200 MB each, 71 of
+    # them after a day of simulated drives (2026-10-25)
+    import multiprocessing
+    parent = multiprocessing.parent_process()       # (its sentinel: a process handle on Windows, where getppid stays)
+    if parent is not None:
+        threading.Thread(target=_watch_parent, args=(parent,), daemon=True, name="parent-watch").start()
+
+
+def _watch_parent(parent):
+    parent.join()
+    os._exit(0)
 
 
 def build_tile(lat0, lon0, bbox, offset, target_err, verts_max, start_err, tex_px, dds_path, cells=32):
@@ -741,6 +758,7 @@ class DiskBudget:
     least recently used files not touched within protect_s go, in a thread, down to LOW of the cap."""
 
     LOW = 0.8
+    RETRY_S = 30.0
 
     def __init__(self, root, cap_bytes, protect_s=300.0, now=None, start=True):
         import time
@@ -750,6 +768,7 @@ class DiskBudget:
         self._files = {}                # path -> [bytes, last use]
         self.used = 0
         self._busy = False
+        self._retry_at = 0.0
         self.evicted = 0
         if start:
             threading.Thread(target=self._start, name="photoreal-budget", daemon=True).start()
@@ -795,7 +814,7 @@ class DiskBudget:
 
     def check(self, wait=False):
         with self._lock:
-            if not self.cap or self.used <= self.cap or self._busy:
+            if not self.cap or self.used <= self.cap or self._busy or time.monotonic() < self._retry_at:
                 return
             self._busy = True
         if wait:
@@ -828,6 +847,10 @@ class DiskBudget:
                         self.used -= e[0]
                 n, b = n + 1, b + e[0]
             self.evicted += n
+            if self.used > target:
+                # all the rest used within protect_s: not again for a while (every touch sorted every file again, in
+                # a new thread each: 10% of the server's interpreter in a simulated drive, 2026-10-25)
+                self._retry_at = time.monotonic() + self.RETRY_S
             if n:
                 log.info("photoreal: disk cache: %d least recently used files removed (%.2f GB), %.1f GB of %.1f GB",
                          n, b / 1e9, self.used / 1e9, self.cap / 1e9)
