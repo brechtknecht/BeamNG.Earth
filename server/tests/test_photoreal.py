@@ -7,6 +7,7 @@ import struct
 import sys
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 
 import numpy as np
@@ -127,7 +128,42 @@ class PhotorealTest(unittest.TestCase):
         n = len(self.srv.urls)
         q = pr.Photoreal(self.tmp.name, key="k", opener=self.srv)
         q.mesh(self.frame, (-100, -100, 100, 100), target_err=10.0)
-        self.assertEqual(len(self.srv.urls), n + 1)             # only the root again: the rest from the disk cache
+        self.assertEqual(len(self.srv.urls), n)     # the kept session (its root too) and the disk cache: no request
+
+    def test_a_stale_kept_session_is_not_taken_up(self):
+        self.p.mesh(self.frame, (-100, -100, 100, 100), target_err=10.0)
+        path = os.path.join(self.p.cache_dir, pr.SESSION_FILE)
+        with open(path) as f:
+            d = json.load(f)
+        d["t"] -= pr.SESSION_MAX_S + 1
+        with open(path, "w") as f:
+            json.dump(d, f)
+        n = len(self.srv.urls)
+        q = pr.Photoreal(self.tmp.name, key="k", opener=self.srv)
+        q.root()
+        self.assertEqual(len(self.srv.urls), n + 1)             # a new root
+        q = pr.Photoreal(self.tmp.name, key="other", opener=self.srv)
+        q.root()
+        self.assertEqual(len(self.srv.urls), n + 2)             # another key: its own session
+
+    def test_adopted_session_reads_the_others_files_and_an_expired_one_is_dropped(self):
+        self.p.mesh(self.frame, (-100, -100, 100, 100), target_err=10.0)
+        state = self.p.session()
+        other = tempfile.TemporaryDirectory()
+        self.addCleanup(other.cleanup)
+        q = pr.Photoreal(other.name, key="k", opener=self.srv)
+        q.adopt(state)
+        n = len(self.srv.urls)
+        q.mesh(self.frame, (-100, -100, 100, 100), target_err=10.0)
+        self.assertFalse(any("root.json" in u for u in self.srv.urls[n:]))     # no root of its own
+
+        def gone(url):
+            raise urllib.error.HTTPError(url, 400, "session expired", {}, io.BytesIO(b""))
+        r = pr.Photoreal(tempfile.mkdtemp(dir=other.name), key="k", opener=gone)
+        r.adopt(state)
+        with self.assertRaises(pr.PhotorealError):
+            r.mesh(self.frame, (-100, -100, 100, 100), target_err=10.0)
+        self.assertIsNone(r._root)                              # the next request asks for a new root
 
     def test_only_overlapping_leaves(self):
         self.p.mesh(self.frame, (10, 10, 50, 50), target_err=1.0)

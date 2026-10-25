@@ -43,6 +43,13 @@ TIMEOUT_S = 30
 # ~20 s (2026-10-23, Felix: "in mapng we loaded the tiles much faster": the browser fetched in parallel)
 FETCH_THREADS = int(os.environ.get("BNGE_PHOTOREAL_FETCH", "16"))
 MAX_DEPTH = 40
+# The file names under the root are the session's own: another root request (another process, a server restart) names
+# the same subtrees and contents differently, and the disk cache (by URL path) never found what another session had
+# fetched (2026-10-25: every build process had its own session; the downloads ahead went into a cache no build read).
+# One session for the server and all its processes (Photoreal.session / adopt), kept in <cache>/session.json and taken
+# up again by a restart while younger than this (a session that stopped answering is dropped: _get)
+SESSION_MAX_S = 2 * 3600.0
+SESSION_FILE = "session.json"
 # glTF is y-up; 3D Tiles' content frame is z-up (3D Tiles spec, "glTF transforms")
 Y_UP_TO_Z_UP = np.array([[1, 0, 0, 0], [0, 0, -1, 0], [0, 1, 0, 0], [0, 0, 0, 1]], np.float64)
 
@@ -460,11 +467,13 @@ class Photoreal:
         self.key = key or os.environ.get("GOOGLE_MAPS_API_KEY")
         self.ion_token = ion_token or os.environ.get("CESIUM_ION_TOKEN")
         # neither: Cesium ion without a token of ours (a proxy that adds the Authorization header, the cloud sessions)
-        self.cache_dir = os.path.join(cache_dir, "photoreal")
+        # BNGE_PHOTOREAL_CACHE_DIR: another folder (tools/photoreal_drive.py's cold runs start from an empty one)
+        self.cache_dir = os.environ.get("BNGE_PHOTOREAL_CACHE_DIR") or os.path.join(cache_dir, "photoreal")
         os.makedirs(self.cache_dir, exist_ok=True)
         self._open = opener or _keepalive_open
         self._lock = threading.Lock()
         self._root = None
+        self._kept = False              # the session is an earlier run's or another process's (may have expired)
         self._params = {}               # query parameters every request carries (key, session)
         self._json = {}                 # url path -> parsed subtree
         self._file_locks = {}           # cache path -> Lock (one fetch / write per file)
@@ -513,7 +522,15 @@ class Photoreal:
                     pass
             q = dict(urllib.parse.parse_qsl(parts.query))
             q.update({k: v for k, v in self._params.items() if k not in q})
-            data = self._open(urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(q))))
+            try:
+                data = self._open(urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(q))))
+            except urllib.error.HTTPError as e:
+                if self._kept and e.code in (400, 401, 403, 404, 410):
+                    # a kept or adopted session that expired: a new one for the next tile (this one falls back)
+                    log.info("photoreal: session no longer valid (%d): asking for a new one", e.code)
+                    self.drop_session()
+                    raise PhotorealError(f"session expired ({e.code})") from e
+                raise
             with self._lock:
                 self.fetched += 1
             try:
@@ -535,13 +552,79 @@ class Photoreal:
     def root(self):
         with self._lock:
             if self._root is None:
+                kept = self._load_session()
+                if kept is not None:
+                    url, params, ts = kept
+                    self._params = dict(params)
+                    self._root = (url, ts)
+                    self._kept = True
+                    return self._root
                 url, params = self._root_url()
                 self._params = dict(params)
                 q = urllib.parse.urlencode(params)
                 ts = json.loads(self._open(url + "?" + q))
                 self.fetched += 1
                 self._root = (url, ts)
+                self._kept = False
+                self._save_session(url, params, ts)
             return self._root
+
+    def session(self):
+        """(root url, params, root tileset) of this instance's session (asked now when there is none yet): for the
+        other processes' adopt(), so all read the same file names."""
+        url, ts = self.root()
+        with self._lock:
+            return url, {k: v for k, v in self._params.items() if k != "session"}, ts
+
+    def adopt(self, state):
+        """Use the session of another instance (session())."""
+        url, params, ts = state
+        with self._lock:
+            self._root = (url, ts)
+            self._params = dict(params)
+            self._json = {}
+            self._kept = True
+
+    def _session_path(self):
+        return os.path.join(self.cache_dir, SESSION_FILE)
+
+    def _load_session(self):
+        """The session kept by an earlier run while younger than SESSION_MAX_S, or None."""
+        import time
+        try:
+            with open(self._session_path(), encoding="utf-8") as f:
+                d = json.load(f)
+            if time.time() - float(d["t"]) < SESSION_MAX_S and d.get("token") == self._who():
+                return d["url"], d["params"], d["root"]
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        return None
+
+    def _save_session(self, url, params, ts):
+        import time
+        try:
+            tmp = self._session_path() + ".tmp%d" % os.getpid()
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"t": time.time(), "token": self._who(), "url": url, "params": params, "root": ts}, f)
+            os.replace(tmp, self._session_path())
+        except OSError as e:
+            log.debug("photoreal: session not kept: %s", e)
+
+    def _who(self):
+        """Which credentials the session was opened with (a hash: another key or token opens its own)."""
+        return hashlib.sha1(f"{self.key}|{self.ion_token}".encode()).hexdigest()[:16]
+
+    def drop_session(self):
+        """Forget the session (it stopped answering): the next request asks for a new root."""
+        with self._lock:
+            self._root = None
+            self._params = {}
+            self._json = {}
+            self._kept = False
+        try:
+            os.remove(self._session_path())
+        except OSError:
+            pass
 
     def _child_url(self, base, uri):
         url = urllib.parse.urljoin(base, uri)
@@ -673,11 +756,14 @@ def tile_mesh(pr, frame, box, offset, target_err, verts_max=65535, coarsest=64.0
 _worker = None
 
 
-def worker_init(cache_dir, level=logging.INFO):
-    """ProcessPoolExecutor initializer: this process's Photoreal (its own fetch threads; the disk cache is shared)."""
+def worker_init(cache_dir, level=logging.INFO, session=None):
+    """ProcessPoolExecutor initializer: this process's Photoreal (its own fetch threads; the disk cache is shared),
+    in the server's session (Photoreal.session(): the same file names, so one process finds what another fetched)."""
     global _worker
     logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     _worker = Photoreal(cache_dir)
+    if session is not None:
+        _worker.adopt(session)
 
 
 def build_tile(lat0, lon0, bbox, offset, target_err, verts_max, start_err, tex_px, dds_path):
