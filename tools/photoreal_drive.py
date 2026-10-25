@@ -6,7 +6,7 @@ options, teleports to (lat, lon), waits for the far field at rest, then drives s
 HEADING degrees (0 = north), sending poses ten times a second and the terrain-follow requests the mod would (a new
 block every 256 m, committed when ready). Engine work (imports) is not modelled: the numbers are the server's side.
 
-Per level (L-2: 64 m, L-1: 128 m tiles) it prints how many seconds after a tile came within its level's radius of
+Per level (L-2: 64 m, L-1: 128 m tiles; L0: the 256 m DEM tiles their L-1 children wait for) it prints how many seconds after a tile came within its level's radius of
 the car the far_swap that shows it arrived (median / p90 / max; "never": not shown before the end), for all near
 tiles past the first 200 m, and for the ones the road (the drive's line) passes through. Use a new heading each
 run for a cold cache, as on a real drive.
@@ -129,6 +129,8 @@ def run(a, hdg, proc):
                     tl = ff.Tile(lvl, i, j)
                     if tl.key not in need and tl.distance(x, y) <= r:
                         need[tl.key] = (now, d)
+                        if lvl == -1:           # its L0 parent: needed shown first (one level at a time)
+                            need.setdefault(ff.Tile(0, i >> 1, j >> 1).key, (now, d))
         if pending is None and max(abs(x - cx), abs(y - cy)) > 256:
             pending = (req, round(x / 256) * 256.0, round(y / 256) * 256.0)
             c.send({"type": "prepare_terrain", "requestId": req, "anchorId": aid, "cx": pending[1], "cy": pending[2]})
@@ -157,7 +159,7 @@ def run(a, hdg, proc):
         return any(x0 - 10 <= ux * d <= x1 + 10 and y0 - 10 <= uy * d <= y1 + 10 for d in range(0, int(a.dist) + 1, 8))
 
     for label, pick in (("all", lambda k: True), ("on the road", on_road)):
-        for lvl in RADII:
+        for lvl in (0, *RADII):
             rows = [(shown.get(k), tn) for k, (tn, d) in need.items()
                     if int(k.split("_")[0]) == lvl and d > 200 and pick(k)]
             got = sorted(max(0.0, ts - tn) for ts, tn in rows if ts is not None)

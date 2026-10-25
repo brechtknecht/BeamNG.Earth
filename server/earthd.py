@@ -2173,6 +2173,13 @@ class Server:
         else:
             return None
         fut.add_done_callback(self._photoreal_files)
+        t0 = time.perf_counter()
+
+        def done(f):
+            if not f.cancelled() and f.exception() is None:
+                log.info("photoreal: prefetched %d tiles (%d files) in %.1f s", len(tiles), f.result()["fetched"],
+                         time.perf_counter() - t0)
+        fut.add_done_callback(done)
         return fut
 
     def photoreal_tile(self, anchor, tile, job):
