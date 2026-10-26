@@ -72,7 +72,11 @@ VERTEX_STEP = 4.0           # m between the plan's vertices (segments for the gr
                             # crest or a sag was a kink every 16 m, 'bumpy roads, worst uphill and at speed' on r/BeamNG,
                             # 2026-10-17: a San Francisco street's slope changed 4.4 % rms per 2 m, 1.2 % at 4 m;
                             # grading a 1 km block 0.06 -> 0.14 s)
-BUCKET = 32.0               # m, query-point buckets
+BUCKET = 8.0                # m, query-point buckets (32 m: a 4 m segment's reach touched 4-9 buckets of 256 points;
+                            # 8 m graded Munich's blocks in 415 ms instead of 760, the same heights, 2026-10-26)
+# threads a large grade_points call (a block's chunks, a road tile's ground) is spread over in Rust, the points in bands of
+# rows, each point's sums in the same order (the same heights); BNGE_GRADE_THREADS=1: one, as before 2026-10-26
+GRADE_THREADS = int(os.environ.get("BNGE_GRADE_THREADS", str(max(1, min(4, (os.cpu_count() or 2) // 2)))))
 ROAD_LIFT = 0.04            # m the physics ground is raised under roads (see Grader.apply)
 BLEND_R = 4.0               # m: roads near each other blend their targets by 1 / (1 + (d / BLEND_R)^2)
 PROFILE_ZOOM = int(os.environ.get("BNE_DEM_ZOOM", "16"))   # DEM zoom of the profiles (one zoom for every caller)
@@ -1274,6 +1278,7 @@ class Grader:
         plans alone): kind 0 an open road at z, 1 a low arch, 2 a full tunnel. box: only the tunnels near it (_meets)."""
         out = []
         ts = roadsmod.tunnel_specs(feats)
+        pack = None             # (the road plans' PlanPack, made once: per tunnel part it cost ~8 ms a Munich cell)
         for i in range(len(feats)):
             if ts[i] is None:
                 continue
@@ -1296,8 +1301,10 @@ class Grader:
                     continue            # (a dry piece of an underwater tunnel: left out with it, GitHub #128)
                 g = np.asarray(self.elev(la, lo), np.float64)
                 if road_plans:
+                    if pack is None:
+                        pack = PlanPack(list(road_plans))
                     g = g.copy()
-                    g[[0, -1]] = grade_points(xy[[0, -1], 0], xy[[0, -1], 1], g[[0, -1]], list(road_plans))
+                    g[[0, -1]] = grade_points(xy[[0, -1], 0], xy[[0, -1], 1], g[[0, -1]], pack)
                 floor, kinds = roadsmod.tunnel_sections(s, g)
                 i0 = 0
                 while i0 < len(kinds):
@@ -1890,14 +1897,14 @@ def grade_points(px, py, base, plans, lift=0.0):
         return out
     A, B, ZA, ZB, H, RH, RID, AB, CUT = got
     import fast
-    fast.require(41, "grade_points")         # (the Rust loop: native/earthfast)
+    fast.require(76, "grade_points")         # (the Rust loop: native/earthfast; 76: without the GIL, GRADE_THREADS)
     f64 = np.float64
     return fast._ef.grade_points(np.ascontiguousarray(px, f64), np.ascontiguousarray(py, f64),
                                  np.ascontiguousarray(base, f64), A, B, ZA, ZB, H, RH, RID, AB, CUT, float(lift),
                                  float(SLOPE_RUN), float(T_MIN), float(T_MAX), float(BLEND_R), float(BUCKET),
                                  float(WALL_CUT_M), float(WALL_T_M), float(WALL_FLAT_M), float(WALL_AHEAD_M),
                                  bool(SEP_ON), float(SEP_FROM_M), float(SEP_FULL_M), float(CORE_FADE_M),
-                                 float(SIDE_FADE_M), float(SHARP_STEP_M))
+                                 float(SIDE_FADE_M), float(SHARP_STEP_M), int(GRADE_THREADS))
 
 
 def bridge_chain(line, all_bridges):

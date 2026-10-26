@@ -2669,6 +2669,32 @@ class BridgeProfiles:
             cache.setdefault(str(key), got)
             return cache[str(key)]
 
+    def _pool_pairs(self, keys, pool):
+        """{part key: {part keys}} of the pool's parts that cross or lie side by side (solved together). A pure function
+        of the pool's parts, kept per pool: every part not in a chain yet gathered the same cells' pool and paired all
+        of it again (O(n^2) each; Munich's ~400 small tunnels: 426 pairings of 19 pools, 9 of 10 s, 2026-10-26)."""
+        sig = tuple((k, len(pool[k][1]), pool[k][4], float(pool[k][0].width)) for k in keys)
+        memo = self.__dict__.setdefault("_pairs_memo", {})
+        with self.lock:
+            got = memo.get(sig)
+        if got is not None:
+            return got
+        over = _deck_crossings([pool[k][1] for k in keys])
+        crossing = {}
+        for a, b, _, _ in over:
+            crossing.setdefault(keys[a], set()).add(keys[b])
+            crossing.setdefault(keys[b], set()).add(keys[a])
+        # and side by side / one over the other (solved apart, the Queensboro Bridge's two upper roadways met at
+        # a 0.5 m step and its tiles' decks at different heights stood as blocks in the lanes, 2026-10-17)
+        for a, b in _deck_beside([pool[k][1] for k in keys], [pool[k][0].width for k in keys]):
+            crossing.setdefault(keys[a], set()).add(keys[b])
+            crossing.setdefault(keys[b], set()).add(keys[a])
+        with self.lock:
+            if len(memo) > 64:
+                memo.clear()
+            memo[sig] = crossing
+        return crossing
+
     def _resolve(self, start, pool, ground, loaded):
         """The chain of part `start` (keys), loading the cell at each loose end until closed."""
         def nk(p):
@@ -2679,16 +2705,7 @@ class BridgeProfiles:
                 by_node.setdefault(nk(xy[0]), []).append(k)
                 by_node.setdefault(nk(xy[-1]), []).append(k)
             keys = sorted(pool)
-            over = _deck_crossings([pool[k][1] for k in keys])
-            crossing = {}
-            for a, b, _, _ in over:
-                crossing.setdefault(keys[a], set()).add(keys[b])
-                crossing.setdefault(keys[b], set()).add(keys[a])
-            # and side by side / one over the other (solved apart, the Queensboro Bridge's two upper roadways met at
-            # a 0.5 m step and its tiles' decks at different heights stood as blocks in the lanes, 2026-10-17)
-            for a, b in _deck_beside([pool[k][1] for k in keys], [pool[k][0].width for k in keys]):
-                crossing.setdefault(keys[a], set()).add(keys[b])
-                crossing.setdefault(keys[b], set()).add(keys[a])
+            crossing = self._pool_pairs(keys, pool)
             comp, stack = {start}, [start]
             while stack:                        # joined at nodes, or crossing (solved together)
                 k = stack.pop()
