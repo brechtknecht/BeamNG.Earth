@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import cpupin  # noqa: E402
 import earthd  # noqa: E402
 import farfield  # noqa: E402
+import quality  # noqa: E402
 
 
 class EdgeAtTest(unittest.TestCase):
@@ -37,9 +38,38 @@ class EdgeAtTest(unittest.TestCase):
         self.assertIsNone(earthd.Connection.edge_at(SimpleNamespace(block=None), 0.0, 0.0, 50.0, 0.0))
 
 
+class PredictChainTest(unittest.TestCase):
+    """The blocks after the next one (earthd.predict_chain: the prefetch when the follow blocks fall behind)."""
+    rule = earthd.FOLLOW_RULES[512]
+
+    def test_straight_drive_every_block_ahead(self):
+        chain = earthd.predict_chain(0.0, 0.0, 55.0, 0.0, 0.0, 0.0, self.rule, 30.0)
+        self.assertGreaterEqual(len(chain), 3)
+        ts = [t for t, _ in chain]
+        self.assertEqual(ts, sorted(ts))
+        self.assertTrue(all(t <= 30.0 for t in ts))
+        xs = [c[0] for _, c in chain]
+        self.assertEqual(xs, sorted(set(xs)))                    # each further east, none twice
+        self.assertTrue(all(c[1] == 0.0 for _, c in chain))
+        # its first is the mod's next request (predict_request)
+        self.assertEqual(chain[0][1], earthd.predict_request(0.0, 0.0, 55.0, 0.0, 0.0, 0.0, self.rule))
+
+    def test_each_is_the_request_from_the_one_before(self):
+        chain = earthd.predict_chain(0.0, 0.0, 40.0, 0.0, 0.0, 0.0, self.rule, 40.0)
+        for (t0, a), (t1, b) in zip(chain, chain[1:]):
+            px = 40.0 * t1 - 40.0 * earthd.FRAME_S          # the player just before it leaves a's prepare box
+            self.assertLessEqual(abs(px - a[0]), self.rule.prepare + 1.0)
+            self.assertEqual(b, earthd.predict_request(40.0 * t1, 0.0, 40.0, 0.0, *a, self.rule))
+
+    def test_horizon_and_standing(self):
+        self.assertEqual(earthd.predict_chain(0.0, 0.0, 55.0, 0.0, 0.0, 0.0, self.rule, 0.5), [])
+        self.assertEqual(earthd.predict_chain(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, self.rule, 30.0), [])
+
+
 class BaseWaitTest(unittest.TestCase):
     def wait(self, fast=False, edge_in=None):
-        s = SimpleNamespace(fast=fast, edge_at=None if edge_in is None else time.monotonic() + edge_in)
+        s = SimpleNamespace(fast=fast, edge_at=None if edge_in is None else time.monotonic() + edge_in,
+                            quality=quality.Governor())
         return earthd.Server._base_wait_s(s)
 
     def test_standing_waits_for_the_photo(self):
@@ -92,6 +122,7 @@ class PhotoAheadTest(unittest.TestCase):
         s.near_visual = "detail"
         s.layout = farfield.Layout(64, 512, True)
         s.photo_last, s.photo_asked, s.hm = None, {}, {}
+        s.quality = quality.Governor()
         s.asked = []
         s.imagery = SimpleNamespace(prefetch=lambda frame, x0, y0, size, px: s.asked.append((x0 + size / 2, y0 + size / 2)))
         return s
