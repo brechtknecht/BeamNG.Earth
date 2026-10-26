@@ -30,6 +30,7 @@ readFile = function(p) return files[p] end
 jsonDecode = function(s) return assert(load('return ' .. s))() end
 local trees = require('beamngEarth/trees')
 trees.EVERY_N = 1               -- (every update works here; the batching is tested below)
+trees.FIRST_LOADS = false      -- (every shape at once here; the first loads are tested below)
 local function count() local n = 0; for _ in pairs(items) do n = n + 1 end; return n end
 
 -- the variant: a height inside its range, scaled to it
@@ -283,6 +284,85 @@ do
     'cellsOff: a solid cell turned off')
   getPlayerVehicle = nil
   package.loaded['beamngEarth/roads'] = nil
+end
+
+-- first loads (FIRST_LOADS): a shape the engine never loaded comes alone in its work frame; standing, the shapes of the
+-- tiles' groups are loaded ahead by items under the car; at speed a new one every COLD_GAP_S at most
+do
+  trees.clear()
+  trees.reset()
+  for it in pairs(items) do items[it] = nil end       -- (the level's objects go with it)
+  trees.FIRST_LOADS = true
+  local realClock, fake = os.clock, 100
+  os.clock = function() return fake end
+  local car = { v = vec3(0, 0, 0) }
+  getPlayerVehicle = function() return { getVelocity = function() return car.v end } end
+  local function bases(warm)          -- the distinct shapes (spellings undone) of the shown items, or the warm-up ones
+    local seen, n = {}, 0
+    for it in pairs(items) do
+      local z = it.m and it.m.p and it.m.p.z or 0
+      if (z < -100) == (warm or false) and it.d and it.d.fields then
+        local b = trees.baseOf(it.d.fields.shapeFile)
+        if not seen[b] then seen[b], n = true, n + 1 end
+      end
+    end
+    return n, seen
+  end
+  local function loadedNow() return trees.status().shapes end
+  T.check(trees.baseOf('/a/b/./././c.dae') == '/a/b/c.dae' and trees.baseOf(trees.variant('/a/c', 3)) == '/a/c',
+    'baseOf: the spellings undone')
+  local rows = {}
+  local hs = { 11.2, 19.6, 21.7 }        -- three fir shapes
+  for i = 0, 29 do rows[#rows + 1] = { 1, 20 + i, 20, 5, 0, 1, hs[i % 3 + 1], i / 30 } end
+  trees.onRows(21, '0_0', rows, { 'deciduous', 'conifer' })
+  trees.update(21, { x = 30, y = 30, z = 0 })
+  T.check(loadedNow() == 1, 'standing, the first work frame: one shape loaded, ahead: ' .. loadedNow())
+  T.check(select(1, bases(true)) == 1 and trees.status().warmLeft > 0, 'by an item under the car; more to load ahead')
+  local frames = 1
+  while trees.status().warmLeft > 0 and frames < 400 do trees.update(21, { x = 30, y = 30, z = 0 }); frames = frames + 1 end
+  local want = #trees.CATALOG.deciduous + #trees.CATALOG.conifer
+  T.check(loadedNow() == want and frames >= want, 'every shape of the two groups, one a work frame: ' .. loadedNow() .. ' in ' .. frames)
+  for _ = 1, 40 do trees.update(21, { x = 30, y = 30, z = 0 }) end
+  T.check(count() == 30, 'the tile all shown: ' .. count())
+  T.check(select(1, bases(true)) == 0, 'the warm-up items gone after WARM_KEEP_FRAMES')
+  -- at speed: palms (nine shapes, none loaded) come one shape at a time, COLD_GAP_S apart
+  car.v = vec3(40, 0, 0)
+  local prows = {}
+  for i = 0, 26 do prows[#prows + 1] = { 0, 300 + i, 20, 5, 0, 1, ({ 8.9, 13.8, 25.3 })[i % 3 + 1], i / 27 } end
+  trees.onRows(21, '1_0', prows, { 'palm' })
+  local before = loadedNow()
+  fake = fake + 1
+  trees.update(21, { x = 290, y = 20, z = 0 })
+  T.check(loadedNow() == before + 1, 'fast: one new shape in the frame')
+  T.check(trees.status().fresh == 1, 'status: one shape loaded just now')
+  for _ = 1, 5 do trees.update(21, { x = 290, y = 20, z = 0 }) end
+  T.check(loadedNow() == before + 1, 'fast: no other within COLD_GAP_S')
+  fake = fake + trees.COLD_GAP_S + 0.01
+  trees.update(21, { x = 290, y = 20, z = 0 })
+  T.check(loadedNow() == before + 2, 'after COLD_GAP_S: the next one')
+  T.check(select(1, bases(true)) == 0, 'fast: nothing loaded ahead')
+  for _ = 1, 10 do fake = fake + 1; for _ = 1, 3 do trees.update(21, { x = 290, y = 20, z = 0 }) end end
+  T.check(count() == 30 + 27, 'in the end every palm shown: ' .. count())
+  -- a sign: its body (shared by every sign) loads alone first, then the face
+  local srows = {}
+  for i = 0, 3 do srows[#srows + 1] = { 0, 600 + i * 10, 20, 5, 0, 1, 2, i / 4 } end
+  trees.onRows(21, '2_0', srows, { 'speedk50' })
+  local function signs()
+    local n = 0
+    for it in pairs(items) do
+      local z = it.m and it.m.p and it.m.p.z or 0
+      if z > -100 and it.d and it.d.fields and it.d.fields.shapeFile:find('sign') then n = n + 1 end
+    end
+    return n
+  end
+  local s0 = loadedNow()
+  fake = fake + 1
+  trees.update(21, { x = 590, y = 20, z = 0 })
+  T.check(loadedNow() == s0 + 1 and signs() == 0, 'a new sign: its body loaded alone first, no sign made yet')
+  for _ = 1, 4 do fake = fake + 1; for _ = 1, 3 do trees.update(21, { x = 590, y = 20, z = 0 }) end end
+  T.check(signs() == 8 and loadedNow() == s0 + 2, 'then the signs (face and body each): ' .. signs())
+  os.clock = realClock
+  getPlayerVehicle = nil
 end
 trees.clear()
 T.done('test_trees')
