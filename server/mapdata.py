@@ -81,10 +81,11 @@ OSM_THREADS = 8                 # cells whose OpenStreetMap tags are read at onc
 # (all 36 of a fresh place: 122 s -> 145-181 s over 8 places, 2026-10-25); on a 16-thread PC they came 2-10 s sooner.
 _CPUS = os.cpu_count() or 4
 WARM_THREADS = min(8, _CPUS // 2) if _CPUS > 8 else 0
-# (cell, layer)s whose bytes are fetched ahead at once (fetch_ahead: the network part of a build only, no DuckDB query,
-# no decode, no store), also where WARM_THREADS is 0; 0 = off. Each is mostly waiting on Oregon (the I/O audit,
-# 2026-10-26)
-FETCH_AHEAD_THREADS = int(os.environ.get("BNGE_FETCH_AHEAD", "3"))
+# (cell, layer)s whose bytes are fetched ahead at once (fetch_ahead: the network part of a build only, no decode, no
+# store), also where WARM_THREADS is 0; 0 = off. Off by default: 3 threads made the cloud test drive's pauses worse
+# (fresh cache, 300 km/h, 8 km: 30.0 / 35.6 / 33.8 s with them, 10.2 / 14.0 s without, the base 15.3-29.1 s; the
+# planning's DuckDB bbox queries took the main process's CPU, 2026-10-26). BNGE_FETCH_AHEAD=3 to try it
+FETCH_AHEAD_THREADS = int(os.environ.get("BNGE_FETCH_AHEAD", "0"))
 FETCH_AHEAD_SOURCES = ("path", "ahead")     # fetch_ahead's lists, first first: the road plans' path, the straight line
 
 
