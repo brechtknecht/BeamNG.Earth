@@ -82,6 +82,16 @@ class PriorityTest(unittest.TestCase):
             self.assertEqual(self.run_child("import os; b=os.nice(0); budget.lower_priority(3); print(os.nice(0)-b)"),
                              "3")
 
+    def test_request_lane_thread_raised(self):
+        # Windows: the request lane's build thread a step above its class (still below the game); elsewhere nothing
+        if sys.platform == "win32":
+            get = ("import ctypes; from ctypes import wintypes; k=ctypes.WinDLL('kernel32'); "
+                   "k.GetCurrentThread.restype=wintypes.HANDLE; k.GetThreadPriority.argtypes=(wintypes.HANDLE,); "
+                   "print(budget.raise_thread(), k.GetThreadPriority(k.GetCurrentThread()))")
+            self.assertEqual(self.run_child(get), "thread above normal 1")
+        else:
+            self.assertIsNone(budget.raise_thread())
+
 
 if __name__ == "__main__":
     unittest.main()

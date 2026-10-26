@@ -143,6 +143,7 @@ def trim():
 # far workers got nothing at all (a Windows player, i5-9400F, 1.6.1: "distant land 5/514", only the land near the car
 # loading). os.nice elsewhere only weights the share.
 WIN_BELOW_NORMAL = 0x4000
+WIN_THREAD_ABOVE_NORMAL = 1
 
 
 def lower_priority(nice, worker=False):
@@ -166,6 +167,23 @@ def lower_priority(nice, worker=False):
     if not k32.SetPriorityClass(k32.GetCurrentProcess(), WIN_BELOW_NORMAL):
         raise OSError("SetPriorityClass(below normal) failed")
     return "below normal"
+
+
+def raise_thread():
+    """Windows: the calling thread one step above its process's class (the request lane's block builds: "below normal"
+    + 1, still below the game's "normal"). Without os.nice all of the server's processes ran at one priority there, and
+    the block the car waits for got ~0.2 of a core under load (the CPU audit, 2026-10-26). Returns the change or None."""
+    if sys.platform != "win32":
+        return None
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.GetCurrentThread.restype = wintypes.HANDLE
+    k32.SetThreadPriority.argtypes = (wintypes.HANDLE, ctypes.c_int)
+    k32.SetThreadPriority.restype = wintypes.BOOL
+    if not k32.SetThreadPriority(k32.GetCurrentThread(), WIN_THREAD_ABOVE_NORMAL):
+        raise OSError("SetThreadPriority(above normal) failed")
+    return "thread above normal"
 
 
 def road_processes(cpus=None, gb=None):

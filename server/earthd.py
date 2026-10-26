@@ -4821,14 +4821,15 @@ async def main_async(args):
         import budget
         lanes = PREFETCH_LANES or (2 if (os.cpu_count() or 1) >= 8 and not budget.small() else 1)
         log.info("block processes: 1 for the requests, %d for the prefetch", lanes)
-        for _ in range(1 + max(1, lanes)):
+        for lane in range(1 + max(1, lanes)):
             warm_q = ctx.Queue(maxsize=64)
             block_pools.append((poolsmod.RespawningPool(
                 "block", 1, mp_context=ctx, initializer=blockworker.init,
                 initargs=(args.cache_dir, args.offline, args.roads == "on",
                           args.grading == "on" and args.roads == "on",
                           args.road_widths == "on" and args.roads == "on", args.surface == "on", warm_q,
-                          logging.getLogger().level, args.airports == "on", args.sea == "on", 0,
+                          logging.getLogger().level, args.airports == "on", args.sea == "on",
+                          -1 if lane == LANE_REQUEST else 0,
                           roadsmod.ROADS_IN_GROUND, args.gas_stations == "on" and args.roads == "on")), warm_q))
         far_pool = poolsmod.RespawningPool(
             "far tile", args.workers, mp_context=ctx, initializer=blockworker.init,

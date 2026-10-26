@@ -138,9 +138,9 @@ def _trace_memory(every_s=60.0, top=10):
 
 def init(cache_dir, offline, roads, grading, road_widths, surface, warm_q, log_level=logging.INFO, airports=False,
          sea=False, nice=0, roads_in_ground=None, gas_stations=False):
-    """nice: this worker's niceness on top of the server's (earthd NICE_*): the terrain blocks' workers keep the
-    server's own, the road tiles' and the far field's run below them, so the ground under the car wins the server's
-    few cores (2026-10-19: at 180 mph the next block waited 6 s behind the road tiles ahead and a ball fell off the
+    """nice: this worker's niceness on top of the server's (earthd NICE_*; < 0: the request lane, raised a step on
+    Windows: budget.raise_thread): the terrain blocks' workers keep the server's own, the road tiles' and the far
+    field's run below them, so the ground under the car wins the server's few cores (2026-10-19: at 180 mph the next block waited 6 s behind the road tiles ahead and a ball fell off the
     block's edge)."""
     global _s
     # A helper may serve clients with different choices. Never use its own launcher
@@ -151,6 +151,8 @@ def init(cache_dir, offline, roads, grading, road_widths, surface, warm_q, log_l
     import budget
     try:
         budget.lower_priority(nice, worker=True)    # (Windows: the server's class, as inherited)
+        if nice < 0:            # the request lane's blocks (earthd main_async): the builds run in this thread
+            budget.raise_thread()
     except (OSError, AttributeError):
         pass
     logging.basicConfig(level=log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -159,7 +161,7 @@ def init(cache_dir, offline, roads, grading, road_widths, surface, warm_q, log_l
         _trace_memory()
     import sampler
     sampler.maybe_start(f".{os.getpid()}")      # BNGE_SAMPLE: this worker's own sampling profile (debugging)
-    xproc.PRIORITY = nice
+    xproc.PRIORITY = max(0, nice)
     _s = _State(cache_dir, offline, roads, grading, road_widths, surface, airports, sea, gas_stations)
     threading.Thread(target=_watch_parent, args=(os.getppid(),), daemon=True, name="parent-watch").start()
     threading.Thread(target=_read_warm, args=(warm_q,), daemon=True, name="warm-read").start()
