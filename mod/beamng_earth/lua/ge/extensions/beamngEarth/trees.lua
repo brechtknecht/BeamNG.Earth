@@ -871,10 +871,22 @@ local function byClassThenPath(a, b)
 end
 -- view: the camera's {x, y} when it is away from the car (core: VIEW_AWAY_M), else nil: what is shown follows what the
 -- player looks at, the colliding items stay round the car (the user, 2026-10-20: "the LODs still all follow the car").
-function M.update(anchorId, player, view)
+-- Trees give way to the governor's heavy ops (Felix 2026-10-26, "lehmig" at speed: no hitches, yet runs of 30-60 ms
+-- frames): a terrain commit waits for two calm frames, and tree changes, outside the governor's budget, kept frames
+-- from being calm while every far tile and road had already stopped; their engine cost also landed in the frames round
+-- the commit. So no tree work while a heavy op waits, in its frame or in the quiet frames after it (gov: core's
+-- governor; nil = never yield). trees.YIELD = false turns it off; M.yielded counts the frames given way.
+M.YIELD = true
+M.yielded = 0
+
+function M.update(anchorId, player, view, gov)
   if not next(tiles) then return end
   if not setup() then return end
   frameN = frameN + 1
+  if M.YIELD and gov and (gov.heavyPending or gov.blocked or (gov.isHeavyFrame and gov:isHeavyFrame())) then
+    M.yielded = M.yielded + 1
+    return
+  end
   if frameN % M.EVERY_N ~= 0 then return end
   local budget = M.PER_FRAME * M.EVERY_N
   M.lastShapeItems = touchedItems        -- the previous frame's (diagnostics)

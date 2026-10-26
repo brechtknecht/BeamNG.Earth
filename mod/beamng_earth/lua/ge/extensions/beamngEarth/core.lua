@@ -137,6 +137,8 @@ local st -- all runtime state, see resetState()
 local rebaseLag = 0 -- frames between a vehicle move request and its visibility (measured, see commitRebase)
 local roadsSession = nil -- the server session whose road tiles are shown (roads.lua)
 local gov = governor.new() -- outlives levels (keeps its target and cost estimates)
+M.msgQ = {}                  -- server messages not handled yet (MSG_BUDGET_MS)
+M.MSG_BUDGET_MS = 4          -- server messages handled per frame until this many ms went by (at least one); 0 = all
 local warned = {}          -- one-time warnings
 local nearVisual = 'terrain' -- from the server's hello; outlives levels like the connection
 local serverAttribution = nil -- hello.attribution (protocol 4): the credits for the sources it uses
@@ -1845,9 +1847,23 @@ local function onUpdate(dtReal, dtSim)
   gov:setLoading(st.placeFrames ~= nil or st.clock < st.loadingUntil or st.slowFor > SLOW_S)
   gov:beginFrame(farfield.hasWork() or roads.hasWork())
   gov:chargeEngine(engineTickMs())     -- what the engine spent on last frame's new tiles (governor.lua)
-  for _, msg in ipairs(net.update(dtReal)) do
-    local ok, err = pcall(onMessage, msg)
-    if not ok then log('E', 'beamngEarth', 'message ' .. tostring(msg.type) .. ' failed: ' .. tostring(err)) end
+  -- this frame's messages after the ones left over, handled until MSG_BUDGET_MS went by (at least one); the rest wait,
+  -- in order, for the next frame (Felix 2026-10-26: 'net' 17-35 ms frames at 200 mph, tile messages in bursts)
+  for _, msg in ipairs(net.update(dtReal)) do M.msgQ[#M.msgQ + 1] = msg end
+  if #M.msgQ > 0 then
+    local msw, done = stopwatch.new(), 0
+    while done < #M.msgQ do
+      if done > 0 and M.MSG_BUDGET_MS > 0 and msw() >= M.MSG_BUDGET_MS and not st.placeFrames then break end
+      done = done + 1
+      local msg = M.msgQ[done]
+      local ok, err = pcall(onMessage, msg)
+      if not ok then log('E', 'beamngEarth', 'message ' .. tostring(msg.type) .. ' failed: ' .. tostring(err)) end
+    end
+    if done >= #M.msgQ then M.msgQ = {} else
+      local rest = {}
+      for i = done + 1, #M.msgQ do rest[#rest + 1] = M.msgQ[i] end
+      M.msgQ = rest
+    end
   end
   t = mark('net', t)
   if not scenetree.MissionGroup then return end -- no level loaded
@@ -1901,7 +1917,7 @@ local function onUpdate(dtReal, dtSim)
     M.updatePhotoless()
     t = mark('far', t)
     sea.update(st.anchorId, st.player)
-    trees.update(st.anchorId, st.player, M.viewAway())
+    trees.update(st.anchorId, st.player, M.viewAway(), gov)
     t = mark('sea+trees', t)
     local pb = nil
     if st.block then

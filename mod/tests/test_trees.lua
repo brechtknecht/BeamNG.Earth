@@ -412,4 +412,23 @@ do -- a tile's rows packed in one flat array (the garbage collector walks one ta
   T.check(flat[1] == 3 and flat[2] == 1.5 and flat[5] == 90 and flat[7] == 12 and flat[8] == 0.25, 'the first row')
   T.check(flat[9] == 1 and flat[12] == 6 and flat[13] == 0 and flat[15] == 10 and flat[16] == 0, 'defaults filled in')
 end
+-- trees give way to the governor's heavy ops: nothing changes while one waits, in its frame or the quiet ones after
+trees.clear()
+local n0 = count()
+trees.onTile({ anchorId = 21, key = '0_0', path = '/t/v.json', n = 100 }, 21)
+local y0 = trees.yielded
+trees.update(21, { x = 50, y = 50 }, nil, { heavyPending = true })
+trees.update(21, { x = 50, y = 50 }, nil, { blocked = true })
+trees.update(21, { x = 50, y = 50 }, nil, { isHeavyFrame = function() return true end })
+T.check(count() == n0 and trees.yielded == y0 + 3, 'a heavy op waiting, quiet, or running: no tree made')
+for _ = 1, 30 do trees.update(21, { x = 50, y = 50 }, nil, { isHeavyFrame = function() return false end }) end
+T.check(count() >= n0 + 100, 'then the trees come (and the warm-up of their shapes)')
+trees.YIELD = false
+trees.clear()
+n0 = count()
+trees.onTile({ anchorId = 22, key = '0_0', path = '/t/v.json', n = 100 }, 22)
+for _ = 1, 30 do trees.update(22, { x = 50, y = 50 }, nil, { heavyPending = true }) end
+T.check(count() == n0 + 100, 'YIELD off: made regardless')
+trees.YIELD = true
+trees.clear()
 T.done('test_trees')

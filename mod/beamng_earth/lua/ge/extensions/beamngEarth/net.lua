@@ -6,6 +6,7 @@
 -- banner's "reconnecting (attempt n)") and whether this game ever reached the server.
 
 local framing = require('beamngEarth/framing')
+local stopwatch = require('beamngEarth/stopwatch')
 
 local M = {}
 
@@ -23,6 +24,10 @@ local RECONNECT_S = 2.0
 local CONNECT_TIMEOUT_S = 2.0
 local RECV_CHUNK = 65536
 local MAX_RECV_PER_FRAME = 64 -- chunks; 4 MiB per frame is plenty for JSON control traffic
+-- Messages decoded per frame until this many ms went by (at least one); the rest wait in the reassembler, in order, for
+-- the next frames (Felix 2026-10-26: 'net' 17-35 ms in frames at 190-203 mph, a tree tile's inline JSON of up to 6000
+-- rows decoded in one frame, several in a burst). 0 = no limit.
+M.DECODE_BUDGET_MS = 3
 
 local socket = nil
 local sock = nil
@@ -114,9 +119,13 @@ local function receive(out)
   end
   -- decode before closing: closeSocket() resets the reassembler, and the server's last
   -- frames (e.g. an anchor_error) may have arrived together with the close
+  local closing = rx.err or closeErr
+  local clk, n = stopwatch.new(), 0
   while true do
+    if n > 0 and not closing and M.DECODE_BUDGET_MS > 0 and clk() >= M.DECODE_BUDGET_MS then break end
     local payload = rx:pop()
     if not payload then break end
+    n = n + 1
     local msg = jsonDecode(payload, 'beamngEarth/net')
     if type(msg) == 'table' then out[#out + 1] = msg end
   end

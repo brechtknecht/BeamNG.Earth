@@ -196,6 +196,24 @@ T.check(#received('hello') == 1 and received('hello')[1].protocol == 4 and recei
   'hello (protocol 4, format 4: the newest the mod reads) sent on connect')
 T.check(calls.safeTeleport == 1, 'player placed on flat ground')
 
+-- server messages handled per frame until MSG_BUDGET_MS went by (at least one), the rest in order next frames
+do
+  local b0 = core.MSG_BUDGET_MS
+  core.MSG_BUDGET_MS = 1e-9            -- one message a frame
+  local seen, perFrame = {}, {}
+  beamngEarth_weather = { onWeather = function(m) seen[#seen + 1] = 'w' .. m.code; perFrame[frameNo] = (perFrame[frameNo] or 0) + 1 end }
+  for code = 1, 3 do serverSend({ type = 'weather', v = 1, code = code, tempC = 20 }) end
+  for _ = 1, 400 do
+    frame()
+    if #seen == 3 then break end
+  end
+  local most = 0
+  for _, n in pairs(perFrame) do most = math.max(most, n) end
+  beamngEarth_weather = nil
+T.check(table.concat(seen, ',') == 'w1,w2,w3' and most == 1, 'one message a frame, in order: ' .. table.concat(seen, ','))
+  core.MSG_BUDGET_MS = b0
+end
+
 -- capture the mod's warnings (the stub log() drops everything)
 local warnings = {}
 local stubLog = log
