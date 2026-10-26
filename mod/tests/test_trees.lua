@@ -284,5 +284,45 @@ do
   getPlayerVehicle = nil
   package.loaded['beamngEarth/roads'] = nil
 end
+-- pop-in at speed (LOOKAHEAD): a tile ahead shows what it will show LOOK_S later, one behind as before; the budget goes
+-- to the tile ahead first
+do
+  local car = { v = vec3(0, 0, 0) }
+  getPlayerVehicle = function() return { getVelocity = function() return car.v end } end
+  package.loaded['beamngEarth/roads'] = { requestCollision = function() end }
+  local function tileRows(tx)
+    local rows = {}
+    for i = 0, 99 do rows[#rows + 1] = string.format('{0, %d, %d, 5, 0, 1, 12, %.2f}', tx * 256 + 8 + (i % 10) * 24,
+      8 + math.floor(i / 10) * 24, i / 100) end
+    return '{ groups = {}, items = { ' .. table.concat(rows, ', ') .. ' } }'
+  end
+  files['/t/la2'], files['/t/lam3'] = tileRows(2), tileRows(-3)
+  trees.onTile({ anchorId = 12, key = '2_0', path = '/t/la2', n = 100 }, 12)     -- its square 384 m ahead
+  trees.onTile({ anchorId = 12, key = '-3_0', path = '/t/lam3', n = 100 }, 12)   -- 384 m behind
+  local function inTile(tx)
+    local n = 0
+    for it in pairs(items) do if it.m and it.m.p and math.floor(it.m.p.x / 256) == tx then n = n + 1 end end
+    return n
+  end
+  car.v = vec3(85, 0, 0)
+  for _ = 1, 30 do trees.update(12, { x = 128, y = 128 }) end
+  T.check(inTile(2) == 100, 'fast: the tile 384 m ahead shows as from 340 m further on (every item): ' .. inTile(2))
+  T.check(inTile(-3) == 60, 'the one 384 m behind: its ring as before (60 %): ' .. inTile(-3))
+  trees.LOOKAHEAD = false
+  for _ = 1, 30 do trees.update(12, { x = 128, y = 128 }) end
+  T.check(inTile(2) == 60, 'LOOKAHEAD off: the ring of its distance now')
+  trees.LOOKAHEAD = true
+  trees.clear()
+  -- the budget: one frame's worth for two tiles at the same distance, ahead and behind: the one ahead first
+  trees.onTile({ anchorId = 12, key = '2_0', path = '/t/la2', n = 100 }, 12)
+  trees.onTile({ anchorId = 12, key = '-3_0', path = '/t/lam3', n = 100 }, 12)
+  local pf = trees.PER_FRAME
+  trees.PER_FRAME = 20
+  for _ = 1, trees.EVERY_N do trees.update(12, { x = 128, y = 128 }) end
+  T.check(inTile(2) == 20 * trees.EVERY_N and inTile(-3) == 0, 'the tile ahead gets the budget first: ' .. inTile(2) .. ' / ' .. inTile(-3))
+  trees.PER_FRAME = pf
+  getPlayerVehicle = nil
+  package.loaded['beamngEarth/roads'] = nil
+end
 trees.clear()
 T.done('test_trees')

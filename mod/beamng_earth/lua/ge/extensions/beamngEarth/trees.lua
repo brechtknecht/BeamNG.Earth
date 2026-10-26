@@ -72,6 +72,21 @@ M.SHAPE_ITEMS_PER_FRAME = 4000
 -- path ('dir/./name', 'dir/././name', ...: the same file, a shape of its own), which splits the big populations (one
 -- beech ~7.7k items: a frame touching it cost ~4-9 ms). A variant's first items cost one ~12 ms frame (its load).
 M.SHAPE_VARIANTS = 4
+-- Pop-in at speed (Felix, 2026-10-26, 250 km/h: "about 150 m ahead the trees suddenly pop in"; the mod's replay of the
+-- A13 forest at 307 km/h: 6 % of the trees ahead first showed under 150 m, 30 % under 300 m). The per-frame budget above
+-- went to whatever was nearest, behind the car as much as ahead of it. From FAST_MS on (LOOKAHEAD on):
+-- - a tile ahead shows what it will show LOOK_S of driving later (LOOK_MAX_M at most): its rank and group distance are
+--   the smaller of its distance now and from that point on the car's line;
+-- - the budget goes ahead first: a tile outside the view cone ahead (VIEW_COS) counts SIDE_K times as far, one behind
+--   the car BEHIND_K times plus BEHIND_M (a tile left with rows of a collision change keeps that change's class).
+-- (Holding back the removals of dropped tiles made it worse: the shapes' populations grew, so every frame touched fewer.)
+M.LOOKAHEAD = true
+M.LOOK_S = 4
+M.LOOK_MAX_M = 400
+M.VIEW_COS = 0.77       -- 40 deg either side of the car's heading
+M.SIDE_K = 2
+M.BEHIND_K = 4
+M.BEHIND_M = 2000
 
 local ECA = '/levels/east_coast_usa/art/shapes/'
 local WCA = '/levels/west_coast_usa/art/shapes/'
@@ -678,6 +693,23 @@ function M.update(anchorId, player, view)
     end
     return false
   end
+  -- LOOKAHEAD: the point LOOK_S ahead on the car's line, and the budget's order (pathKey) at speed
+  local ahead = nil
+  if M.LOOKAHEAD and car.ux and not view then
+    local look = math.min(M.LOOK_MAX_M, sp * M.LOOK_S)
+    ahead = { x = player.x + car.ux * look, y = player.y + car.uy * look }
+  end
+  local function pathKey(t, d)
+    local k = d
+    if ahead then
+      local dx, dy = t.cx - player.x, t.cy - player.y
+      local along = dx * car.ux + dy * car.uy
+      local r = math.sqrt(dx * dx + dy * dy)
+      if along < -128 then k = d * M.BEHIND_K + M.BEHIND_M
+      elseif r > 181 and along < r * M.VIEW_COS then k = d * M.SIDE_K end
+    end
+    return k
+  end
   for key, t in pairs(tiles) do
     if t.anchor ~= anchorId or t.drop then goto continue end     -- still being emptied
     local dCar = boxDist(player, t)
@@ -692,12 +724,16 @@ function M.update(anchorId, player, view)
     local class = 2
     if (all and not t.all) or (not all and M.cellsOff(mask, t.mask or '')) then class = 0
     elseif (t.all and not all) or (not all and M.cellsOff(t.mask or '', mask)) then class = 1 end
-    order[#order + 1] = { key, view and math.min(boxDist(view, t), dCar) or dCar, dCar, all, mask, class }
+    local dShow = view and math.min(boxDist(view, t), dCar) or dCar
+    if ahead and not t.ghost then dShow = math.min(dShow, boxDist(ahead, t)) end
+    if t.pending and t.pendingClass and t.pendingClass < class then class = t.pendingClass end
+    -- [7] the budget's order within a class: the distance shown, ahead first at speed (pathKey)
+    order[#order + 1] = { key, dShow, dCar, all, mask, class, pathKey(t, dShow) }
     ::continue::
   end
   table.sort(order, function(a, b)
     if a[6] ~= b[6] then return a[6] < b[6] end
-    return a[2] < b[2]
+    return a[7] < b[7]
   end)
   local nearMade, urgentMade = false, false
   local urgentR2 = math.max(M.URGENT_MIN_M, sp * M.URGENT_S) ^ 2
@@ -724,7 +760,7 @@ function M.update(anchorId, player, view)
       end
       if rowsScanned > M.ROWS_PER_FRAME then finish(); return end
       -- (the tile's state is what it shows once its rows are done: the rows not done yet are its pendingRows)
-      t.pending, t.pendingRows = false, nil
+      t.pending, t.pendingRows, t.pendingClass = false, nil, nil
       t.all, t.mask, t.shown, t.band, t.near = all, mask, want, band, near
       local left = {}
       local cells = mask ~= '' and not all and M.cellsOf(t) or nil
@@ -771,7 +807,7 @@ function M.update(anchorId, player, view)
           else left[#left + 1] = i end
         end
       end
-      if #left > 0 then t.pending, t.pendingRows = true, left end
+      if #left > 0 then t.pending, t.pendingRows, t.pendingClass = true, left, math.min(o[6], t.pendingClass or 2) end
       if budget <= 0 then finish(); return end
     end
   end
