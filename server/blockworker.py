@@ -365,6 +365,133 @@ def build(aid, lat, lon, hm_zoom, q, cx, cy, size, out_dir, name, ter_name=None,
     return info
 
 
+def ready():
+    """A no-op job: the process started (and init run) before its first real job (the stand-in's)."""
+    return os.getpid()
+
+
+def donor_chunks(frame, cx, cy, size, donors):
+    """A heightmap.ChunkCache with the heights of the graded blocks donors [(.ter path, zBase, maxHeight, their cx,
+    cy)], nearest first, where they overlap the block at (cx, cy) - for a late block's stand-in: only the samples none
+    of them has are computed (a block moved 384 m shares 62 % with the last). Clipmap-style reuse (Losasso & Hoppe
+    2004): the graded heights, roads cut in, under the overlap. Its .landcover: their ground models (the .ter's layers,
+    MATERIALS indices) as land cover chunks (surface.base_chunked), none with a hole (the edge ring, tunnel mouths:
+    computed instead). None when no donor overlaps."""
+    import struct
+    ch = heightmap.CHUNK
+    try:
+        kx0, ky0 = heightmap.lattice_index(cx, size), heightmap.lattice_index(cy, size)
+    except ValueError:
+        return None
+    if kx0 % ch or ky0 % ch or size % ch:
+        return None
+    nc = size // ch
+    want = {(kx0 // ch + i, ky0 // ch + j) for i in range(nc) for j in range(nc)}
+    cache = heightmap.ChunkCache(cap=len(want) + 1)
+    cache.donated = 0
+    cache.landcover = surfacemod.LandcoverChunks(cap=len(want) + 1)
+    tag = surfacemod.frame_tag(frame)
+    order = [m for m, _ in surfacemod.MATERIALS]
+    for path, zbase, max_height, dcx, dcy in donors:
+        try:
+            dx0, dy0 = heightmap.lattice_index(dcx, size) // ch, heightmap.lattice_index(dcy, size) // ch
+        except ValueError:
+            continue
+        mine = [c for c in want if dx0 <= c[0] < dx0 + nc and dy0 <= c[1] < dy0 + nc]
+        if not mine:
+            continue
+        try:
+            with open(path, "rb") as f:
+                head = f.read(5)
+                if len(head) < 5 or struct.unpack("<BI", head) != (heightmap.TER_VERSION, size):
+                    continue
+                qgrid = np.frombuffer(f.read(2 * size * size), "<u2").reshape(size, size)
+                lay = np.frombuffer(f.read(size * size), np.uint8).reshape(size, size)
+                names = [f.read(f.read(1)[0]).decode() for _ in range(struct.unpack("<I", f.read(4))[0])]
+        except (OSError, ValueError, IndexError, struct.error):      # (evicted meanwhile)
+            continue
+        u = heightmap.heights(qgrid, zbase, max_height)
+        to_glob = np.full(256, heightmap.TER_HOLE, np.uint8)
+        to_glob[:len(names)] = [order.index(m) if m in order else surfacemod.DIRT for m in names]
+        lay = to_glob[lay]
+        for c in mine:
+            j, i = (c[1] - dy0) * ch, (c[0] - dx0) * ch
+            cache.put(c, u[j:j + ch, i:i + ch].copy())
+            cache.donated += 1
+            lc = lay[j:j + ch, i:i + ch]
+            if not (lc == heightmap.TER_HOLE).any():
+                cache.landcover.put((tag,) + c, lc.copy())
+        want.difference_update(mine)
+        if not want:
+            break
+    return cache if cache.donated else None
+
+
+def stand_in(aid, lat, lon, hm_zoom, q, cx, cy, size, out_dir, name, ter_name, donors=(), fuel_pads=None,
+             grade=True):
+    """A late follow block's provisional stand-in (earthd make_follow_provisional, fast), built here: in the server's
+    process its thread waited for the interpreter lock behind ~20 busy threads (heights 0.1 s of CPU in 1-4 s at
+    300 km/h on 2 cores, 2026-10-26). Nothing waited for that is not at hand: the DEM tiles not on disk from their
+    coarser ancestors (Dem.sample_local), the runways, graded only under the road plans made already (grade:
+    Grader.apply planned_only, adopted from the other processes' plancache), the heights and ground models the graded
+    blocks around have (donors: donor_chunks), the land cover every other sample, no sea floor, tunnels or measured
+    road widths. Returns make_heightmap's info dict (without seconds / zoom / base)."""
+    _take_pads(fuel_pads)
+    t0, c0 = time.perf_counter(), time.thread_time()
+    g, _chunks = _s.anchor(aid, lat, lon)
+    g = g if grade else None
+    frame = geodesy.EnuFrame(lat, lon)
+    keep = {}
+    stood_in = [0]
+    grade_s = [0.0]
+
+    def elev(la, lo):
+        z, n = _s.dem.sample_local(la, lo, hm_zoom)
+        stood_in[0] += n
+        if _s.airports is not None:
+            z = _s.airports.apply(la, lo, z)
+        if g is None:
+            return z
+        t1 = time.perf_counter()
+        z = g.apply(la, lo, z, gradingmod.ROAD_LIFT, planned_only=True, adopt=True)
+        grade_s[0] += time.perf_counter() - t1
+        return z
+    chunks = donor_chunks(frame, cx, cy, size, donors) if donors else None
+    info = heightmap.generate(frame, elev, os.path.join(out_dir, name), cx, cy, q=q, size=size, keep=keep,
+                              chunks=chunks)
+    stages = {"heights": time.perf_counter() - t0, "grading": grade_s[0], "heightsCpu": time.thread_time() - c0}
+    if chunks is not None:
+        stages["donorChunks"] = chunks.donated
+    idx = None
+    if _s.surface is not None:
+        t1 = time.perf_counter()
+        lc, complete = surfacemod.base_chunked(_s.surface, frame, keep["lat"], keep["lon"], cx, cy, size,
+                                               getattr(chunks, "landcover", None), coarse=True)
+        idx = surfacemod.slope_rock(lc, keep["u"], heightmap.SQUARE)
+        road_feats, roads_complete = _s.surface.roads(keep["lat"], keep["lon"])
+        stages["landcover"] = time.perf_counter() - t1
+        t1 = time.perf_counter()
+        if road_feats:              # (the widths' guesses, not measured between the buildings)
+            idx = surfacemod.paint_roads(idx, keep["lat"], keep["lon"], road_feats, heightmap.SQUARE,
+                                         _s.surface.urban, None, [])
+        idx = (surfacemod.paint_lots(idx, keep["lat"], keep["lon"], _s.surface.lots(keep["lat"], keep["lon"]))
+               if hasattr(_s.surface, "lots") else idx)
+        if hasattr(_s.surface, "fuel_pads"):
+            idx = surfacemod.paint_pads(idx, keep["lat"], keep["lon"], _s.surface.fuel_pads(keep["lat"], keep["lon"]))
+        stages["roadPaint"] = time.perf_counter() - t1
+        info["layers"] = surfacemod.write_masks(idx[::-1], out_dir, name[:-4])
+        info["surfaceComplete"] = complete and roads_complete
+    info["ter"], mats = surfacemod.write_ter(out_dir, ter_name, keep["qgrid"], idx)
+    if mats is not None:
+        info["mats"] = mats
+    if stood_in[0]:
+        stages["demStandIn"] = stood_in[0]
+    stages["cpu"] = time.thread_time() - c0
+    info["stages"] = stages
+    info["hm"] = name
+    return info
+
+
 REGION_PAD_M = 16.0         # m around a block's lattice its region's box reaches (its samples' surface points)
 _REGION_IDS = itertools.count(1)
 
