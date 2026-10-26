@@ -52,6 +52,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from urllib.parse import urlsplit
 
+import perftrace
+
 log = logging.getLogger("earthd.net")
 
 SERVER_VERSION = "0.4.0"
@@ -768,6 +770,8 @@ class Fetcher:
                     elapsed = self.clock() - t0
                     if NETLOG:
                         _netlog(url, hd, status, body)
+                    if perftrace.ON:
+                        perftrace.net(h.name, kind, status, len(body or b""), elapsed, url)
                 finally:
                     sem.release()
                 res = self._classify(h, url, status, {k.lower(): v for k, v in (rh or {}).items()}, body, elapsed)

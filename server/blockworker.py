@@ -29,6 +29,7 @@ import grading as gradingmod
 import heightmap
 import mapdata as mapdatamod
 import netfetch
+import perftrace
 import plancache
 import roadwidth as roadwidthmod
 import seacarve as seacarvemod
@@ -325,6 +326,7 @@ def build(aid, lat, lon, hm_zoom, q, cx, cy, size, out_dir, name, ter_name=None,
             idx[_s.sea.depth(keep["lat"], keep["lon"]) > WATER_BED_M] = surfacemod.MUD
         road_feats, roads_complete = _s.surface.roads(keep["lat"], keep["lon"])
         stages["landcover"] = time.perf_counter() - t1
+        perftrace.stage("landcover", t1, cx=cx, cy=cy)
         t1 = time.perf_counter()
         if road_feats:
             idx = surfacemod.paint_roads(idx, keep["lat"], keep["lon"], road_feats, heightmap.SQUARE,
@@ -335,6 +337,7 @@ def build(aid, lat, lon, hm_zoom, q, cx, cy, size, out_dir, name, ter_name=None,
         if hasattr(_s.surface, "fuel_pads"):    # gas station forecourts (--gas-stations on)
             idx = surfacemod.paint_pads(idx, keep["lat"], keep["lon"], _s.surface.fuel_pads(keep["lat"], keep["lon"]))
         stages["roadPaint"] = time.perf_counter() - t1
+        perftrace.stage("roadPaint", t1, cx=cx, cy=cy)
         info["layers"] = surfacemod.write_masks(idx[::-1], out_dir, name[:-4])
         info["surfaceComplete"] = complete and roads_complete
     if ter_name is not None:
@@ -344,6 +347,7 @@ def build(aid, lat, lon, hm_zoom, q, cx, cy, size, out_dir, name, ter_name=None,
         if mats is not None:          # the .ter's own material list (MATERIALS indices)
             info["mats"] = mats
         stages["ter"] = time.perf_counter() - t1
+        perftrace.stage("ter", t1, cx=cx, cy=cy)
     info["stages"] = stages
     whole = [(rid, reg)] if reg is not None else []
     with _s.lock:

@@ -106,6 +106,7 @@ import mapdata as mapdatamod  # noqa: E402
 import dem as demmod  # noqa: E402
 import mapcells  # noqa: E402
 import pacer  # noqa: E402
+import perftrace  # noqa: E402
 import peerwork as peerworkmod  # noqa: E402
 import deshadow as deshadowmod  # noqa: E402
 import farfield  # noqa: E402
@@ -1819,6 +1820,7 @@ class Server:
                 idx[self.sea.depth(keep["lat"], keep["lon"]) > blockworker.WATER_BED_M] = surfacemod.MUD
             road_feats, roads_complete = self.surface.roads(keep["lat"], keep["lon"])
             stages["landcover"] = time.perf_counter() - t1
+            perftrace.stage("landcover", t1, cx=cx, cy=cy, provisional=provisional)
             t1 = time.perf_counter()
             if road_feats:              # (provisional: the widths' guesses, not measured between the buildings)
                 idx = surfacemod.paint_roads(idx, keep["lat"], keep["lon"], road_feats, heightmap.SQUARE,
@@ -1830,6 +1832,7 @@ class Server:
                 idx = surfacemod.paint_pads(idx, keep["lat"], keep["lon"],
                                             self.surface.fuel_pads(keep["lat"], keep["lon"]))
             stages["roadPaint"] = time.perf_counter() - t1
+            perftrace.stage("roadPaint", t1, cx=cx, cy=cy, provisional=provisional)
             complete = complete and roads_complete
             info["layers"] = surfacemod.write_masks(idx[::-1], self.out_dir, hm[:-4])
             info["surfaceComplete"] = complete
@@ -3834,6 +3837,7 @@ class Connection:
                 key = (aid, cx, cy)
                 self.s.hm_sent.append(key)
                 log.info("terrain_ready %s (provisional) after %.0f ms", key, (time.perf_counter() - t0) * 1000)
+                perftrace.request("terrain request", "req", t0, key=[cx, cy], budget=budget, provisional=True)
                 self.send({"type": "terrain_ready", "requestId": req, "anchorId": aid, "provisional": True,
                            **self.terrain_msg(key, prov)})
                 self.spawn(self.refine_follow(job, key, prov.get("ter"), t0))
@@ -3849,6 +3853,7 @@ class Connection:
         except Exception as e:
             self.terrain_wait -= 1
             log.exception("terrain request %s failed", req)
+            perftrace.request("terrain request", "req", t0, key=[cx, cy], budget=budget, error=type(e).__name__)
             self.send({"type": "terrain_error", "requestId": req, "anchorId": aid,
                        "error": f"{type(e).__name__}: {e}"})
             if aid == self.active and self.pending_block == self.s.layout.block_at(cx, cy):
@@ -3861,6 +3866,7 @@ class Connection:
         used = time.perf_counter() - t0
         log.info("terrain_ready %s after %.0f ms%s", key, used * 1000,
                  "" if budget is None else f" (budget {budget:.1f} s)")
+        perftrace.request("terrain request", "req", t0, key=[cx, cy], budget=budget, provisional=False)
         if budget is not None:
             self.s.quality_changed(self.s.quality.record(used, budget, info.get("stages", {}).get("grading", 0.0)))
         self.send({"type": "terrain_ready", "requestId": req, "anchorId": aid, **self.terrain_msg(key, info)})
@@ -3976,6 +3982,8 @@ class Connection:
             self.commit_anchor(aid)
         x, y = _num(msg, "x", 0.0), _num(msg, "y", 0.0)
         vx, vy = _num(msg, "vx", 0.0), _num(msg, "vy", 0.0)
+        if perftrace.ON:            # (the drive in a real game's recording)
+            perftrace.counter("pose", speed=round(math.hypot(vx, vy), 2), x=round(x), y=round(y))
         if aid == self.active:
             self.focus = (x, y)
             self.pz = _num(msg, "z", 0.0)
@@ -4208,6 +4216,7 @@ class Connection:
         else:
             return None
         log.info("terrain %s late (%.1f s to the stop line): a provisional one first", (anchor.id, cx, cy), left)
+        perftrace.instant("provisional started", "req", key=[cx, cy], stop_in=left)
         prov = asyncio.ensure_future(self.loop.run_in_executor(
             self.s.prov_pool, self.s.make_follow_provisional, anchor, cx, cy))
         await asyncio.wait([job, prov], return_when=asyncio.FIRST_COMPLETED)
@@ -4236,8 +4245,9 @@ class Connection:
                 if self.pending_block != blk and self.block != blk:
                     # (driven past on the provisional one: the graded one is not wanted, and it would hold up the
                     # next blocks' builds)
-                    log.info("graded follow block %s %s: the game moved on", key,
-                             "dropped" if self.s.drop_build(key) else "not sent")
+                    dropped = self.s.drop_build(key)
+                    log.info("graded follow block %s %s: the game moved on", key, "dropped" if dropped else "not sent")
+                    perftrace.instant("graded block dropped", "req", key=list(key[1:]), dropped=dropped)
                     job.add_done_callback(lambda f: f.cancelled() or f.exception())     # (no "never retrieved")
                     return
                 await asyncio.wait([job], timeout=FOLLOW_PROV_CHECK_S)
@@ -4254,6 +4264,7 @@ class Connection:
                     return
                 await asyncio.sleep(FOLLOW_PROV_CHECK_S)
             self.s.hm_sent.append(key)
+            perftrace.request("graded refresh", "req", t0, key=list(key[1:]))
             self.send({"type": "terrain_refresh", "anchorId": key[0], **self.terrain_msg(key, info)})
         finally:
             self.refining.discard(key)
@@ -4845,7 +4856,7 @@ async def main_async(args):
         for lane in range(1 + max(1, lanes)):
             warm_q = ctx.Queue(maxsize=64)
             block_pools.append((poolsmod.RespawningPool(
-                "block", 1, mp_context=ctx, initializer=blockworker.init,
+                "block" if lane == LANE_REQUEST else f"prefetch block {lane}", 1, mp_context=ctx, initializer=blockworker.init,
                 initargs=(args.cache_dir, args.offline, args.roads == "on",
                           args.grading == "on" and args.roads == "on",
                           args.road_widths == "on" and args.roads == "on", args.surface == "on", warm_q,
@@ -4961,6 +4972,8 @@ async def main_async(args):
             time.sleep(LAG_TICK_S)
             b = beat[0]
             lag = time.perf_counter() - b - LAG_TICK_S
+            if perftrace.ON and lag > 0.05:
+                perftrace.counter("loop lag", s=round(lag, 3))
             if lag > LAG_REPORT_S and reported != b and log.isEnabledFor(logging.DEBUG):
                 reported = b
                 f = sys._current_frames().get(main_ident)
@@ -5376,6 +5389,7 @@ def main():
         raise SystemExit(str(ex))
     import sampler
     sampler.maybe_start()           # BNGE_SAMPLE=<path>: a sampling profile of this process's threads (debugging)
+    perftrace.init("main")          # BNGE_TRACE=<folder>: every process's spans for the profiler (debugging)
     import budget
     if args.nice:
         try:

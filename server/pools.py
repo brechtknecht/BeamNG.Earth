@@ -5,11 +5,14 @@ every later submit raises BrokenProcessPool. The road pool broken that way left 
 tile while the terrain and the far buildings went on loading. RespawningPool makes the pool again at the next submit
 (at most every RESPAWN_S: a pool whose processes cannot even start does not spawn without end) and logs it.
 """
+import functools
 import logging
 import threading
 import time
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
+
+import perftrace
 
 log = logging.getLogger("earthd.pools")
 
@@ -20,6 +23,8 @@ class RespawningPool:
     """ProcessPoolExecutor(*args, **kwargs) made again when broken. submit / shutdown as the executor's."""
 
     def __init__(self, name, *args, **kwargs):
+        if perftrace.ON:           # (BNGE_TRACE: each process traced under the pool's name)
+            kwargs["initializer"] = functools.partial(perftrace.worker_init, name, kwargs.get("initializer"))
         self.name, self._args, self._kwargs = name, args, kwargs
         self._lock = threading.Lock()
         self._pool = ProcessPoolExecutor(*args, **kwargs)
@@ -27,6 +32,7 @@ class RespawningPool:
         self.respawns = 0
 
     def submit(self, fn, *args, **kwargs):
+        fn = perftrace.job(fn, self.name, args)
         with self._lock:
             pool = self._pool
         try:
