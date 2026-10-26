@@ -81,6 +81,7 @@ import numpy as np  # noqa: E402
 from PIL import Image  # noqa: E402
 
 import aheadpath  # noqa: E402
+import quality as qualitymod  # noqa: E402
 import blockworker  # noqa: E402
 import cache as cachemod  # noqa: E402
 import cdae  # noqa: E402
@@ -518,6 +519,31 @@ def predict_request(px, py, vx, vy, cx, cy, rule=FOLLOW_RULES[1024]):
     return predict_centre(px + vx * t, py + vy * t, vx, vy, lead, reach, rule.grid, rule.min_lead, rule.min_lead_v)
 
 
+def predict_chain(px, py, vx, vy, cx, cy, rule, horizon_s, steps=4):
+    """The mod's requests after the block centred (cx, cy), for a player driving straight at (vx, vy) from (px, py):
+    [(s from now, centre)] while within horizon_s (predict_request again at each block's prepare-box exit). The
+    prefetch builds these when the follow blocks fall behind (quality.Governor.block_ahead_s)."""
+    out, t_all, cur = [], 0.0, (cx, cy)
+    _lead, _reach, ahead = rule.mode(vx, vy)
+    for _ in range(steps):
+        qx, qy = px + vx * ahead, py + vy * ahead
+        exits = [((c + math.copysign(rule.prepare, v)) - q) / v
+                 for q, v, c in ((qx, vx, cur[0]), (qy, vy, cur[1])) if abs(v) > 0.5]
+        if not exits:
+            break
+        t = max(0.0, min(exits)) + FRAME_S
+        if t_all + t > horizon_s:
+            break
+        t_all += t
+        px, py = px + vx * t, py + vy * t
+        nxt = predict_request(px, py, vx, vy, *cur, rule)
+        if nxt == cur:
+            break
+        out.append((t_all, nxt))
+        cur = nxt
+    return out
+
+
 def _num(msg, name, default=None):
     v = msg.get(name, default)
     if v is None:
@@ -743,6 +769,7 @@ class Server:
         self.region_thread = None
         self.fast = False               # the player faster than FAST_BASE_V (the latest pose): photos follow blocks
         self.edge_at = None             # time.monotonic() the moving player gets to its block's edge (_base_wait_s)
+        self.quality = qualitymod.Governor()    # detail and lookahead by the follow blocks' measured build budget
         self.base_pending = {}          # block -> the analysis regions its base photo was rendered without
         self.base_rev = itertools.count(1)
         self.hm_committed = deque(maxlen=HM_KEEP_COMMITTED)
@@ -1133,6 +1160,15 @@ class Server:
         if on != self.speed_on:
             self._repin(self.boost_on, on, "speed boost", on, why)
 
+    def quality_changed(self, change):
+        """Governor.record / tick's result: log a new quality level and apply what the next pose does not."""
+        if change is None:
+            return
+        log.info("quality %s -> %s (%s)", change[0], change[1], self.quality.summary())
+        for c in list(self.connections):
+            if getattr(c, "active", None) is not None and hasattr(c, "update_far"):
+                c.update_far()          # (the far field's K; the speed boost ends by its own rule)
+
     def _repin(self, boost, speed, what, on, why):
         cpus = self.boost_cpus if boost else self.speed_cpus if speed else self.server_cpus
         if not cpus:
@@ -1422,7 +1458,9 @@ class Server:
         if g is None:
             return
         reach = self.layout.block * heightmap.SQUARE / 2 + gradingmod.T_MAX + 40.0
-        path = aheadpath.points(x, y, vx, vy, turn) or [(0.0, x, y, 0.0)]
+        scale = self.quality.lead_scale()       # (behind the player: started earlier)
+        path = aheadpath.points(x, y, vx, vy, turn, lead_s=aheadpath.LEAD_S * scale,
+                                max_m=aheadpath.MAX_M * scale) or [(0.0, x, y, 0.0)]
         keys = []
         for px, py, r in [(px, py, reach + sp) for _t, px, py, sp in path] + [(x, y, WARM_AROUND)]:
             la, lo, _ = anchor.frame.enu_to_geodetic(px, py, 0.0)
@@ -1456,7 +1494,8 @@ class Server:
         if last is not None and last[0] == anchor.id and math.hypot(x - last[1], y - last[2]) < AHEAD_MOVE_M:
             return
         self.ahead_last = (anchor.id, x, y)
-        k = min(1.0, AHEAD_MAX_M / (v * AHEAD_S[-1]))
+        scale = self.quality.lead_scale()
+        k = scale * min(1.0, AHEAD_MAX_M / (v * AHEAD_S[-1]))
         pts = []
         for t in AHEAD_S:
             la, lo, _ = anchor.frame.enu_to_geodetic(x + vx * t * k, y + vy * t * k, 0.0)
@@ -1512,9 +1551,9 @@ class Server:
         last = self.photo_last
         if last is not None and last[0] == anchor.id and math.hypot(x - last[1], y - last[2]) < PHOTO_AHEAD_MOVE_M:
             return
-        v = math.hypot(vx, vy)
-        path = aheadpath.points(x, y, vx, vy, turn, lead_s=PHOTO_AHEAD_S, min_m=PHOTO_AHEAD_MIN_M,
-                                max_m=max(PHOTO_AHEAD_MIN_M, v * PHOTO_AHEAD_S))
+        v, lead = math.hypot(vx, vy), PHOTO_AHEAD_S * self.quality.lead_scale()
+        path = aheadpath.points(x, y, vx, vy, turn, lead_s=lead, min_m=PHOTO_AHEAD_MIN_M,
+                                max_m=max(PHOTO_AHEAD_MIN_M, v * lead))
         if not path:
             return
         self.photo_last = (anchor.id, x, y)
@@ -1937,6 +1976,8 @@ class Server:
             return BASE_FAST_WAIT_S
         if self.edge_at is None:
             return None
+        if not self.quality.photo_waits():      # (behind the player: the photo follows the block, block_base)
+            return BASE_FAST_WAIT_S
         return max(BASE_FAST_WAIT_S, self.edge_at - time.monotonic() - BASE_MARGIN_S)
 
     def _base_later(self, key, fut, tries=4):
@@ -2946,6 +2987,7 @@ class Connection:
         self.pending_block = None       # the last prepare_terrain of the active anchor
         self.terrain_wait = 0           # prepare_terrain requests being built (roads.Tracker: the ground first)
         self.predicted_block = None     # the terrain the prefetch expects next
+        self.ahead_blocks = []          # ... and the ones after it (follow blocks behind: Governor.block_ahead_s)
         self.focus = (0.0, 0.0)         # player x, y in the active frame
         self.view_at = None             # the camera's x, y there when it is VIEW_AWAY_M or more from the car, else None
         self.foci = ()                  # other vehicles' collision foci there ((x, y, r, trees), parse_foci)
@@ -3732,6 +3774,9 @@ class Connection:
             if time.perf_counter() - t1 > 0.1:
                 log.debug("terrain request %s: update_far %.2f s", (aid, cx, cy), time.perf_counter() - t1)
         t0 = time.perf_counter()
+        # the follow block's budget: the time the moving player has left to its block's edge (Governor)
+        edge = self.s.edge_at if aid == self.active and self.following else None
+        budget = None if edge is None else edge - time.monotonic()
         self.terrain_wait += 1
         try:
             job = asyncio.ensure_future(self.s.terrain(anchor, cx, cy))
@@ -3767,7 +3812,11 @@ class Connection:
         self.terrain_wait -= 1
         key = (aid, cx, cy)
         self.s.hm_sent.append(key)
-        log.info("terrain_ready %s after %.0f ms", key, (time.perf_counter() - t0) * 1000)
+        used = time.perf_counter() - t0
+        log.info("terrain_ready %s after %.0f ms%s", key, used * 1000,
+                 "" if budget is None else f" (budget {budget:.1f} s)")
+        if budget is not None:
+            self.s.quality_changed(self.s.quality.record(used, budget, info.get("stages", {}).get("grading", 0.0)))
         self.send({"type": "terrain_ready", "requestId": req, "anchorId": aid, **self.terrain_msg(key, info)})
 
     def commit_anchor(self, aid):
@@ -3813,6 +3862,7 @@ class Connection:
         self.refined, self.node_changed = set(), {}
         self.failed.clear()
         self.block = self.pending_block = self.predicted_block = None
+        self.ahead_blocks = []
         if anchor.first_terrain is not None:
             self._set_block(aid, *anchor.first_terrain)
         log.info("commit anchor %d", aid)
@@ -3905,10 +3955,12 @@ class Connection:
             v, now = math.hypot(vx, vy), time.monotonic()
             if v > SPEED_BOOST_OFF_V:
                 self.fast_t = now
-            if v > SPEED_BOOST_V:
-                self.s.speed_boost(True, f"{v * 3.6:.0f} km/h")
+            behind = self.s.quality.boost() and v > BOOST_MOVE_MS   # (the follow blocks late: more cores at any speed)
+            if v > SPEED_BOOST_V or behind:
+                self.s.speed_boost(True, f"{v * 3.6:.0f} km/h" if not behind else f"behind, {v * 3.6:.0f} km/h")
             elif self.s.speed_on and now - getattr(self, "fast_t", 0.0) > SPEED_BOOST_HOLD_S:
                 self.s.speed_boost(False, "slower")
+            self.s.quality_changed(self.s.quality.tick())
         if isinstance(msg.get("cam"), dict):
             self.cam, self.cam_aid = msg["cam"], aid
         self.view_at = self.camera_away(msg.get("cam")) if aid == self.active else None
@@ -3937,6 +3989,11 @@ class Connection:
                 c = predict_request(px, py, *self.vel, base.cx, base.cy, rule)
                 if c != (base.cx, base.cy) and self.s.layout.block_at(*c) != self.block:
                     self.predicted_block = self.s.layout.block_at(*c)
+            horizon = self.s.quality.block_ahead_s()
+            self.ahead_blocks = [self.s.layout.block_at(*c) for _t, c in
+                                 predict_chain(px, py, *self.vel, base.cx, base.cy, rule, horizon)] if horizon else []
+        else:
+            self.ahead_blocks = []
         self.update_far()
         if self.teleport_pending and time.monotonic() - self.teleport_t0 > TELEPORT_PAUSE_MAX_S:
             self.teleport_pending = False   # the mod never committed it (it stayed): the old place's work goes on
@@ -4352,11 +4409,14 @@ class Connection:
     def maybe_prefetch(self):
         """Speculatively build the terrain the mod is about to ask for."""
         anchor = self.s.anchors.get(self.active)
-        if anchor is None or self.predicted_block is None or self.prefetching:
+        if anchor is None or self.prefetching:
             return
-        cx, cy = self.predicted_block.cx, self.predicted_block.cy
-        if self.s.terrain_cached((anchor.id, cx, cy)):
+        # the next one, then (the follow blocks behind the player) the ones after it, nearest first
+        todo = [b for b in [self.predicted_block, *self.ahead_blocks]
+                if b is not None and b != self.block and not self.s.terrain_cached((anchor.id, b.cx, b.cy))]
+        if not todo:
             return
+        cx, cy = todo[0].cx, todo[0].cy
         self.prefetching = True
 
         async def run():
@@ -4395,7 +4455,9 @@ class Connection:
         self.retired = {ck: t for ck, t in self.retired.items() if now - t < self.s.retired_keep}
         self.node_changed = {n: t for n, t in self.node_changed.items() if now - t < farfield.HOLD_S}
         radius, extra = (self.horizon_select() if self.s.horizon else (self.s.radius, {}))
-        new, refined = farfield.select(*self.view_focus, self.forced(), self.refined, self.s.kfun,
+        kfun, fk = self.s.kfun, self.s.quality.far_k()     # (coarser while the follow blocks are behind the player)
+        kfun = kfun if fk == 1.0 else (lambda lvl: self.s.kfun(lvl) * fk)
+        new, refined = farfield.select(*self.view_focus, self.forced(), self.refined, kfun,
                                        self.s.hysteresis, radius, hold=set(self.node_changed),
                                        min_level=self.s.min_level, radii=self.s.near_radii, layout=self.s.layout,
                                        forced_level=self.s.forced_level, view=self.view(), **extra)
@@ -4586,7 +4648,8 @@ class Connection:
             # While a physics block builds in this process, one far tile at a time: they share the interpreter
             # (GIL), and three far workers made a block build 3-10x slower (landcover 1.4 s vs 0.1 s), too slow
             # to follow a car at 58 m/s (2026-10-12). The far tile finishing next refills the workers.
-            workers = HM_BUSY_TILE_WORKERS if self.s.hm_here else self.s.tile_workers
+            # (fewer while the follow blocks are behind the player: Governor.far_workers)
+            workers = HM_BUSY_TILE_WORKERS if self.s.hm_here else self.s.quality.far_workers(self.s.tile_workers)
             # plus the helpers' slots (compute sharing): their tiles cost this process only the files (26 ms a
             # tile); kept to the local workers, a Steam Deck sent 2 at a time to 12 idle helper workers (2026-10-22)
             workers += self.s.remote_slots()

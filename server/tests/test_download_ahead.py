@@ -6,6 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import earthd  # noqa: E402
+import quality  # noqa: E402
 import geodesy  # noqa: E402
 
 
@@ -40,7 +41,7 @@ class FakeMapdata:
 def server():
     s = types.SimpleNamespace(dem=FakeDem(), mapdata=FakeMapdata(), buildings=True, ahead_pool=SyncPool(),
                               ahead_busy=False, ahead_last=None, ahead_stats={"dem": 0, "cells": 0, "deferred": 0},
-                              layout=types.SimpleNamespace(block=512))
+                              layout=types.SimpleNamespace(block=512), quality=quality.Governor())
     return s
 
 
