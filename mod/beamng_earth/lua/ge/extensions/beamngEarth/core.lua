@@ -810,6 +810,8 @@ local function onMessage(msg)
     -- protocol 4: who draws the near ground (a protocol-3 server sends nothing: the terrain does),
     -- and the credit line for the imagery / elevation sources the server actually uses
     M.setNearVisual(msg.nearVisual)
+    -- (A/B, server BNGE_TERRAIN_BASE_TEX) the block's baked base colour's size; none: the mod's own
+    terrain.setBaseTexSize(tonumber(msg.terrainBaseTex))
     -- M1h: horizon mode (a server without hello.horizon: the level's sky and 100 km view distance)
     M.setHorizon(msg.horizon == true)
     serverAttribution = (type(msg.attribution) == 'string' and msg.attribution ~= '') and msg.attribution or nil
