@@ -2155,13 +2155,16 @@ def _is_link(spec):
 
 
 class GradedDem:
-    """dem.Dem with sample() graded under the roads; everything else passes through."""
+    """dem.Dem with sample() graded under the roads; everything else passes through. region_for(lat, lon): the Region
+    that grades the points (Grader.region), or None: as the cells' whole plans."""
 
-    def __init__(self, dem, grader):
-        self._dem, self._grader = dem, grader
+    def __init__(self, dem, grader, region_for=None):
+        self._dem, self._grader, self._region_for = dem, grader, region_for
 
     def sample(self, lat, lon, zoom, progress=None):
         base = self._dem.sample(lat, lon, zoom, progress) if progress is not None else self._dem.sample(lat, lon, zoom)
+        if self._region_for is not None:
+            return self._grader.apply(lat, lon, base, region=self._region_for(lat, lon))
         return self._grader.apply(lat, lon, base)
 
     def __getattr__(self, name):

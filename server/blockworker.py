@@ -995,9 +995,52 @@ def _far_geometry(aid, lat, lon, tile, zoom, q, ref_zoom, with_sink, layout):
     base = _s.airports.wrap(_s.dem) if _s.airports is not None else _s.dem
     if _s.sea is not None:
         base = seacarvemod.SeaDem(base, _s.sea if tile.level <= seacarvemod.CARVE_MAX_LEVEL else None)
-    src = gradingmod.GradedDem(base, g) if (g is not None and tile.level <= 0) else base
+    src = base
+    if g is not None and tile.level <= 0:
+        region_for = _regions_for(g, _grow_box(tile.bbox, REGION_PAD_M)) if FAR_REGION else None
+        src = gradingmod.GradedDem(base, g, region_for)
     return farfield.build_tile(frame, src, tile, zoom, q, ref_zoom, with_sink=with_sink,
                                layout=layout)
+
+
+# A far tile of level <= 0 (the ground round the blocks, graded under the roads) whose cells are not planned whole yet is
+# graded from region plans as the road tiles are (a block's on disk, else its own over its box): it waited for the cells'
+# whole plans in its far process (xproc / plancache: 230-300 s of waits in a 300 km/h drive on 2 cores, 2026-10-26). It
+# is not told apart from the whole plans later (the far field's ground, drawn only); the revisit cache keeps none such.
+# 0: the whole plans (as before).
+FAR_REGION = os.environ.get("BNGE_FAR_REGION", "1") != "0"
+
+
+def _regions_for(g, box):
+    """region_for(lat, lon) of a far tile over box (grading.GradedDem): the region whose box holds the points, made
+    (grow 0) when none does; None when their cells are planned whole. One that came from region plans marks the build
+    incomplete (revisit.fault)."""
+    import revisit
+    regs = []
+
+    def region_for(la, lo):
+        e, n, _ = g.frame.geodetic_to_enu(np.asarray(la, np.float64).ravel(), np.asarray(lo, np.float64).ravel(), 0.0)
+        e, n = np.asarray(e), np.asarray(n)
+        if not e.size:
+            return None
+        for r in regs:
+            x0, y0, x1, y1 = r.box
+            if e.min() >= x0 and e.max() <= x1 and n.min() >= y0 and n.max() <= y1:
+                return r
+        m = REGION_PAD_M
+        pts = (float(e.min()) - m, float(n.min()) - m, float(e.max()) + m, float(n.max()) + m)
+        want = box if _within_box(pts, box) else pts
+        reg = g.region(want, make=False) or g.region(want, grow=0.0)
+        if reg is not None:
+            if not regs:
+                revisit.fault()
+            regs.append(reg)
+        return reg
+    return region_for
+
+
+def _within_box(box, outer):
+    return box[0] >= outer[0] and box[1] >= outer[1] and box[2] <= outer[2] and box[3] <= outer[3]
 
 
 WORKER_IMAGERY_TILES = 96      # decoded imagery tiles a far-tile worker keeps (imagery.MEM_TILES: 512, the server's)

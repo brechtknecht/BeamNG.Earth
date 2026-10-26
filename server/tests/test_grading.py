@@ -681,6 +681,23 @@ class RegionTest(unittest.TestCase):
                                    g.apply(la, lo, base, grading.ROAD_LIFT), atol=1e-9)
         self.assertTrue(g.region(tile, make=False, whole=True).same(g), "as the whole plans make it")
 
+    def test_far_tile_regions(self):
+        import blockworker
+        g = grading.Grader(FRAME, CellsMD(self.roads()), self.hill)
+        box = (-128.0, -128.0, 128.0, 128.0)
+        region_for = blockworker._regions_for(g, box)
+
+        class Dem:
+            def sample(self, la, lo, zoom):
+                return RegionTest.hill(la, lo)
+        la, lo = self.grid(box)
+        got = grading.GradedDem(Dem(), g, region_for).sample(la, lo, 15)
+        la2, lo2 = self.grid((300.0, 300.0, 400.0, 400.0))     # (points beyond its box: a region of their own)
+        got2 = grading.GradedDem(Dem(), g, region_for).sample(la2, lo2, 15)
+        self.assertEqual(g.cells, {}, "no cell planned whole")
+        np.testing.assert_allclose(got, g.apply(la, lo, self.hill(la, lo)), atol=1e-9)
+        np.testing.assert_allclose(got2, g.apply(la2, lo2, self.hill(la2, lo2)), atol=1e-9)
+
     def test_a_grown_box_planned_once(self):
         md = CellsMD(self.roads())
         g = grading.Grader(FRAME, md, self.hill)
