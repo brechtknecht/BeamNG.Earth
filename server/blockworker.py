@@ -663,6 +663,10 @@ def _roads_tile(aid, lat, lon, zoom, tx, ty, out_dir, vfs_dir, sidewalks, lift, 
     _s.md.warm(roadsmod.tile_needs(frame, tx, ty, buildings, _s.widths is not None,
                                    1 + seacarvemod.LINE_CELLS if _s.sea is not None else 0))
     g, _ = _s.anchor(aid, lat, lon)
+    if g is not None and TILE_NOWAIT:       # (another process plans its cells: the other tiles first, roads.NotReady)
+        busy = g.elsewhere(_tile_plan_keys(frame, tx, ty))
+        if busy:
+            raise roadsmod.NotReady(f"road plans of {', '.join(map(str, busy))} being made by another process")
     cells = [_s.md.cell(k, layers=("roads",), kind="demand").layers.get("roads")
              for k in roadsmod.cells_of_tile(frame, tx, ty)]
 
@@ -741,6 +745,20 @@ def _roads_tile(aid, lat, lon, zoom, tx, ty, out_dir, vfs_dir, sidewalks, lift, 
         bld = buildingsmod.road_tile(frame, tx, ty, _s.md, elev, None, None, items)
     return roadsmod.write_tile(out_dir, vfs_dir, aid, tx, ty, chunks, walks if sidewalks else None, mesh, dmesh,
                                bld, props, wires, park, tunnel_mesh=tmesh, fuel=fuel, rail_mesh=rmesh) + (fuel_pads,)
+
+
+TILE_NOWAIT = os.environ.get("BNGE_TILE_NOWAIT", "1") != "0"     # 0: a road tile waits for the plans (as before)
+TILE_PLAN_MARGIN_M = 64.0       # m round a road tile whose points' cells' plans it needs at once (_tile_plan_keys)
+
+
+def _tile_plan_keys(frame, tx, ty):
+    """The map cells whose road plans grade a road tile's ground (grading.Grader._keys over its box)."""
+    import roads as roadsmod
+    x0, y0, x1, y1 = roadsmod.tile_bbox(tx, ty)
+    m = TILE_PLAN_MARGIN_M
+    xs, ys = np.meshgrid(np.linspace(x0 - m, x1 + m, 5), np.linspace(y0 - m, y1 + m, 5))
+    la, lo, _ = frame.enu_to_geodetic(xs.ravel(), ys.ravel(), np.zeros(xs.size))
+    return gradingmod.Grader._keys(la, lo)
 
 
 def _with_plazas(mesh, frame, tx, ty, elev, origin, surface):

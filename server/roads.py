@@ -4482,6 +4482,10 @@ class Tracker:
             return
         try:
             res = fut.result()
+        except NotReady as e:       # its road plans are being made by another process: the other tiles meanwhile
+            log.debug("roads tile %s: %s", key, e)
+            self.retry[key] = time.monotonic() + NOT_READY_S
+            return
         except Exception as e:      # network trouble: the next pose asks again
             # (a bug failed every tile on a Steam Deck with nothing in the log, 2026-10-20: each kind once, in full)
             kind = f"{type(e).__name__}: {e}"[:200]
@@ -4515,6 +4519,15 @@ class Tracker:
 
 
 TILE_RETRY_S = 3.0              # s before a road tile whose build failed is built again (Tracker._built)
+# A road tile whose cells' road plans another process is making (blockworker.roads_tile) comes back at once and is asked
+# again after NOT_READY_S: waiting for them in the road process (up to plancache.WAIT_S) held its slot, and the tiles
+# whose plans were there waited behind it (a fresh place at 200 km/h: 99-141 s of such waits per process, the CPU
+# audit 2026-10-26)
+NOT_READY_S = 1.0
+
+
+class NotReady(Exception):
+    """A tile's road plans are being made elsewhere (blockworker.roads_tile): build it again later."""
 TILE_STUCK_S = 90.0             # s a road tile's build may take before the log says it may be stuck
 TILE_FAILS_WARN = 5             # a tile's builds failed in a row before an expected kind of failure is logged as a warning
 _FAILS_SEEN = set()             # the kinds of road tile failures logged in full (Tracker._built)

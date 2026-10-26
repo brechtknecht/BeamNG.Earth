@@ -9,7 +9,7 @@ writes it here; the others read it, or wait while one is planning it (a lock fil
 
 The files: <cache>/plans/<run>/<anchor lat_lon>/<signature>/<z>_<x>_<y>.npz, the arrays as npz (no pickle) and the
 rest as JSON (Spec as its fields). One server run's own (RUN_ENV, set by earthd before its workers start): a plan made
-while some elevation was missing stays out of the next run. A stale lock (xproc.STALE_S: a process that died planning)
+while some elevation was missing stays out of the next run. A stale lock (xproc.stale_s(): a process that died planning)
 is taken over; a wait longer than WAIT_S plans the cell here as before; a process waits only for a planner at least as
 favoured as itself (xproc.once). Old runs' folders go at server start (prune).
 """
@@ -180,7 +180,7 @@ class PlanCache:
     def busy(self, key):
         """True while another process holds cell key's lock (planning it): a lookahead plans another cell meanwhile."""
         try:
-            return time.time() - os.path.getmtime(self._path(key) + ".lock") <= xproc.STALE_S
+            return time.time() - os.path.getmtime(self._path(key) + ".lock") <= xproc.stale_s()
         except OSError:
             return False
 

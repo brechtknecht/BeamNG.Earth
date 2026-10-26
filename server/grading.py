@@ -24,6 +24,7 @@ import math
 import os
 import threading
 import time
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -64,6 +65,12 @@ SPREAD_CELLS = 16           # plans(): more map cells in the points' bbox: only 
 # tiles); Region.same then tells whether the block came out as they make it (blockworker.region_poll: it is built
 # again when not).
 REGION_ON = os.environ.get("BNE_GRADE_REGION", "on") != "off"
+# A cell's region plans are made for the block's box grown by REGION_GROW_M and kept (Grader._region_memo) until the
+# cell's whole plans are made: the next blocks along the way, whose boxes lie within it, take them instead of planning
+# the cell's roads again (a fresh place at 200 km/h: one cell's region planned 13 times, 44 times for 7 cells,
+# the CPU audit 2026-10-26). 0: each block plans its own (as before).
+REGION_GROW_M = float(os.environ.get("BNE_REGION_GROW_M", "384"))
+REGION_MEMO_MAX = 32        # cells' region plans kept per Grader
 REGION_REACH_M = 80.0       # m: the roads whose lines come this near the block are planned (a plan grades its core half
                             # width + T_MAX from its line: ~30 m for the widest motorway)
 T_MIN, T_MAX = 5.0, 12.0    # m, transition back to the natural ground (5: roads close together meet gently)
@@ -1456,21 +1463,37 @@ class Grader:
         dem = getattr(self, "dem", None)
         urgent = dem is not None and hasattr(dem, "urgent")     # (the block waits for it: ahead of the lookahead's tiles)
         failed = []
+        memo = self.__dict__.setdefault("_region_memo", OrderedDict())
+        grown = _grow(box, REGION_GROW_M) if REGION_GROW_M > 0 else box
+        reused = []                 # the earlier regions' (missed, widths) whose cells' plans this one takes
 
         def one(k):
             with self.lock:
                 if k in self.cells:         # (planned whole meanwhile: those)
+                    memo.pop(k, None)
                     return self.cells[k], self.keeps.get(k, []), self.covers.get(k, []), self.opens.get(k, [])
+                hit = memo.get(k)
+                if hit is not None and _within(box, hit[0]):
+                    memo.move_to_end(k)
+                    reused.append((hit[2], hit[3]))
+                    return hit[1]
             with dem.urgent() if urgent else _nullctx():
-                got = sub._make_cell(k, box)
+                got = sub._make_cell(k, grown)
             if got is None:
                 failed.append(k)
                 return [], [], [], []
+            if REGION_GROW_M > 0:
+                with self.lock:
+                    memo[k] = (grown, got, sorted(view.missed), widths)
+                    while len(memo) > REGION_MEMO_MAX:
+                        memo.popitem(last=False)
             return got
         with ThreadPoolExecutor(min(len(keys), PLAN_THREADS), thread_name_prefix="region") as ex_:
             cells = list(ex_.map(one, keys))
-        reg = Region(box, keys, cells, sorted(view.missed) + [str(k) for k in failed])
-        reg.widths = widths
+        missed = set(view.missed) | {m for ms, _w in reused for m in ms}
+        reg = Region(box, keys, cells, sorted(missed) + [str(k) for k in failed])
+        ws = [w for w in [widths] + [w for _m, w in reused] if w is not None]
+        reg.widths = ws[0] if len(ws) == 1 else (_AllWidths(ws) if ws else None)
         log.info("grading: block region %s planned in %.2f s from %d cells (%d plans; cells not read: %s)",
                  tuple(round(v) for v in box), time.perf_counter() - t0, len(keys), len(reg.plans),
                  ", ".join(reg.missed) or "none")
@@ -1496,6 +1519,18 @@ class Grader:
                 self.keeps.setdefault(key, keeps)
                 self.covers.setdefault(key, covers)
                 self.opens.setdefault(key, opens)
+
+    def elsewhere(self, keys):
+        """The cells of keys another process of the run is planning now (their plancache lock held, no plans on disk),
+        after taking the ones it planned already (adopt): a road tile that would wait for them comes back later instead
+        (blockworker.roads_tile)."""
+        if self.shared is None:
+            return []
+        self.adopt(keys)
+        with self.lock:
+            missing = [k for k in keys if k not in self.cells and not (
+                k in self.failed and time.monotonic() - self.failed[k] < RETRY_S)]
+        return [k for k in missing if self.shared.busy(k) and self.shared.load(k) is None]
 
     def apply(self, lat, lon, base, lift=0.0, roads_only=False, planned_only=False, region=None, adopt=False):
         """base (the ungraded heights at the points) graded under the roads. Same shape as base.
@@ -1615,6 +1650,22 @@ def _nullctx():
 
 def _grow(box, m):
     return box[0] - m, box[1] - m, box[2] + m, box[3] + m
+
+
+def _within(box, outer):
+    """Whether box (x0, y0, x1, y1) lies within outer."""
+    return box[0] >= outer[0] and box[1] >= outer[1] and box[2] <= outer[2] and box[3] <= outer[3]
+
+
+class _AllWidths:
+    """The street widths of several regions' plans (a Region whose cells' plans came from earlier ones, region()):
+    same() when every one's are the real ones."""
+
+    def __init__(self, parts):
+        self.parts = list(parts)
+
+    def same(self):
+        return all(w.same() for w in self.parts)
 
 
 def _xy_meets(xy, box):
