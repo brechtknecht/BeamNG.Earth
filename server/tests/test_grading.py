@@ -650,6 +650,45 @@ class RegionTest(unittest.TestCase):
         reg.rows[0] = (k, q)
         self.assertFalse(reg.same(g))
 
+    def shared(self, md):
+        import plancache
+        import shutil
+        import tempfile
+        if not hasattr(self, "dir"):
+            self.dir = tempfile.mkdtemp()
+            self.addCleanup(shutil.rmtree, self.dir, True)
+            os.environ[plancache.RUN_ENV] = "test"
+            self.addCleanup(os.environ.pop, plancache.RUN_ENV, None)
+        g = grading.Grader(FRAME, md, self.hill)
+        g.shared = plancache.for_grader(self.dir, g, None, None)
+        return g
+
+    def test_shared_with_the_other_processes(self):
+        box = (-300.0, -300.0, 300.0, 300.0)
+        reg = self.shared(CellsMD(self.roads())).region(box)
+        md = CellsMD(self.roads())
+        g = self.shared(md)                     # (another process: a road tile in the block)
+        tile = (-100.0, -100.0, 50.0, 50.0)
+        mine = g.region(tile, make=False)
+        self.assertIsNotNone(mine, "the block's region plans on disk")
+        self.assertEqual(md.asked, set(), "nothing planned here")
+        la, lo = self.grid(tile)
+        base = self.hill(la, lo)
+        np.testing.assert_allclose(g.apply(la, lo, base, grading.ROAD_LIFT, region=mine),
+                                   g.apply(la, lo, base, grading.ROAD_LIFT, region=reg), atol=1e-9)
+        self.assertIsNone(g.region((-2000.0, -2000.0, -1800.0, -1800.0), make=False), "none kept there")
+        np.testing.assert_allclose(g.apply(la, lo, base, grading.ROAD_LIFT, region=mine),
+                                   g.apply(la, lo, base, grading.ROAD_LIFT), atol=1e-9)
+        self.assertTrue(g.region(tile, make=False, whole=True).same(g), "as the whole plans make it")
+
+    def test_a_grown_box_planned_once(self):
+        md = CellsMD(self.roads())
+        g = grading.Grader(FRAME, md, self.hill)
+        g.region((-300.0, -300.0, 300.0, 300.0))
+        with unittest.mock.patch.object(grading.Grader, "_make_cell", side_effect=AssertionError("planned again")):
+            reg = g.region((-200.0, -250.0, 400.0, 350.0))      # (the next block along the way, within the grown box)
+        self.assertGreater(len(reg.plans), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

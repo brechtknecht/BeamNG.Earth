@@ -1096,7 +1096,10 @@ class Server:
             t0 = time.perf_counter()
             cla, clo, _ = anchor.frame.enu_to_geodetic(x, y, 0.0)
             rules = navgraphmod.road_rules(navgraphmod.country_near(self.airports_db, float(cla), float(clo)))
-            path, n_nodes, n_edges = self.road_pool.submit(
+            # (in the far buildings' process when there is one: a graph held a road process for 10-35 s at 300 km/h,
+            # and the road tiles waited behind it, 2026-10-26; NAV_FAR_BLD)
+            pool = self.far_bld_pool if NAV_FAR_BLD and self.far_bld_pool is not None else self.road_pool
+            path, n_nodes, n_edges = pool.submit(
                 blockworker.navgraph, aid, anchor.lat, anchor.lon, anchor.zooms[0], x, y, self.out_dir,
                 self.vfs_dir, serial, self.left_hand(anchor), self.mph(anchor), rules).result()
             log.debug("navgraph %d of anchor %d: %d nodes in %.2f s (queue + build)", serial, aid, n_nodes,
@@ -2953,6 +2956,8 @@ REGION_FORGET_S = 900.0     # s a block's answer is waited for at most
 PROVISIONAL_FOLLOW = os.environ.get("BNGE_PROVISIONAL_FOLLOW", "1") != "0"
 # ... graded under the roads whose cells' plans are made already (Grader.adopt: the block processes' plans on disk)
 PROVISIONAL_GRADE = os.environ.get("BNGE_PROVISIONAL_GRADE", "1") != "0"
+# The AI graph is built in the far buildings' process (when there is one), not in a road process (build_navgraph).
+NAV_FAR_BLD = os.environ.get("BNGE_NAV_FARBLD", "1") != "0"
 FOLLOW_PROV_EST_S = 3.0     # s a provisional follow block takes, until measured (Server.prov_est)
 FOLLOW_PROV_MIN_V = 2.0     # m/s: slower, a block is late only for a car standing ...
 FOLLOW_PROV_HELD_M = 40.0   # ... this close to a stop line (the edge guard holds it there)

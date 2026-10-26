@@ -1440,13 +1440,14 @@ class Grader:
                 memo[mk] = out
         return out
 
-    def region(self, box, make=True, whole=False):
+    def region(self, box, make=True, whole=False, grow=None):
         """A Region for the block over box (x0, y0, x1, y1) in the frame: the plans of the roads near it (REGION_REACH_M)
         in the cells its points reach, made now from those cells' map data alone (and any other cell on disk), or None
         when those cells are all planned already (or REGION_ON is off): apply(region=) then grades as their whole plans
         would, as far as the cells around did not count (Region.same). A cell's region plans made by this or another
         process (shared: plancache) over a box that holds this one are taken. make False: only those (None when a cell
-        has none); whole: also when the cells are planned (a road tile's region told apart from them later)."""
+        has none); whole: also when the cells are planned (a road tile's region told apart from them later); grow: m the
+        box is grown by for the plans made here (None: REGION_GROW_M)."""
         if not REGION_ON or not hasattr(self.md, "has"):
             return None
         t = np.linspace(0.0, 1.0, 9)
@@ -1467,7 +1468,8 @@ class Grader:
         urgent = dem is not None and hasattr(dem, "urgent")     # (the block waits for it: ahead of the lookahead's tiles)
         failed, lacking = [], []
         memo = self.__dict__.setdefault("_region_memo", OrderedDict())
-        grown = _grow(box, REGION_GROW_M) if REGION_GROW_M > 0 else box
+        grow = REGION_GROW_M if grow is None else grow
+        grown = _grow(box, grow) if grow > 0 else box
         reused = []                 # the earlier regions' (missed, widths) whose cells' plans this one takes
         shared = self.shared if REGION_SHARE else None
         made = []
@@ -1500,7 +1502,7 @@ class Grader:
                 failed.append(k)
                 return [], [], [], []
             made.append(k)
-            if REGION_GROW_M > 0:
+            if grow > 0:
                 with self.lock:
                     memo[k] = (grown, got, sorted(view.missed), widths)
                     while len(memo) > REGION_MEMO_MAX:

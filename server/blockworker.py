@@ -420,7 +420,8 @@ def _region_over(g, la, lo):
         if e.min() >= x0 and e.max() <= x1 and n.min() >= y0 and n.max() <= y1:
             return r
     m = REGION_PAD_M
-    more = g.region((float(e.min()) - m, float(n.min()) - m, float(e.max()) + m, float(n.max()) + m))
+    more = g.region((float(e.min()) - m, float(n.min()) - m, float(e.max()) + m, float(n.max()) + m),
+                    grow=getattr(_s, "building_grow", None))
     if more is not None:
         _s.building_more.append(more)
     return more
@@ -698,25 +699,25 @@ def _roads_tile(aid, lat, lon, zoom, tx, ty, out_dir, vfs_dir, sidewalks, lift, 
         keys = _tile_plan_keys(frame, tx, ty)
         busy = g.elsewhere(keys)            # (and the cells planned already taken: Grader.adopt)
         if TILE_REGION and not g.planned(keys):
-            # graded from the region plans of the block it lies in (plancache: another process's), else its own when
-            # no process plans its cells; the whole plans are waited for by no one (roads.Tracker checks it later)
+            # graded from the region plans of the block it lies in (plancache: another process's), else from its own
+            # over just its box (quick: a cell's whole plans took 17-150 s at 300 km/h, a block's region came after the
+            # car had passed); the whole plans are waited for by no one (roads.Tracker checks it against them later)
+            box = _grow_box(roadsmod.tile_bbox(tx, ty), TILE_PLAN_MARGIN_M)
             try:
-                reg = g.region(_grow_box(roadsmod.tile_bbox(tx, ty), TILE_PLAN_MARGIN_M), make=not busy)
+                reg = g.region(box, make=False) or g.region(box, grow=0.0)
             except Exception:       # (as the whole plans make it then)
                 log.exception("road tile region (%s, %s)", tx, ty)
-            if reg is None and busy:
-                raise roadsmod.NotReady(f"road plans of {', '.join(map(str, busy))} being made by another process")
-        elif busy and TILE_NOWAIT:          # (another process plans its cells: the other tiles first, roads.NotReady)
+        if reg is None and busy and TILE_NOWAIT:    # (another process plans its cells: the other tiles first)
             raise roadsmod.NotReady(f"road plans of {', '.join(map(str, busy))} being made by another process")
     if reg is not None:
         import revisit
         revisit.fault()                     # (not kept: its whole plans may grade it otherwise)
-    _s.building, _s.building_more = reg, []     # (its points beyond the region's box: _region_over)
+    _s.building, _s.building_more, _s.building_grow = reg, [], 0.0     # (its points beyond its box: _region_over)
     try:
         return _roads_tile_graded(aid, lat, lon, zoom, tx, ty, out_dir, vfs_dir, sidewalks, lift, buildings,
                                   left_hand, mph, q, gas_stations, frame, g) + (reg is not None,)
     finally:
-        _s.building, _s.building_more = None, []
+        _s.building, _s.building_more, _s.building_grow = None, [], None
 
 
 def _roads_tile_graded(aid, lat, lon, zoom, tx, ty, out_dir, vfs_dir, sidewalks, lift, buildings, left_hand, mph, q,
