@@ -1022,17 +1022,20 @@ class Server:
         loop.call_later(due[0] - loop.time(), step)
 
     # --- heightmaps ------------------------------------------------------
-    def hm_name(self, key):
+    def hm_name(self, key, provisional=False):
+        """A provisional build's own name (its heights and masks): on Windows the graded build of the same block,
+        in its block process at the same time, failed on the shared one ("Zugriff verweigert" in os.replace, 300 km/h
+        on the test PC, 2026-10-26), and the one written last was the other's masks (its road paint gone)."""
         aid, cx, cy = key
-        return f"hm_{aid}_{int(cx)}_{int(cy)}.png"
+        return f"hm_{aid}_{int(cx)}_{int(cy)}{'_p' if provisional else ''}.png"
 
     def ter_name(self, key):
         """A new .ter name for every build of key: the engine skips a terrainFile it already has, and a
         rebuilt block (an evicted one, or one with more of its land cover) can differ."""
         return f"{self.hm_name(key)[:-4]}_{next(self.ter_serial)}.ter"
 
-    def hm_vfs(self, key):
-        return f"{self.vfs_dir}/{self.hm_name(key)}"
+    def hm_vfs(self, key, info=None):
+        return f"{self.vfs_dir}/{(info or {}).get('hm') or self.hm_name(key)}"
 
     def build_veg_tile(self, aid, tx, ty):
         """vegetation.py: one vegetation tile of anchor aid written to the session folder: (vfs path, n) or
@@ -1771,8 +1774,9 @@ class Server:
             def gen(la, lo):        # the ground over the low arches raised over their vaults (roads.arch_raise)
                 return roadsmod.block_arch_raise(tun, cell_fn, anchor.frame, la, lo, elev(la, lo),
                                                  (cx - half, cy - half, cx + half, cy + half))
+        hm = self.hm_name((anchor.id, cx, cy), provisional)
         info = heightmap.generate(anchor.frame, gen,
-                                  os.path.join(self.out_dir, self.hm_name((anchor.id, cx, cy))), cx, cy, q=q,
+                                  os.path.join(self.out_dir, hm), cx, cy, q=q,
                                   size=self.layout.block, keep=keep, chunks=None if provisional else anchor.chunks,
                                   ground_at=ground_at)
         stages = {"heights": time.perf_counter() - t0, "grading": grade_s[0], "gradingCpu": grade_s[1],
@@ -1800,7 +1804,7 @@ class Server:
                                             self.surface.fuel_pads(keep["lat"], keep["lon"]))
             stages["roadPaint"] = time.perf_counter() - t1
             complete = complete and roads_complete
-            info["layers"] = surfacemod.write_masks(idx[::-1], self.out_dir, self.hm_name((anchor.id, cx, cy))[:-4])
+            info["layers"] = surfacemod.write_masks(idx[::-1], self.out_dir, hm[:-4])
             info["surfaceComplete"] = complete
         if not provisional:
             idx = self._tunnel_holes(anchor, elev, keep, cx, cy, idx, info)
@@ -1808,6 +1812,8 @@ class Server:
         if mats is not None:          # the .ter's own material list (MATERIALS indices)
             info["mats"] = mats
         info["stages"] = stages
+        if provisional:
+            info["hm"] = hm
         return self._finish_heightmap(anchor, cx, cy, info, t0, base)
 
     def tunnels_of(self, anchor, elev, g):
@@ -2158,7 +2164,8 @@ class Server:
                  if a.first_terrain is not None and (newest is None or aid > newest)}
         for key in [k for k in self.hm if k not in keep][:max(0, len(self.hm) - HM_CACHE)]:
             info = self.hm.pop(key)
-            self._remove(os.path.join(self.out_dir, self.hm_name(key)))
+            for prov in (False, True):
+                self._remove(os.path.join(self.out_dir, self.hm_name(key, prov)))
             self._remove(os.path.join(self.out_dir, self.base_name(key)))
             self.base_stale.discard(key)
             self.base_pending.pop(key, None)
@@ -2171,8 +2178,9 @@ class Server:
                     self._remove(os.path.join(terraincache.cache_dir(self.user_dir),
                                               terraincache.base_key(f"{self.vfs_dir}/{name}", BASE_AO_VFS) + ".dds"))
             if self.surface is not None:        # its surface masks (only read at import)
-                for name in surfacemod.mask_names(self.hm_name(key)[:-4]):
-                    self._remove(os.path.join(self.out_dir, name))
+                for prov in (False, True):
+                    for name in surfacemod.mask_names(self.hm_name(key, prov)[:-4]):
+                        self._remove(os.path.join(self.out_dir, name))
 
     # --- far tiles -------------------------------------------------------
     def tile_name(self, aid, key):
@@ -3626,7 +3634,7 @@ class Connection:
         return progress
 
     def terrain_msg(self, key, info):
-        out = {"cx": key[1], "cy": key[2], "heightmap": self.s.hm_vfs(key), "size": self.s.layout.block,
+        out = {"cx": key[1], "cy": key[2], "heightmap": self.s.hm_vfs(key, info), "size": self.s.layout.block,
                "squareSize": heightmap.SQUARE, "zBase": info["zBase"], "maxHeight": info["maxHeight"],
                "q": info["q"]}
         if info.get("layers"):      # --surface on: one mask per material, MATERIALS order
@@ -3781,7 +3789,7 @@ class Connection:
         try:
             job = asyncio.ensure_future(self.s.terrain(anchor, cx, cy))
             # a block the car would reach the stop line before: an ungraded one in time, the graded one after it
-            prov = (await self.late_provisional(job, anchor, cx, cy)
+            prov = (await self.late_provisional(job, anchor, cx, cy, t0)
                     if PROVISIONAL_FOLLOW and self.s.grading and aid == self.active else None)
             if prov is not None:
                 self.terrain_wait -= 1
@@ -4138,7 +4146,7 @@ class Connection:
         d = min(x - x0, x1 - heightmap.SQUARE - x, y - y0, y1 - heightmap.SQUARE - y) - BASE_EDGE_STOP_M
         return 0.0 if d <= FOLLOW_PROV_HELD_M else None
 
-    async def late_provisional(self, job, anchor, cx, cy):
+    async def late_provisional(self, job, anchor, cx, cy, t0=None):
         """A follow block's provisional build (Server.make_follow_provisional) once the graded one (job) would come
         after the car reaches the stop line (stop_in, less the provisional's own time and the send): its info when it is
         done first, else None (the graded one done first, never late, or the mod asks for another block now)."""
@@ -4148,7 +4156,14 @@ class Connection:
                 return None
             left = self.stop_in()
             if left is not None and left <= 1.5 * self.s.prov_est + BASE_MARGIN_S:
-                break
+                # (not when the graded one should be done before a provisional one would: at 300 km/h nearly every
+                # block was asked for this close to its stop line, and the provisional builds then took the CPU of
+                # graded ones done in time, 2026-10-26)
+                build = self.s.quality.build_s
+                if t0 is None or build is None or build - (time.perf_counter() - t0) > self.s.prov_est:
+                    break
+                if left <= BASE_MARGIN_S:   # (the graded one late after all)
+                    break
             await asyncio.wait([job], timeout=FOLLOW_PROV_CHECK_S)
         else:
             return None
