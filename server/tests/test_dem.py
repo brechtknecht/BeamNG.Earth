@@ -281,3 +281,39 @@ class DemPrefetchTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SampleLocalTest(unittest.TestCase):
+    """sample_local (a late follow block's provisional stand-in): a tile not on disk comes from its nearest ancestor in
+    memory, upsampled, without waiting for its download, which is started meanwhile."""
+
+    def test_stand_in_from_ancestor(self):
+        import math
+        gate = threading.Event()
+
+        class Slow(TerrariumFetcher):
+            def get(self, url, **kw):
+                gate.wait(10)
+                return super().get(url, **kw)
+        with tempfile.TemporaryDirectory() as d:
+            dem = demmod.Dem(d, fetcher=Slow())
+            lat, lon, z = 48.1, 11.5, 14
+            n = 2 ** z
+            x = int((lon / 360 + 0.5) * n)
+            y = int((0.5 - math.asinh(math.tan(math.radians(lat))) / (2 * math.pi)) * n)
+            anc = np.add.outer(np.arange(demmod.TILE), np.arange(demmod.TILE)).astype(np.float32)
+            dem._remember((11, x >> 3, y >> 3), anc)
+            la = np.full(5, lat) + np.linspace(-1e-4, 1e-4, 5)
+            lo = np.full(5, lon)
+            got, stood_in = dem.sample_local(la, lo, z)
+            self.assertEqual(stood_in, 1)
+            self.assertIn((z, x, y), dem._inflight, "its own load started")
+            ref = demmod.Dem(d, fetcher=Slow())
+            ref._remember((z, x, y), demmod.Dem._upsample(anc, z, x, y, 11))
+            np.testing.assert_allclose(got, ref.sample(la, lo, z))
+            gate.set()
+            dem.pool.shutdown(wait=True)
+            dem.urgent_pool.shutdown(wait=True)
+            dem.probe_pool.shutdown(wait=True)
+            got2, stood_in2 = dem.sample_local(la, lo, z)
+            self.assertEqual(stood_in2, 0, "loaded meanwhile: its own tile")

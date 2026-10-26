@@ -109,6 +109,12 @@ def classify(classes, u, square, lat=None, lon=None):
     """Material index per sample: the land-cover class's material, ROCK where the slope of the
     height grid u (metres, [row, col], `square` m apart) is steeper than ROCK_SLOPE_DEG (snow stays
     snow). With the samples' positions, built-up land is LAWN where lawns() says. Pure."""
+    return slope_rock(base_index(classes, lat, lon), u, square)
+
+
+def base_index(classes, lat=None, lon=None):
+    """classify's material index before the slope (the class's material, the lawns): a pure function of the
+    samples' positions (base_chunked keeps it per lattice chunk). Pure."""
     classes = np.asarray(classes, np.uint8)
     idx = _LUT[classes]
     if lat is not None and lon is not None:
@@ -120,12 +126,97 @@ def classify(classes, u, square, lat=None, lon=None):
             sub = idx[urban]
             sub[lawns(np.asarray(lat, np.float64)[urban], np.asarray(lon, np.float64)[urban])] = np.uint8(LAWN)
             idx[urban] = sub
+    return idx.astype(np.uint8)
+
+
+def slope_rock(idx, u, square):
+    """classify's last step: ROCK where the height grid u is steeper than ROCK_SLOPE_DEG (snow stays snow). Pure."""
     u = np.asarray(u, np.float64)
     if min(u.shape) < 2:            # no slope from a single row / column
         return idx.astype(np.uint8)
     gy, gx = np.gradient(u, square)
     steep = (gx * gx + gy * gy) > math.tan(math.radians(ROCK_SLOPE_DEG)) ** 2
     return np.where(steep & (idx != SNOW), np.uint8(ROCK), idx).astype(np.uint8)
+
+
+# A follow block at speed moves 256-384 m of its 1024: most of its samples were the last block's. Their land cover
+# (warp's noise, the class rasters, the lawns: ~1 s of a block in Felix's 285 km/h log, 2026-10-26) is kept per
+# 128 m lattice chunk, as heightmap.ChunkCache keeps the heights. BNGE_LANDCOVER_CHUNKS=0: every sample every block.
+LANDCOVER_CHUNKS = os.environ.get("BNGE_LANDCOVER_CHUNKS", "1") != "0"
+LANDCOVER_CHUNK_CACHE = 1024        # chunks kept per process (4 KB each)
+
+
+class LandcoverChunks:
+    """base_index per heightmap.CHUNK² lattice chunk of a frame, only for chunks whose land cover was complete.
+    First in, first out; thread-safe."""
+
+    def __init__(self, cap=LANDCOVER_CHUNK_CACHE):
+        self.cap = cap
+        self.chunks = {}
+        self.order = []
+        self.lock = threading.Lock()
+
+    def get(self, k):
+        with self.lock:
+            return self.chunks.get(k)
+
+    def put(self, k, v):
+        with self.lock:
+            if k not in self.chunks:
+                self.order.append(k)
+            self.chunks[k] = v
+            while len(self.order) > self.cap:
+                self.chunks.pop(self.order.pop(0), None)
+
+
+_LC_CHUNKS = LandcoverChunks()
+
+
+def base_chunked(surface, frame, lat, lon, cx, cy, size, cache=None, coarse=False):
+    """(base_index of the samples (lat, lon: [row j, col i] of the size² block centred (cx, cy) in frame), complete):
+    surface.classes and base_index only for the chunks not kept from an earlier block of the same frame. coarse (a
+    provisional stand-in): the chunks not kept every other sample's, repeated (a quarter of the work), not kept."""
+    cache = _LC_CHUNKS if cache is None else cache
+    ch = heightmap.CHUNK
+    kx0, ky0 = heightmap.lattice_index(cx, size), heightmap.lattice_index(cy, size)
+    if not LANDCOVER_CHUNKS or kx0 % ch or ky0 % ch or size % ch:
+        if coarse:
+            classes, complete = surface.classes(lat[::2, ::2], lon[::2, ::2])
+            b = base_index(classes, lat[::2, ::2], lon[::2, ::2])
+            return b.repeat(2, 0).repeat(2, 1)[:lat.shape[0], :lat.shape[1]], complete
+        classes, complete = surface.classes(lat, lon)
+        return base_index(classes, lat, lon), complete
+    tag = (round(float(frame.lat0), 9), round(float(frame.lon0), 9))
+    nc = size // ch
+    out = np.empty((size, size), np.uint8)
+    missing = []
+    for cj in range(nc):
+        for ci in range(nc):
+            k = (tag, kx0 // ch + ci, ky0 // ch + cj)
+            got = cache.get(k)
+            if got is None:
+                missing.append((slice(cj * ch, (cj + 1) * ch), slice(ci * ch, (ci + 1) * ch), k))
+            else:
+                out[cj * ch:(cj + 1) * ch, ci * ch:(ci + 1) * ch] = got
+    if not missing:
+        return out, True
+    st = 2 if coarse else 1
+    mla = np.concatenate([lat[a, b][::st, ::st].ravel() for a, b, _ in missing])
+    mlo = np.concatenate([lon[a, b][::st, ::st].ravel() for a, b, _ in missing])
+    classes, complete = surface.classes(mla, mlo)
+    base = base_index(classes, mla, mlo)
+    if coarse:
+        n2 = (ch // 2) ** 2
+        for n, (a, b, k) in enumerate(missing):
+            out[a, b] = base[n * n2:(n + 1) * n2].reshape(ch // 2, ch // 2).repeat(2, 0).repeat(2, 1)
+        return out, complete
+    for n, (a, b, k) in enumerate(missing):
+        sl = slice(n * ch * ch, (n + 1) * ch * ch)
+        c = base[sl].reshape(ch, ch)
+        out[a, b] = c
+        if complete and classes[sl].all():  # (no-data samples: maybe a cell that failed to come, asked again later)
+            cache.put(k, c.copy())
+    return out, complete
 
 
 def _hash01(ix, iy, seed):

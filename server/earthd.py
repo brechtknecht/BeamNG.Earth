@@ -1677,7 +1677,7 @@ class Server:
         try:
             with urgent() if urgent is not None else contextlib.nullcontext():
                 info = self._make_heightmap_here(anchor, cx, cy, None, t0, self.anchor_q(anchor), base,
-                                                 provisional=True)
+                                                 provisional=True, fast=FOLLOW_PROV_FAST)
         finally:
             if key not in self.hm_inflight:     # (the graded one done meanwhile: its photo future is not wanted)
                 self.base_futs.pop(key, None)
@@ -1741,17 +1741,24 @@ class Server:
                  " ".join(f"{k} {v:.2f}" for k, v in info.get("stages", {}).items()))
         return info
 
-    def _make_heightmap_here(self, anchor, cx, cy, progress, t0, q, base=None, provisional=False, ground_at=(0.0, 0.0)):
+    def _make_heightmap_here(self, anchor, cx, cy, progress, t0, q, base=None, provisional=False, ground_at=(0.0, 0.0),
+                             fast=False):
         with self.hm_here_lock:
             self.hm_here += 1
         try:
-            return self._make_heightmap_here_(anchor, cx, cy, progress, t0, q, base, provisional, ground_at)
+            return self._make_heightmap_here_(anchor, cx, cy, progress, t0, q, base, provisional, ground_at, fast)
         finally:
             with self.hm_here_lock:
                 self.hm_here -= 1
 
-    def _make_heightmap_here_(self, anchor, cx, cy, progress, t0, q, base=None, provisional=False, ground_at=(0.0, 0.0)):
+    def _make_heightmap_here_(self, anchor, cx, cy, progress, t0, q, base=None, provisional=False, ground_at=(0.0, 0.0),
+                              fast=False):
+        """fast (a late follow block's provisional stand-in, FOLLOW_PROV_FAST): nothing waited for that is not at hand -
+        the DEM tiles not on disk yet from their coarser ancestors (Dem.sample_local), the land cover every other
+        sample, the photo sent when it is done (block_base)."""
         keep = {}
+        sample_local = getattr(self.dem, "sample_local", None) if fast else None    # (test DEMs: none)
+        stood_in = [0]
         g = None if provisional else self.grader_for(anchor)
         # a provisional block graded under the roads whose plans are made already (never waiting for any)
         g_prov = self.grader_for(anchor) if provisional and PROVISIONAL_GRADE else None
@@ -1760,7 +1767,11 @@ class Server:
         grade_s = [0.0, 0.0]            # wall, this thread's CPU (the rest: waiting for map data, the interpreter)
 
         def elev(la, lo):
-            z = self.dem.sample(la, lo, anchor.hm_zoom, progress)
+            if sample_local is not None:
+                z, n = sample_local(la, lo, anchor.hm_zoom)
+                stood_in[0] += n
+            else:
+                z = self.dem.sample(la, lo, anchor.hm_zoom, progress)
             if provisional:             # the runways only (the sea floor waits on the water cells)
                 z = self.airports.apply(la, lo, z) if self.airports is not None else z
                 if g_prov is None:
@@ -1801,8 +1812,9 @@ class Server:
             # ground models per 2 m sample from the cached land cover and the slope (surface.py);
             # rows flipped as the heightmap's (row 0 = north)
             t1 = time.perf_counter()
-            classes, complete = self.surface.classes(keep["lat"], keep["lon"])
-            idx = surfacemod.classify(classes, keep["u"], heightmap.SQUARE, keep["lat"], keep["lon"])
+            lc, complete = surfacemod.base_chunked(self.surface, anchor.frame, keep["lat"], keep["lon"], cx, cy,
+                                                     self.layout.block, coarse=fast)
+            idx = surfacemod.slope_rock(lc, keep["u"], heightmap.SQUARE)
             if self.sea is not None and not provisional:    # under water: the bed (no grass through the surface)
                 idx[self.sea.depth(keep["lat"], keep["lon"]) > blockworker.WATER_BED_M] = surfacemod.MUD
             road_feats, roads_complete = self.surface.roads(keep["lat"], keep["lon"])
@@ -1829,7 +1841,9 @@ class Server:
         info["stages"] = stages
         if provisional:
             info["hm"] = hm
-        return self._finish_heightmap(anchor, cx, cy, info, t0, base)
+        if stood_in[0]:
+            stages["demStandIn"] = stood_in[0]
+        return self._finish_heightmap(anchor, cx, cy, info, t0, base, FOLLOW_PROV_PHOTO_WAIT_S if fast else None)
 
     def tunnels_of(self, anchor, elev, g):
         """anchor.tunnels (roads.TunnelProfiles), made now if not yet (elev: the caller's ground; g: the anchor's
@@ -1962,12 +1976,13 @@ class Server:
         else:
             self.base_stale.add(key)
 
-    def _finish_heightmap(self, anchor, cx, cy, info, t0, base=None):
+    def _finish_heightmap(self, anchor, cx, cy, info, t0, base=None, photo_wait=None):
         """The base photo (detail mode; rendered here: the imagery corrections live in this process; base: its
-        future from _base_photo, started with the heights), the timings."""
+        future from _base_photo, started with the heights), the timings. photo_wait: s it waits at most for the photo
+        (None: _base_wait_s)."""
         if base is not None:
             t1 = time.perf_counter()
-            wait = self._base_wait_s()
+            wait = self._base_wait_s() if photo_wait is None else photo_wait
             if wait is not None and not base.done():
                 concurrent.futures.wait([base], timeout=wait)
             if wait is not None and not base.done():
@@ -2944,6 +2959,12 @@ PROVISIONAL_FOLLOW = os.environ.get("BNGE_PROVISIONAL_FOLLOW", "1") != "0"
 # ... graded under the roads whose cells' plans are made already (Grader.adopt: the block processes' plans on disk)
 PROVISIONAL_GRADE = os.environ.get("BNGE_PROVISIONAL_GRADE", "1") != "0"
 FOLLOW_PROV_EST_S = 3.0     # s a provisional follow block takes, until measured (Server.prov_est)
+# A provisional follow block is the fallback for a late one: it waits for nothing that is not at hand (_make_heightmap_here_
+# fast): not for its photo (2.2 s of its typical 3.7 s in Felix's 285 km/h log, 2026-10-26, longer than the graded block
+# it stood in for; the photo follows as block_base), nor for DEM downloads (its coarser tiles stand in), its land cover
+# every other sample. BNGE_PROVISIONAL_FAST=0: built as the first block's provisional one.
+FOLLOW_PROV_FAST = os.environ.get("BNGE_PROVISIONAL_FAST", "1") != "0"
+FOLLOW_PROV_PHOTO_WAIT_S = 0.0
 FOLLOW_PROV_MIN_V = 2.0     # m/s: slower, a block is late only for a car standing ...
 FOLLOW_PROV_HELD_M = 40.0   # ... this close to a stop line (the edge guard holds it there)
 FOLLOW_PROV_CHECK_S = 0.25  # a waiting follow request looks at the clock this often

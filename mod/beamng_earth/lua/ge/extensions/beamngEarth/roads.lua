@@ -47,6 +47,11 @@ M.RELOAD_EVERY_S = 6
 M.TILE_M = 256
 M.COLLIDE_M = { 320, 2000 }
 M.COLLIDE_LEAD_S = 14
+-- ... but the buildings' and sidewalks' colliders (most of the colliding triangles: a rebuild took 150-220 ms every 6 s
+-- with 100 k collision instances at 191 mph, Felix's log 2026-10-26) only BLD_LEAD_S ahead: RELOAD_EVERY_S plus the
+-- import queue's few seconds still makes them solid before the car arrives. What the car drives on (decks, tunnels,
+-- rails) keeps COLLIDE_LEAD_S. BLD_LEAD_S = COLLIDE_LEAD_S turns this off.
+M.BLD_LEAD_S = 10
 M.UNCOLLIDE_M = 350
 M.COLLIDE_CHECK_S = 0.25
 M.RELOAD_DELETES_S = 30
@@ -296,12 +301,19 @@ function M.fieldsFor(chunk)
   }
 end
 
--- The collision radius around the player (m): COLLIDE_LEAD_S of driving at its speed, within COLLIDE_M.
-function M.collideRadius(speed)
-  return math.max(M.COLLIDE_M[1], math.min(M.COLLIDE_M[2], (speed or 0) * M.COLLIDE_LEAD_S))
+-- The collision radius around the player (m): COLLIDE_LEAD_S of driving at its speed (BLD_LEAD_S for a collider
+-- the car doesn't drive on: what = 'bld...' or 'walk...'), within COLLIDE_M.
+function M.collideRadius(speed, what)
+  local lead = M.offRoad(what) and M.BLD_LEAD_S or M.COLLIDE_LEAD_S
+  return math.max(M.COLLIDE_M[1], math.min(M.COLLIDE_M[2], (speed or 0) * lead))
+end
+-- Is collider kind what one the car doesn't drive on (buildings, sidewalks)?
+function M.offRoad(what)
+  return what ~= nil and (what:sub(1, 3) == 'bld' or what:sub(1, 4) == 'walk')
 end
 
 local lastRadius = M.COLLIDE_M[1]
+local lastBldRadius = M.COLLIDE_M[1]
 local foci = {}             -- other vehicles' collision islands { x, y, r } (M.setFoci)
 local collisionfoci = require('beamngEarth/collisionfoci')
 local lastSpeed = 0
@@ -317,12 +329,13 @@ function M.radiusToward(p, cx, cy, radius, dir)
   if d <= M.TILE_M or (dx * dir.x + dy * dir.y) >= 0.7071 * d then return radius end
   return math.min(radius, M.COLLIDE_M[1])
 end
--- Is tile t's centre within the collision radius of the player? (no car or no centre: yes)
-function M.collideNear(t, extra)
+-- Is tile t's centre within the collision radius of the player (for collider kind what, if given)? (no car or no
+-- centre: yes)
+function M.collideNear(t, extra, what)
   if not t or not t.cx then return true end
   local veh = getPlayerVehicle and getPlayerVehicle(0)
   if not veh then return true end
-  local r = M.radiusToward(veh:getPosition(), t.cx, t.cy, lastRadius, lastDir)
+  local r = M.radiusToward(veh:getPosition(), t.cx, t.cy, M.offRoad(what) and lastBldRadius or lastRadius, lastDir)
   if M.nearPlayer(vec3(t.cx, t.cy, 0), r + (extra or 0) + M.TILE_M * 0.71) then return true end
   -- or near another vehicle's collision island (collisionfoci.lua: other players' cars, traffic)
   return #foci > 0 and collisionfoci.near(foci, t.cx, t.cy, (extra or 0) + M.TILE_M * 0.71) or false
@@ -339,6 +352,7 @@ local function updateCollideRange()
   local v = veh and veh.getVelocity and veh:getVelocity()
   local sp = v and math.sqrt(v.x * v.x + v.y * v.y) or 0
   lastRadius = M.collideRadius(sp)
+  lastBldRadius = M.collideRadius(sp, 'bld')
   lastSpeed = sp
   lastDir = sp >= M.FAST_MS and { x = v.x / sp, y = v.y / sp } or nil
   if #parked > 0 then
@@ -346,7 +360,7 @@ local function updateCollideRange()
     for _, q in ipairs(parked) do
       local t = tiles[q.key]
       if t then
-        if M.collideNear(t) then walkQ[#walkQ + 1] = q else keep[#keep + 1] = q end
+        if M.collideNear(t, nil, q.what) then walkQ[#walkQ + 1] = q else keep[#keep + 1] = q end
       end
     end
     parked = keep
@@ -462,7 +476,7 @@ function M.onTile(msg, currentAnchor)
       local q = { key = key, walk = w, what = what, tile = tiles[key],
         renderOnly = (lean and what:sub(1, 3) == 'bld' and what ~= 'bldcol') or (leanWalk and what == 'walk') }
       if not q.renderOnly then tiles[key].colWant[what] = true end
-      if q.renderOnly or M.collideNear(tiles[key]) then walkQ[#walkQ + 1] = q else parked[#parked + 1] = q end
+      if q.renderOnly or M.collideNear(tiles[key], nil, what) then walkQ[#walkQ + 1] = q else parked[#parked + 1] = q end
     end
   end
   return true

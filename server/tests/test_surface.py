@@ -225,6 +225,72 @@ class FakeMapData:
         self.cached[path] = {"data": data, "meta": np.array(json.dumps(meta)), "provenance": np.array("null")}
 
 
+class LandcoverChunksTest(unittest.TestCase):
+    """base_chunked: the same base_index as every sample at once, and a moved block only asks for its new chunks."""
+
+    class Classes:
+        def __init__(self, zero_at=None):
+            self.asked = 0
+            self.zero_at = zero_at
+
+        def classes(self, lat, lon):
+            self.asked += lat.size
+            c = np.where((np.floor(lat * 3000) + np.floor(lon * 3000)) % 2 == 0, 10, 50).astype(np.uint8)
+            if self.zero_at is not None:
+                c[lat > self.zero_at] = 0
+            return c, True
+
+    def block(self, frame, cx, cy, size=256):
+        import geodesy  # noqa: F401
+        keep = {}
+        heightmap.grid_u(frame, lambda la, lo: np.zeros_like(la), cx, cy, size, keep)
+        return keep["lat"], keep["lon"]
+
+    def test_chunks_reused_and_identical(self):
+        import geodesy
+        frame = geodesy.EnuFrame(LAT, LON)
+        s = self.Classes()
+        cache = sf.LandcoverChunks()
+        lat, lon = self.block(frame, 0.0, 0.0)
+        got, complete = sf.base_chunked(s, frame, lat, lon, 0.0, 0.0, 256, cache)
+        self.assertTrue(complete)
+        self.assertTrue((got == sf.base_index(s.classes(lat, lon)[0], lat, lon)).all())
+        s.asked = 0
+        lat, lon = self.block(frame, 128.0, 256.0)     # one chunk east, two north: 6 of its 16 chunks kept
+        got, _ = sf.base_chunked(s, frame, lat, lon, 128.0, 256.0, 256, cache)
+        self.assertEqual(s.asked, 10 * heightmap.CHUNK ** 2)
+        self.assertTrue((got == sf.base_index(s.classes(lat, lon)[0], lat, lon)).all())
+
+    def test_coarse_every_other_sample_not_kept(self):
+        import geodesy
+        frame = geodesy.EnuFrame(LAT, LON)
+        s = self.Classes()
+        cache = sf.LandcoverChunks()
+        lat, lon = self.block(frame, 0.0, 0.0)
+        got, _ = sf.base_chunked(s, frame, lat, lon, 0.0, 0.0, 256, cache, coarse=True)
+        self.assertEqual(s.asked, 256 * 256 // 4)
+        self.assertEqual(got.shape, (256, 256))
+        full = sf.base_index(s.classes(lat, lon)[0], lat, lon)
+        self.assertTrue((got[::2, ::2] == full[::2, ::2]).all() and (got[1::2, 1::2] == got[::2, ::2]).all())
+        self.assertEqual(cache.chunks, {}, "a stand-in's chunks are not kept")
+        sf.base_chunked(s, frame, lat, lon, 0.0, 0.0, 256, cache)      # a full one's are, and a stand-in uses them
+        s.asked = 0
+        got, _ = sf.base_chunked(s, frame, lat, lon, 0.0, 0.0, 256, cache, coarse=True)
+        self.assertEqual(s.asked, 0)
+        self.assertTrue((got == full).all())
+
+    def test_no_data_chunks_not_kept(self):
+        import geodesy
+        frame = geodesy.EnuFrame(LAT, LON)
+        s = self.Classes(zero_at=LAT)                  # the northern half: no data yet
+        cache = sf.LandcoverChunks()
+        lat, lon = self.block(frame, 0.0, 0.0)
+        sf.base_chunked(s, frame, lat, lon, 0.0, 0.0, 256, cache)
+        s.asked = 0
+        sf.base_chunked(s, frame, lat, lon, 0.0, 0.0, 256, cache)
+        self.assertEqual(s.asked, 8 * heightmap.CHUNK ** 2)
+
+
 class SurfaceTest(unittest.TestCase):
     def test_not_cached_is_dirt_and_queued_then_cached(self):
         md = FakeMapData(lambda key: 30)

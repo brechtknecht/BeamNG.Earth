@@ -64,6 +64,8 @@ MAX_ZOOM = 15               # AWS stops at z15 (the far field's zooms: zoom_for'
 # terrain's lattice 2 m); a z16 tile it lacks is its z15 parent upsampled (AWS has no z16). BNE_DEM_ZOOM=15: as before.
 FINE_ZOOM = int(os.environ.get("BNE_DEM_ZOOM", "16"))
 GLOBAL_ZOOM = 12            # Mapterhorn is complete on land up to here
+STAND_IN_MIN_ZOOM = 8       # sample_local: the coarsest ancestor a missing tile comes from
+LOCAL_WAIT_S = 0.1          # ... and how long it waits for one already being loaded (from disk: a moment)
 GROUND_MARGIN = 96          # px of the neighbouring z12 tiles the ground filter sees around a tile
 MAX_LAT = 85.0511287798     # Web Mercator limit
 MAX_TILES_PER_SAMPLE = 1024
@@ -98,6 +100,10 @@ def coverage_index(doc):
     return out
 AWS = dict(name="aws-terrarium", ext="png", size=256,
            url="https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png")
+
+
+class LocalMiss(Exception):
+    """Dem.sample_local: a tile that a download would have to bring (not on this disk yet)."""
 
 
 class DemUnavailable(IOError):
@@ -259,6 +265,8 @@ class Dem:
         if data is not None:
             self._count(src["name"] + ":disk")
             return data
+        if getattr(self._local, "offline", False):      # (sample_local: no waiting for the network)
+            raise LocalMiss(f"{z}/{x}/{y}")
         url = src["url"].format(z=z, x=x, y=y)
         if self.fetcher.miss_alive(miss, url):
             return None
@@ -642,10 +650,21 @@ class Dem:
             anc = self._lru.get(key)
         if anc is None:
             anc = self._load_tile(key)      # (in this thread: a pool worker waiting on the pool could deadlock)
-            with self._lock:
-                self._lru[key] = anc
-                while len(self._lru) > self.mem_tiles:
-                    self._lru.popitem(last=False)
+            self._remember(key, anc)
+        return self._upsample(anc, z, x, y, z0)
+
+    def _remember(self, key, a):
+        with self._lock:
+            self._lru[key] = a
+            self._lru.move_to_end(key)
+            while len(self._lru) > self.mem_tiles:
+                self._lru.popitem(last=False)
+
+    @staticmethod
+    def _upsample(anc, z, x, y, z0):
+        """Tile (z, x, y) bilinear from anc, its ancestor tile at zoom z0 (edges held at the ancestor's)."""
+        d = z - z0
+        ax, ay = x >> d, y >> d
         k = 2 ** d
         i = (np.arange(TILE) + 0.5) / k - 0.5
         u = np.clip((x - ax * k) * TILE / k + i, 0, TILE - 1)
@@ -725,8 +744,80 @@ class Dem:
         n = TILE // block
         return a.reshape(n, block, n, block).max(axis=(1, 3))
 
+    # --- without the network: a stand-in from the tiles at hand ----------
+    def _local_tile(self, key, start=True):
+        """Tile key without waiting for the network: in memory, loaded meanwhile, or made from the files on this disk;
+        None when a download would be needed (start: its load started then, for whoever asks next)."""
+        with self._lock:
+            got = self._lru.get(key)
+            fut = self._inflight.get(key)
+        if got is not None:
+            return got
+        if fut is not None:
+            try:                            # (one being read from disk: a moment)
+                return fut.result(timeout=LOCAL_WAIT_S)
+            except Exception:
+                return None
+        prev = getattr(self._local, "offline", False)
+        self._local.offline = True
+        try:
+            got = self._mirror_get(key)
+            if got is None:
+                got = self._make_tile(key)
+        except (LocalMiss, netfetch.FetchError, DemUnavailable, OSError, ValueError):
+            got = None
+        finally:
+            self._local.offline = prev
+        if got is not None:
+            self._remember(key, got)
+            return got
+        if start:
+            self._start([key])
+        return None
+
+    def _start(self, keys):
+        """Start loading keys (not in memory nor on their way) without waiting for them."""
+        pool = self.urgent_pool if getattr(self._local, "urgent", False) else self.pool
+        new = []
+        with self._lock:
+            for k in keys:
+                if k not in self._lru and k not in self._inflight:
+                    f = self._inflight[k] = pool.submit(self._load_tile, k)
+                    new.append((k, f))
+        for k, f in new:
+            f.add_done_callback(lambda f, k=k: self._finish(k, f))
+
+    def _tiles_local(self, keys, progress=None, stood_in=None):
+        """tiles() without waiting for the network: a tile that is not at hand comes from its nearest ancestor that is
+        (down to STAND_IN_MIN_ZOOM; the far field's tiles), upsampled; its key goes into stood_in."""
+        out = {}
+        for k in dict.fromkeys(keys):
+            a = self._local_tile(k)
+            if a is None:
+                z, x, y = k
+                for z0 in range(z - 1, STAND_IN_MIN_ZOOM - 1, -1):
+                    anc = self._local_tile((z0, x >> (z - z0), y >> (z - z0)), start=False)
+                    if anc is not None:
+                        a = self._upsample(anc, z, x, y, z0)
+                        break
+                if a is None:               # (nothing at all here yet: waited for, as sample's)
+                    a = self.tiles([k])[k]
+                elif stood_in is not None:
+                    stood_in.append(k)
+            out[k] = a
+        return out
+
+    def sample_local(self, lat, lon, zoom):
+        """(sample(lat, lon, zoom), tiles stood in): the tiles not on this disk yet come from their nearest ancestor
+        that is, upsampled (coarser heights), their own loads started meanwhile. A late follow block's provisional
+        stand-in (earthd make_follow_provisional): it went without heights for 2 s of its 6 s on a fresh route,
+        waiting for the same downloads as the graded block it stood in for (2026-10-26)."""
+        stood_in = []
+        z = self.sample(lat, lon, zoom, tiles_fn=lambda keys, progress=None: self._tiles_local(keys, progress, stood_in))
+        return z, len(set(stood_in))
+
     # --- sampling --------------------------------------------------------
-    def sample(self, lat, lon, zoom, progress=None):
+    def sample(self, lat, lon, zoom, progress=None, tiles_fn=None):
         """Bilinear elevation (m) at arbitrary lat/lon arrays from zoom-level tiles. Points from polardem.FROM_LAT
         (84.9 deg) on (Mapterhorn's heights stop short of 85, Web Mercator at 85.05) come from the Copernicus DEM
         (polardem.py; 0 m on the Arctic Ocean)."""
@@ -773,11 +864,11 @@ class Dem:
             sub = np.zeros(len(lat), np.float64)
             for key in np.unique(np.stack([gx, gy], 1), axis=0):
                 m = (gx == key[0]) & (gy == key[1])
-                sub[m] = self.sample(lat[m], lon[m], zoom, progress)
+                sub[m] = self.sample(lat[m], lon[m], zoom, progress, tiles_fn)
             out[valid] = sub
             return out.reshape(shape)
         keys = {(tx, ty): (zoom, tx % n, ty) for ty in range(ty0, ty1 + 1) for tx in range(tx0, tx1 + 1)}
-        got = self.tiles(keys.values(), progress)
+        got = (tiles_fn or self.tiles)(keys.values(), progress)
         mosaic = np.empty((ny * TILE, nx * TILE), np.float32)
         for (tx, ty), k in keys.items():
             c, r = (tx - tx0) * TILE, (ty - ty0) * TILE

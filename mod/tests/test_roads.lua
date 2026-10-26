@@ -378,6 +378,9 @@ do
   T.check(roads.radiusToward(p, -100, 50, 1400, east) == 1400, 'its own tile: the full reach')
   T.check(roads.radiusToward(p, -1500, 0, 1400, nil) == 1400, 'slow (no direction): all round')
   T.check(roads.collideRadius(100) == 1400 and roads.collideRadius(500) == roads.COLLIDE_M[2], 'reach: 14 s of driving, capped')
+  T.check(roads.collideRadius(100, 'bldcol') == 100 * roads.BLD_LEAD_S and roads.collideRadius(100, 'walk') == 100 * roads.BLD_LEAD_S
+    and roads.collideRadius(100, 'deck') == 1400 and roads.collideRadius(10, 'bld') == roads.COLLIDE_M[1],
+    'buildings and sidewalks: BLD_LEAD_S of driving; decks the full reach')
 end
 
 T.done('test_roads')
