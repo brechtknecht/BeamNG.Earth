@@ -637,7 +637,7 @@ def _region_tile_same(aid, lat, lon, tx, ty):
         return False
     keys = _tile_plan_keys(frame, tx, ty)
     g.adopt(keys)
-    if not g.planned(keys):
+    if not g.all_planned(keys):
         raise roadsmod.NotReady("its cells' whole plans are not all made yet")
     reg = g.region(_grow_box(roadsmod.tile_bbox(tx, ty), TILE_PLAN_MARGIN_M), make=False, whole=True)
     same = reg is not None and bool(reg.same(g))
@@ -698,7 +698,7 @@ def _roads_tile(aid, lat, lon, zoom, tx, ty, out_dir, vfs_dir, sidewalks, lift, 
     if g is not None and (TILE_NOWAIT or TILE_REGION):
         keys = _tile_plan_keys(frame, tx, ty)
         busy = g.elsewhere(keys)            # (and the cells planned already taken: Grader.adopt)
-        if TILE_REGION and not g.planned(keys):
+        if TILE_REGION and not g.all_planned(keys):
             # graded from the region plans of the block it lies in (plancache: another process's), else from its own
             # over just its box (quick: a cell's whole plans took 17-150 s at 300 km/h, a block's region came after the
             # car had passed); the whole plans are waited for by no one (roads.Tracker checks it against them later)

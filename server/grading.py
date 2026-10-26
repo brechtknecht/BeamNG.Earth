@@ -1524,7 +1524,7 @@ class Grader:
                 len(made), ", ".join(reg.missed) or "none")
         return reg
 
-    def planned(self, keys):
+    def all_planned(self, keys):
         """Whether the cells of keys are all planned whole here."""
         with self.lock:
             return all(k in self.cells for k in keys)
@@ -1696,6 +1696,9 @@ class _AllWidths:
 
     def same(self):
         return all(w.same() for w in self.parts)
+
+    def __call__(self, fid, lonlat):        # (roadwidth.RoadWidths.get: the first region's)
+        return self.parts[0](fid, lonlat)
 
 
 def _xy_meets(xy, box):
