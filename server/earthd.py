@@ -292,6 +292,12 @@ WORKERS = 3                     # far-tile workers (--workers)
 TRACE_S = 60.0                  # BNGE_TRACEMALLOC: seconds between the memory reports ...
 TRACE_TOP = 15                  # ... and the allocation sites in each
 LANE_REQUEST, LANE_PREFETCH = 0, 1     # Server.block_pools: the blocks the mod asks for / the prefetch
+# More prefetch lanes (block processes 2, 3, ...: Connection.maybe_prefetch builds that many blocks ahead at once):
+# at 300 km/h a block came every 4-5 s and one took 3-6 s in its one prefetch process, so nearly every block was
+# asked for late and driven on provisional (the test PC, 2026-10-26). BNGE_PREFETCH_LANES=<n>; default 2 on a
+# machine with 8+ CPUs, else 1
+PREFETCH_LANES = int(os.environ.get("BNGE_PREFETCH_LANES", "0") or 0)
+FAST_AHEAD_S = 10.0         # s of road ahead the extra prefetch lanes build at the speed boost's speed (SPEED_BOOST_V)
 HM_BUSY_TILE_WORKERS = 1    # far tiles built at once while a physics block is building in the server process (an
                             # anchor's first, or every one with --block-process off; the block processes' blocks do
                             # not share its interpreter: far tiles one at a time behind them were most of a Steam
@@ -681,7 +687,7 @@ class Server:
         self.degraded = set()
         # Heightmap workers: with the block processes they mostly wait on a process, and with two a
         # request queued behind a prefetch and an earlier request (3.5 s at 90 m/s, 2026-10-12)
-        self.hm_pool = ThreadPoolExecutor(HM_THREADS, thread_name_prefix="heightmap")
+        self.hm_pool = ThreadPoolExecutor(max(HM_THREADS, len(block_pools) + 2), thread_name_prefix="heightmap")
         self.hm_here, self.hm_here_lock = 0, threading.Lock()  # blocks building in this process (far tiles wait)
         # a block's base photo rendered beside its heights (they do not depend on each other): after them it added
         # 2.3 s to a 12 s Baltimore block on a Steam Deck (2026-10-20)
@@ -3027,7 +3033,7 @@ class Connection:
         self.failed = set()
         self.dirty = False              # far_done owed once every group is emitted
         self.batch = [0.0, 0, 0]        # [start, tiles sent, swaps sent] of the current change, for the log
-        self.prefetching = False
+        self.prefetching = set()        # the prefetch lanes at work (maybe_prefetch)
         self.wake = asyncio.Event()
         self.streamer = None
         self.last_status = ""           # text of the last status message (re-sent with a new backlog)
@@ -3998,6 +4004,8 @@ class Connection:
                 if c != (base.cx, base.cy) and self.s.layout.block_at(*c) != self.block:
                     self.predicted_block = self.s.layout.block_at(*c)
             horizon = self.s.quality.block_ahead_s()
+            if len(self.s.block_pools) > LANE_PREFETCH + 1 and math.hypot(*self.vel) > SPEED_BOOST_V:
+                horizon = max(horizon or 0.0, FAST_AHEAD_S)     # (the extra prefetch lanes: PREFETCH_LANES)
             self.ahead_blocks = [self.s.layout.block_at(*c) for _t, c in
                                  predict_chain(px, py, *self.vel, base.cx, base.cy, rule, horizon)] if horizon else []
         else:
@@ -4422,27 +4430,35 @@ class Connection:
         return radius, {"max_level": self.s.max_level, "disc": True, "horizon": cull}
 
     def maybe_prefetch(self):
-        """Speculatively build the terrain the mod is about to ask for."""
+        """Speculatively build the terrain the mod is about to ask for: in each free prefetch lane (block process) the
+        nearest block not built or building yet."""
         anchor = self.s.anchors.get(self.active)
-        if anchor is None or self.prefetching:
+        if anchor is None:
             return
-        # the next one, then (the follow blocks behind the player) the ones after it, nearest first
-        todo = [b for b in [self.predicted_block, *self.ahead_blocks]
-                if b is not None and b != self.block and not self.s.terrain_cached((anchor.id, b.cx, b.cy))]
-        if not todo:
+        lanes = [ln for ln in range(LANE_PREFETCH, max(LANE_PREFETCH + 1, len(self.s.block_pools)))
+                 if ln not in self.prefetching]
+        if not lanes:
             return
-        cx, cy = todo[0].cx, todo[0].cy
-        self.prefetching = True
+        # the next one, then (the follow blocks behind the player, or a fast car) the ones after it, nearest first
+        todo, seen = [], set()
+        for b in [self.predicted_block, *self.ahead_blocks]:
+            if (b is None or b == self.block or (b.cx, b.cy) in seen
+                    or self.s.terrain_cached((anchor.id, b.cx, b.cy))):
+                continue
+            seen.add((b.cx, b.cy))
+            todo.append(b)
+        for lane, b in zip(lanes, todo):
+            self.prefetching.add(lane)
 
-        async def run():
-            try:
-                await self.s.terrain(anchor, cx, cy, lane=LANE_PREFETCH)
-                log.debug("prefetched terrain (%d, %.0f, %.0f)", anchor.id, cx, cy)
-            except Exception:
-                log.exception("terrain prefetch failed")
-            finally:
-                self.prefetching = False
-        self.spawn(run())
+            async def run(lane=lane, cx=b.cx, cy=b.cy):
+                try:
+                    await self.s.terrain(anchor, cx, cy, lane=lane)
+                    log.debug("prefetched terrain (%d, %.0f, %.0f) in lane %d", anchor.id, cx, cy, lane)
+                except Exception:
+                    log.exception("terrain prefetch failed")
+                finally:
+                    self.prefetching.discard(lane)
+            self.spawn(run())
 
     # --- far field ----------------------------------------------------------
     def forced(self):
@@ -4791,7 +4807,10 @@ async def main_async(args):
     plancachemod.start_run(args.cache_dir)      # (before the workers: they inherit the run's id)
     if args.block_process == "on":
         ctx = multiprocessing.get_context("spawn")
-        for _ in (LANE_REQUEST, LANE_PREFETCH):
+        import budget
+        lanes = PREFETCH_LANES or (2 if (os.cpu_count() or 1) >= 8 and not budget.small() else 1)
+        log.info("block processes: 1 for the requests, %d for the prefetch", lanes)
+        for _ in range(1 + max(1, lanes)):
             warm_q = ctx.Queue(maxsize=64)
             block_pools.append((poolsmod.RespawningPool(
                 "block", 1, mp_context=ctx, initializer=blockworker.init,
