@@ -881,8 +881,37 @@ class CacheTest(Sources, SmallBlocks, unittest.TestCase):
         with mock.patch.object(mapdata, "MIRROR_MB", 1e-6):
             md2._mirror_prune()
         root = os.path.join(cache, "mapdata-mirror")
-        left = [d for d, _, f in os.walk(root) if "ok" in f]
+        left = [d for d, _, f in os.walk(root) if "ok" in f or any(n.endswith(".pack") for n in f)]
         self.assertEqual(left, [])
+
+    def test_mirror_folders_without_pack(self):
+        """BNGE_MIRROR_PACK=0: the mirror as a folder of .npy files per layer file, as before."""
+        with mock.patch.object(mapdata, "MIRROR_PACK", False):
+            cache = os.path.join(self.tmp, "cache")
+            md, _ = self.mapdata(cache=cache)
+            digest = md.cell(mf.CELL).digest()
+            md2, t2 = self.mapdata(cache=cache)
+            self.assertEqual(md2.cell(mf.CELL).digest(), digest)
+            self.assertEqual(t2.count(), 0)
+            root = os.path.join(cache, "mapdata-mirror")
+            self.assertTrue([d for d, _, f in os.walk(root) if "ok" in f])
+            self.assertFalse([n for _, _, f in os.walk(root) for n in f if n.endswith(".pack")])
+
+    def test_mirror_pack_one_file_per_layer(self):
+        """A layer's mirror is one .pack file, read back equal (the large arrays mapped); another stamp is a miss."""
+        cache = os.path.join(self.tmp, "cache")
+        md, _ = self.mapdata(cache=cache)
+        md.cell(mf.CELL)
+        root = os.path.join(cache, "mapdata-mirror")
+        files = [n for _, _, f in os.walk(root) for n in f]
+        self.assertTrue(files and all(n.endswith(".pack") for n in files), files)
+        p = md.path(mf.CELL, "roads")
+        got = md._mirror_load(p)
+        want = md._load(p)
+        for k, v in want.items():
+            if k != "provenance":
+                np.testing.assert_array_equal(got[k], v)
+        self.assertIsNone(mapdata._pack_read(md._mirror_dir(p) + ".pack", "other stamp"))
 
     def test_corrupt_layer_files_are_rebuilt(self):
         """A damaged layer file (truncated, a flipped byte in the deflate stream, an old layout without

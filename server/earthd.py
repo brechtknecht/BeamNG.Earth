@@ -239,9 +239,17 @@ AHEAD_MAX_M = 4000.0
 AHEAD_MIN_V = 8.0               # m/s: slower, the blocks around (and surface.prefetch's 3 km) cover it
 AHEAD_MOVE_M = 150.0            # m the player moves before the next round
 AHEAD_MARGIN_M = 250.0          # m around the block's half width at each point
+# a round fetches bytes only: the map cells through mapdata.fetch_ahead (no build), the elevation tiles of all its
+# points at once. A round that built its cells (mapdata.cell, 5-17 s each behind the blocks' builds) took the whole 8 km
+# test drive: one round, 68 tiles; the blocks then fetched ~400 tiles themselves (the I/O work, 2026-10-26).
+# BNGE_AHEAD_BYTES=0: as before
+AHEAD_BYTES = os.environ.get("BNGE_AHEAD_BYTES", "1") != "0"
 # the road tiles' cells (landcover: surface.prefetch). With roads (surface.prefetch has them within 3 km, with the land
 # cover on) and water, which a road tile otherwise fetched itself when it needed it (from KyzoFox's 1.5.4, PR #64)
 AHEAD_LAYERS = ("roads", "buildings", "building_parts", "infrastructure", "water", "land_use")
+# the layers whose bytes warm_roads fetches ahead along its path (mapdata.fetch_ahead), per cell in this order: the road
+# plans' (roads, buildings for the widths) first
+FETCH_AHEAD_LAYERS = ("roads", "buildings", "water", "land_use", "infrastructure", "building_parts")
 # route_download: like download_ahead, but along the planned GPS route's own geometry (routeahead.py)
 # instead of the player's current heading, since a road route can wander off that heading entirely.
 ROUTE_AHEAD_ON = True            # --route-prefetch
@@ -1480,6 +1488,9 @@ class Server:
             for k in mapcells.cells_for_bbox(la - dlat, lo - dlon, la + dlat, lo + dlon):
                 if k not in keys:
                     keys.append(k)
+        if self.mapdata is not None:        # their downloads in this process at once, ahead of the plans and builds
+            self.mapdata.fetch_ahead([(k, ly) for k in keys
+                                      for ly in (FETCH_AHEAD_LAYERS if self.buildings else ("roads",))])
         for _, q in self.block_pools:
             try:
                 q.put_nowait((anchor.id, anchor.lat, anchor.lon, keys))
@@ -1515,6 +1526,30 @@ class Server:
         layers = (AHEAD_LAYERS if self.buildings else ("roads",)) if self.mapdata is not None else ()
         self.ahead_busy = True
 
+        def cells_at(la, lo):
+            dlat = reach / 111320.0
+            dlon = reach / (111320.0 * max(0.05, math.cos(math.radians(la))))
+            return mapcells.cells_for_bbox(la - dlat, lo - dlon, la + dlat, lo + dlon)
+
+        def run_bytes():
+            # the map cells' bytes queued first (mapdata.fetch_ahead: returns at once, its own threads), then all the
+            # points' elevation tiles in one go (dem.prefetch's threads), nearest point first
+            try:
+                if layers:
+                    self.mapdata.fetch_ahead([(key, ly) for la, lo in pts for key in cells_at(la, lo)
+                                              for ly in layers], source="ahead")
+                keys = [k for la, lo in pts for k in self.dem.keys_around(la, lo, reach, zoom)]
+                dem_n, deferred = self.dem.prefetch(keys)
+                self.ahead_stats["dem"] += dem_n
+                self.ahead_stats["deferred"] += int(deferred)
+                if dem_n:
+                    log.info("download ahead: %d elevation tiles (%.0f m/s; session: %s; map bytes ahead: %s)", dem_n,
+                             v, self.ahead_stats, self.mapdata.fa_stats if self.mapdata is not None else None)
+            except Exception as e:
+                log.debug("download ahead: %s: %s", type(e).__name__, e)
+            finally:
+                self.ahead_busy = False
+
         def run():
             try:
                 dem_n = cells_n = 0
@@ -1541,7 +1576,7 @@ class Server:
                 log.debug("download ahead: %s: %s", type(e).__name__, e)
             finally:
                 self.ahead_busy = False
-        self.ahead_pool.submit(run)
+        self.ahead_pool.submit(run_bytes if AHEAD_BYTES else run)
 
     def warm_imagery(self, anchor, x, y, vx, vy):
         """The lazy imagery sources (NAIP) along the player's straight path (WARM_STEPS_S), over the block's
