@@ -1901,7 +1901,7 @@ local function onUpdate(dtReal, dtSim)
     M.updatePhotoless()
     t = mark('far', t)
     sea.update(st.anchorId, st.player)
-    trees.update(st.anchorId, st.player, M.viewAway())
+    trees.update(st.anchorId, st.player, M.viewAway(), gov)
     t = mark('sea+trees', t)
     local pb = nil
     if st.block then

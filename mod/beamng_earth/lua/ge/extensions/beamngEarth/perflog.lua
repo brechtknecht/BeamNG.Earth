@@ -8,6 +8,11 @@
 --                 windows): the window's fps, its slowest frames, the mod's parts summed over it, the engine's mean
 --   perf back     the frame rate back over BACK_SHARE of the usual: how long the drop lasted, its lowest fps
 --   perf minute   every SUMMARY_S: average fps, 1 % low, hitches, the worst frame and its cause, where
+--   perf pacing   every SUMMARY_S with the minute (Felix 2026-10-26, "lehmig": no hitches, yet 1 % lows of 20-37 fps):
+--                 frame-time p50/p95/p99, the slow frames under HITCH_MS (JANK_X times the usual frame, at least
+--                 JANK_MIN_MS) and how many came in runs of RUN_N or more (runs pass the engine's dt median and drag
+--                 the sim: a slowdown), the mod's mean ms per frame by part, the mod's and the engine's parts in
+--                 the slow frames
 -- Pure but for the clock and the context the caller passes.
 local M = {}
 
@@ -21,14 +26,20 @@ M.MIN_FPS = 12              -- a usual rate below this (a weak machine, a menu):
 M.SUMMARY_S = 60
 M.HITCH_GAP_S = 2           -- hitch lines at most this often (the ones between are counted into the next)
 M.ENGINE_EVERY = 5          -- the engine's breakdown sampled every this many frames for the window means
+M.JANK_X = 1.6              -- a slow frame: this times the usual frame time (the median window's)...
+M.JANK_MIN_MS = 25          -- ...and at least this long
+M.RUN_N = 3                 -- slow frames in a row that count as a run
 
-local w, base, frames, sumMin, hitchesMin, worstMin, lastHitchAt, skipped, drop, summaryAt
+local w, base, frames, sumMin, hitchesMin, worstMin, lastHitchAt, skipped, drop, summaryAt, pace
+
+local function newPace() return { mod = {}, jmod = {}, jeng = {}, jengN = 0, jank = 0, runs = 0, inRun = 0, runFrames = 0 } end
 
 function M.reset()
   w = { t0 = nil, n = 0, ms = 0, worst = {}, mod = {}, eng = {}, engN = 0, k = 0 }
   base = {}
   frames, sumMin, hitchesMin, worstMin = {}, 0, 0, nil
   lastHitchAt, skipped, drop, summaryAt = -math.huge, 0, nil, nil
+  pace = newPace()
 end
 M.reset()
 
@@ -106,6 +117,23 @@ function M.frame(ms, now, ctx, hitch, mod, engine)
       skipped = skipped + 1
     end
   end
+  -- pacing: the slow frames under a hitch, and their runs
+  for k, v in pairs(mod or {}) do if type(v) == 'number' then pace.mod[k] = (pace.mod[k] or 0) + v end end
+  local usualMs = #base >= M.BASELINE_MIN and 1000 / median(base) or 1000 / 60
+  if ms >= math.max(M.JANK_MIN_MS, M.JANK_X * usualMs) then
+    pace.jank = pace.jank + 1
+    pace.inRun = pace.inRun + 1
+    if pace.inRun == M.RUN_N then pace.runs, pace.runFrames = pace.runs + 1, pace.runFrames + M.RUN_N
+    elseif pace.inRun > M.RUN_N then pace.runFrames = pace.runFrames + 1 end
+    for k, v in pairs(mod or {}) do if type(v) == 'number' then pace.jmod[k] = (pace.jmod[k] or 0) + v end end
+    local e = hitch and hitch.engine or (engine and engine())
+    if e then
+      pace.jengN = pace.jengN + 1
+      for k, v in pairs(e) do if type(v) == 'number' then pace.jeng[k] = (pace.jeng[k] or 0) + v end end
+    end
+  else
+    pace.inRun = 0
+  end
   -- the minute's frames
   frames[#frames + 1] = ms
   sumMin = sumMin + ms
@@ -172,6 +200,22 @@ function M.frame(ms, now, ctx, hitch, mod, engine)
     line = line .. ' ' .. where(c)
     if c.extra and c.extra ~= '' then line = line .. ' | ' .. c.extra end
     out[#out + 1] = line
+    local n = #s
+    local function pct(q) return s[math.max(1, math.ceil(n * (1 - q)))] end
+    local modMean, jmodMean, jengMean = {}, {}, {}
+    for k, v in pairs(pace.mod) do modMean[k] = v / n end
+    for k, v in pairs(pace.jmod) do jmodMean[k] = v / math.max(1, pace.jank) end
+    for k, v in pairs(pace.jeng) do jengMean[k] = v / math.max(1, pace.jengN) end
+    local pl = string.format('perf pacing p50 %.1f, p95 %.1f, p99 %.1f ms | slow frames %d (%.1f %%), %d runs of %d+ (%d frames)',
+      pct(0.5), pct(0.95), pct(0.99), pace.jank, 100 * pace.jank / n, pace.runs, M.RUN_N, pace.runFrames)
+    local m = top(modMean, 6, 0.05)
+    if m ~= '' then pl = pl .. ' | mod per frame (ms): ' .. m end
+    m = top(jmodMean, 5, 0.1)
+    if m ~= '' then pl = pl .. ' | mod in slow frames (ms): ' .. m end
+    m = top(jengMean, 5, 0.5)
+    if m ~= '' then pl = pl .. ' | engine in slow frames (ms): ' .. m end
+    out[#out + 1] = pl
+    pace = newPace()
     frames, sumMin, hitchesMin, worstMin, summaryAt = {}, 0, 0, nil, now
   end
   return out
