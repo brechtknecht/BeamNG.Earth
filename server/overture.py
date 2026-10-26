@@ -46,7 +46,13 @@ log = logging.getLogger("earthd.mapdata")
 # pinned release that is gone raises ReleaseGone for cells not cached yet.
 RELEASE = "2026-09-23.1"
 STAC_ROOT = "https://stac.overturemaps.org"
-DUCKDB_THREADS = 2              # DuckDB worker threads per query (the server is niced; the game comes first)
+# DuckDB worker threads per query (the server is niced; the game comes first). 1: a cell's scans are small, and a second
+# thread spun more than it worked (6 Munich cells' layers: 10.2 CPU-s at 2 threads, 7.0 at 1, the same wall time,
+# 2026-10-26); the cells are read in parallel by mapdata's pool anyway. BNGE_DUCKDB_THREADS=2: as before.
+DUCKDB_THREADS = int(os.environ.get("BNGE_DUCKDB_THREADS", "1"))
+# The geometry read as the file's own WKB (GeoParquet conversion off): DuckDB decoded every geometry to its GEOMETRY type
+# only for ST_AsWKB to encode it back (~15 % of a cell's scan). BNGE_GEO_CONVERSION=1: as before.
+RAW_WKB = os.environ.get("BNGE_GEO_CONVERSION", "0") != "1"
 REMOTE_FILES = 32               # open RemoteFiles kept (their blocks share rangeread's memory LRU)
 # DuckDB's own prefetching reads whole row groups one after the other; Reader._plan fetches what the
 # query needs in parallel first, so DuckDB reads lazily from the block cache
@@ -301,6 +307,12 @@ class Reader:
                                      "autoload_known_extensions": False})
         for k, v in PARQUET_CONFIG.items():
             con.execute(f"SET {k} = {str(v).lower()}")
+        global RAW_WKB
+        if RAW_WKB:
+            try:
+                con.execute("SET enable_geoparquet_conversion = false")
+            except Exception:       # (a DuckDB without the setting: ST_AsWKB as before)
+                RAW_WKB = False
         con.register_filesystem(fs)
         return con, fs.protocol, errors
 
@@ -491,11 +503,12 @@ class Reader:
         bbox = (f"bbox.xmin <= {lon1!r} AND bbox.xmax >= {lon0!r} AND "
                 f"bbox.ymin <= {lat1!r} AND bbox.ymax >= {lat0!r}")
         extra = f", {spec['extra']}" if spec.get("extra") else ""
+        wkb = "geometry" if RAW_WKB else "ST_AsWKB(geometry)"
         # The scan first, the dedup (by id, highest version) and numbering from the copy: with the
         # window in the same statement DuckDB 1.5 stopped skipping row groups by their statistics and
         # read every row group of the file between the matches (12 MB more, 9 s, for a city cell).
         con.execute(f"""CREATE TEMP TABLE s AS
-              SELECT id, version, {spec['cols']}, ST_AsWKB(geometry) AS wkb,
+              SELECT id, version, {spec['cols']}, {wkb} AS wkb,
                      (bbox.xmin + bbox.xmax) / 2 AS cx, (bbox.ymin + bbox.ymax) / 2 AS cy,
                      sources{extra}
               FROM {src} WHERE ({only}) AND {bbox}""")
