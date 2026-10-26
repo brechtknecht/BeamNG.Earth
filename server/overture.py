@@ -52,7 +52,16 @@ REMOTE_FILES = 32               # open RemoteFiles kept (their blocks share rang
 # query needs in parallel first, so DuckDB reads lazily from the block cache
 PARQUET_CONFIG = {"disable_parquet_prefetching": True}
 FETCH_THREADS = 4               # parallel range requests per Reader (the hosts allow 4 at once)
-FOOTER_GUESS = 256 * 1024       # bytes read from a file's end first for its footer (one block)
+# bytes read from a file's end first for its footer: the release's footers are 0.16-2.05 MB (2026-09-23.1), so one guess
+# of a block took a second round trip to Oregon for most files (the I/O audit, 2026-10-26). The guess is learnt per
+# theme/type: a footer grows with its file's row groups, so the largest footer-to-file ratio seen there (x FOOTER_PAD)
+# times the file's size, at least FOOTER_MIN; FOOTER_GUESS before the first. BNGE_FOOTER_GUESS=262144 (and no
+# learning, BNGE_FOOTER_LEARN=0): as before
+FOOTER_GUESS = int(os.environ.get("BNGE_FOOTER_GUESS", str(1024 * 1024)))
+FOOTER_MIN = 256 * 1024
+FOOTER_MAX = 4 * 1024 * 1024
+FOOTER_PAD = 1.3
+FOOTER_LEARN = os.environ.get("BNGE_FOOTER_LEARN", "1") != "0"
 MERGE_GAP = 64 * 1024           # column chunks closer than this are fetched in one range
 BASE_COLUMNS = {"id", "geometry", "bbox", "sources", "version"}
 
@@ -256,6 +265,8 @@ class Reader:
         # files never change). Re-reading it for every cell was most of a map cell's CPU (the Deck's mapdata-layer
         # thread, 36 CPU-s of a teleport, 2026-10-23); osmtags._groups keeps its file's the same way.
         self._meta = OrderedDict()
+        self._footer_ratio = {}         # theme/type -> the largest footer / file size seen (_plan's footer guess)
+        self._footer_len = {}           # path -> its footer's length (+ 8)
 
     def close(self):
         self.pool.shutdown(wait=False)
@@ -341,6 +352,30 @@ class Reader:
         finally:
             con.close()
 
+    def fetch_only(self, layer, cell, kind="prefetch"):
+        """Only the network part of query(): the bytes it will read (footers, bbox columns, the columns of the row
+        groups that hold the cell's rows) into the block cache, no rows read, nothing decoded or stored. The map data
+        ahead of the player on a machine that builds none ahead (mapdata.WARM_THREADS 0: 8 CPUs or fewer) waited on
+        its downloads (Oregon's buckets: 3-4 round trips a new file) in the block's own build (the I/O audit,
+        2026-10-26). Raises what the fetches raised (netfetch.Deferred for a refused prefetch)."""
+        spec = LAYERS[layer]
+        bounds = cell.bounds()
+        hits = self.index.files(spec["theme"], spec["type"], bounds, kind)
+        if not hits:
+            return
+        files = {f"{spec['theme']}/{spec['type']}/{name}": self._remote(spec["theme"], spec["type"], name, urls, size)
+                 for name, urls, size in hits}
+        con, proto, errors = self._connect(files, kind)
+        try:
+            self._plan(con, proto, sorted(files), files, spec, bounds, kind)
+        except Exception as e:
+            real = next((x for x in errors if isinstance(x, (netfetch.FetchError, rangeread.RangeError))), None)
+            if real is not None and real is not e:
+                raise real from e
+            raise
+        finally:
+            con.close()
+
     # --- fetch planning ------------------------------------------------------------------------
     def _parallel(self, tasks):
         """Run callables on the fetch pool; the first error is raised once all have finished."""
@@ -386,12 +421,25 @@ class Reader:
         lon0, lat0, lon1, lat1 = bounds
         t0 = time.perf_counter()
 
-        def footer(r):                  # the last 8 bytes: footer length + "PAR1"
-            tail = r.read(max(0, r.size - FOOTER_GUESS), r.size, kind)
+        def footer(path, r):            # the last 8 bytes: footer length + "PAR1"
+            kind_dir = path.rsplit("/", 1)[0]
+            guess = FOOTER_GUESS
+            if FOOTER_LEARN:
+                with self._lock:
+                    known, ratio = self._footer_len.get(path), self._footer_ratio.get(kind_dir)
+                if known is not None:       # (its exact footer: a learnt guess never reads more of a file it read)
+                    guess = known
+                elif ratio is not None:
+                    guess = int(min(FOOTER_MAX, max(FOOTER_MIN, ratio * FOOTER_PAD * r.size)))
+            tail = r.read(max(0, r.size - guess), r.size, kind)
             n = int.from_bytes(tail[-8:-4], "little")
+            if FOOTER_LEARN and r.size:
+                with self._lock:
+                    self._footer_ratio[kind_dir] = max(self._footer_ratio.get(kind_dir, 0.0), (n + 8) / r.size)
+                    self._footer_len[path] = n + 8
             if n + 8 > len(tail):
                 r.read(r.size - n - 8, r.size, kind)
-        self._parallel([lambda r=files[p]: footer(r) for p in paths])
+        self._parallel([lambda p=p: footer(p, files[p]) for p in paths])
         uris = ", ".join(f"'{proto}://{p}'" for p in paths)
         with self._lock:
             new = [p for p in paths if p not in self._meta]
