@@ -534,8 +534,18 @@ class MapData:
                 if got is not None:
                     self._mem.move_to_end((str(key), layer))
                     mem[layer] = got
-        futs = [(layer, self.pool.submit(timed, layer)) for layer in layers if layer not in mem]
         results = {}
+        for layer in layers:
+            # a layer already on disk read here, not queued behind other cells' builds in the pool: a cache hit there
+            # waited up to 33 s behind 5-17 s rebuilds, and a provisional follow block with it (the I/O audit,
+            # 2026-10-26)
+            if layer not in mem and layer in ALL_LAYERS:
+                t0 = time.perf_counter()
+                arrays = self._mirror_load(self.path(key, layer))
+                if arrays is not None:
+                    results[layer] = (arrays, True, time.perf_counter() - t0)
+        futs = [(layer, self.pool.submit(timed, layer)) for layer in layers
+                if layer not in mem and layer not in results]
         err = None
         for layer, fut in futs:             # all finish before an error is raised (no stray fetches)
             try:
