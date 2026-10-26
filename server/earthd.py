@@ -71,7 +71,7 @@ import sys  # noqa: E402
 import shutil  # noqa: E402
 import threading  # noqa: E402
 import time  # noqa: E402
-from collections import OrderedDict, deque  # noqa: E402
+from collections import Counter, OrderedDict, deque  # noqa: E402
 import concurrent.futures  # noqa: E402
 import multiprocessing  # noqa: E402
 from concurrent.futures import ThreadPoolExecutor  # noqa: E402
@@ -307,6 +307,21 @@ LANE_REQUEST, LANE_PREFETCH = 0, 1     # Server.block_pools: the blocks the mod 
 # machine with 8+ CPUs, else 1
 PREFETCH_LANES = int(os.environ.get("BNGE_PREFETCH_LANES", "0") or 0)
 FAST_AHEAD_S = 10.0         # s of road ahead the extra prefetch lanes build at the speed boost's speed (SPEED_BOOST_V)
+# Far field build order at speed (2026-10-26, a 300 km/h drive: the far backlog stayed at 300-420 tiles). Nearest
+# first starved the coarse levels: L3-L7 (2-33 km tiles, ~150 of the ~430) were never built while the near levels
+# kept changing, a whole drive long after the start or a rebase (the horizon empty, or the old anchor's). Ordering
+# everything by distance in tile sizes built them but made the near detail ahead late (L-1 swapped in at 330 m
+# instead of 590 m). BNGE_FAR_ORDER: FAR_SIZE_SLOTS of the tiles in flight go by distance in tile sizes (how big a
+# missing tile looks, as the refinement rule itself), the rest nearest first as before; and a refinement whose
+# tiles all lie behind the car at speed comes after everything else (gone again within seconds: L0 shown 3.5 s
+# median, 269 of 1166 tiles shown less than 5 s). 0: as before.
+FAR_ORDER = os.environ.get("BNGE_FAR_ORDER", "1") != "0"
+FAR_SIZE_SLOTS = 1
+FAR_BEHIND_V = 20.0         # m/s: from this speed on ...
+FAR_BEHIND_M = 64.0         # ... a refinement whose tiles all lie this far behind the car comes last
+# BNGE_FAR_DEPTH: far tiles in flight beyond the workers while the far-tile processes build them: a tile spent as
+# long in this process (its shape written, its record) as in its worker, and the workers idled 60 % of a drive.
+FAR_DEPTH = int(os.environ.get("BNGE_FAR_DEPTH", "2") or 0)
 HM_BUSY_TILE_WORKERS = 1    # far tiles built at once while a physics block is building in the server process (an
                             # anchor's first, or every one with --block-process off; the block processes' blocks do
                             # not share its interpreter: far tiles one at a time behind them were most of a Steam
@@ -727,7 +742,8 @@ class Server:
         self.refetched = 0              # far textures whose missing photo tiles were fetched here (make_tile)
         self.share_lock, self.group_helper = threading.Lock(), None    # (share_start: a BeamMP group's server)
         self.tile_pool = ThreadPoolExecutor(tile_workers + (peerworkmod.MAX_SLOTS if hasattr(far_pool, "remote_slots")
-                                                            else 0), thread_name_prefix="far")
+                                                            else 0) + (FAR_DEPTH if far_pool is not None else 0),
+                                            thread_name_prefix="far")
         # Road plans (grading) of the map cells ahead of the player, made before a block needs them: a
         # cell's first plans (and street widths) take 2-10 s, more than a block move allows at speed
         # One thread takes the most urgent cell of the latest pose's list each time (not a FIFO: cells
@@ -2569,6 +2585,7 @@ class Server:
         t2 = time.perf_counter()
         size = farfield.write_built(path, built, self.far_format, material or farfield.MATERIAL,
                                     textured=material is not None, tex_px=self.tex_size(lvl))
+        perftrace.stage("far write", t2, "far")
         dt = time.perf_counter() - t0
         self.build_stats.append(dt)
         self.level_stats.setdefault(lvl, deque(maxlen=200)).append((dt - (t2 - t1), t2 - t1, size, tex_bytes))
@@ -3190,12 +3207,17 @@ class Connection:
         self.deltas = {}
         self.queue = []                 # tiles to build, by priority
         self.qi = 0
+        self.by_size, self.qs = [], 0   # FAR_ORDER: the same by distance in tile sizes ...
+        self.size_lane = set()          # ... and the (anchorId, key) in flight from it
         self.next_group = 1
         self.inflight = {}              # (anchorId, key) -> (asyncio future, Tile)
         self.prefetched = {}            # (anchorId, key) -> when its imagery prefetch was last asked for
         self.failed = set()
         self.dirty = False              # far_done owed once every group is emitted
         self.batch = [0.0, 0, 0]        # [start, tiles sent, swaps sent] of the current change, for the log
+        self.far_waste = [0, 0]         # far tiles built but not wanted any more, sent but dropped unshown (perftrace)
+        self.far_traced = 0.0
+        self.far_shown_t = {}           # key -> when it was swapped in (perftrace: how long a far tile is shown)
         self.prefetching = set()        # the prefetch lanes at work (maybe_prefetch)
         self.wake = asyncio.Event()
         self.streamer = None
@@ -4043,6 +4065,7 @@ class Connection:
         self._retire((self.active, k) for k in self.sent)
         self.active = aid
         self.desired, self.sent, self.groups, self.queue, self.qi = {}, {}, [], [], 0
+        self.by_size, self.qs = [], 0
         self.refined, self.node_changed = set(), {}
         self.failed.clear()
         self.block = self.pending_block = self.predicted_block = None
@@ -4716,6 +4739,7 @@ class Connection:
         needed = {k for adds, _ in self.groups for k in adds}
         for k in [k for k in self.sent if k not in needed]:
             del self.sent[k]
+            self.far_waste[1] += 1
             self._retire([(aid, k)])
             self.send({"type": "far_remove", "anchorId": aid, "key": k})
         # Build order: L0 under the committed / pending block (the mod's cover and commit
@@ -4728,6 +4752,21 @@ class Connection:
         cone = (farfield.view_cone(self.cam)
                 if isinstance(self.cam, dict) and getattr(self, "cam_aid", None) == aid else None)
         dist = farfield.view_distances(todo, cone, fx, fy)
+        behind = set()
+        self.by_size, self.qs = [], 0
+        if FAR_ORDER:
+            (cx, cy), (vx, vy) = self.focus, self.vel
+            v = math.hypot(vx, vy)
+            if v >= FAR_BEHIND_V:
+                ux, uy = vx / v, vy / v
+
+                def back(k):            # the footprint's front edge along the car's travel, from the car
+                    x0, y0, x1, y1 = self.desired[k].bbox
+                    return max(x0 * ux, x1 * ux) + max(y0 * uy, y1 * uy) - (cx * ux + cy * uy) < -FAR_BEHIND_M
+                for adds, removes in self.groups:
+                    if (adds and removes and min(farfield.tile_of(k).level for k in adds)
+                            < min(farfield.tile_of(k).level for k in removes) and all(map(back, adds))):
+                        behind.update(adds)
 
         def prio(k):
             t = todo[k]
@@ -4736,13 +4775,28 @@ class Connection:
                 cls = 0
             elif t.key in started:
                 cls = 1
+            elif t.key in behind:
+                cls = 3
             return (cls, dist[k], t.level, t.key)
         self.queue = [todo[k] for k in sorted(range(len(todo)), key=prio)]
         self.qi = 0
+        if FAR_ORDER:
+            self.by_size = [todo[k] for k in sorted(range(len(todo)), key=lambda k: (
+                todo[k].key in behind, dist[k] / todo[k].size, todo[k].level, todo[k].key))]
         self.failed.clear()
 
-    def _next_tile(self):
+    def _next_tile(self, workers=1):
         aid = self.active
+        if self.by_size and workers > FAR_SIZE_SLOTS:     # (not the one tile at a time behind a block here)
+            self.size_lane &= self.inflight.keys()
+            if len(self.size_lane) < FAR_SIZE_SLOTS:
+                while self.qs < len(self.by_size):
+                    t = self.by_size[self.qs]
+                    self.qs += 1
+                    ck = (aid, t.key)
+                    if t.key not in self.sent and ck not in self.inflight and t.key in self.desired:
+                        self.size_lane.add(ck)
+                        return t
         while self.qi < len(self.queue):
             t = self.queue[self.qi]
             self.qi += 1
@@ -4801,6 +4855,28 @@ class Connection:
             for k in removes:
                 self.shown.pop((aid, k), None)
             self._retire((aid, k) for k in removes)
+            if perftrace.ON:
+                now = time.monotonic()
+                if adds and removes:            # how close to the car a level change happens (pop-in)
+                    (fx, fy), (vx, vy) = self.focus, self.vel
+                    v = math.hypot(vx, vy)
+                    tl = [farfield.tile_of(k) for k in adds]
+                    b = self.block.bbox if self.block is not None else None
+                    perftrace.instant("far swap", "far", add=min(t.level for t in tl),
+                                      rm=min(farfield.tile_of(k).level for k in removes),
+                                      d=round(min(t.distance(fx, fy) for t in tl)),
+                                      along=round(min(((t.bbox[0] + t.bbox[2]) / 2 - fx) * vx +
+                                                      ((t.bbox[1] + t.bbox[3]) / 2 - fy) * vy for t in tl) / v)
+                                      if v > 1 else None,
+                                      covered=b is not None and all(t.bbox[0] >= b[0] and t.bbox[1] >= b[1] and
+                                                                    t.bbox[2] <= b[2] and t.bbox[3] <= b[3]
+                                                                    for t in tl))
+                for k in removes:
+                    t = self.far_shown_t.pop(k, None)
+                    if t is not None:
+                        perftrace.instant("far gone", "far", key=k, life=round(now - t, 2))
+                for k in adds:
+                    self.far_shown_t[k] = now
             for k in adds:
                 self.shown[(aid, k)] = self.sent.pop(k).bbox
             self.batch[2] += 1
@@ -4860,9 +4936,11 @@ class Connection:
             workers = HM_BUSY_TILE_WORKERS if self.s.hm_here else self.s.quality.far_workers(self.s.tile_workers)
             # plus the helpers' slots (compute sharing): their tiles cost this process only the files (26 ms a
             # tile); kept to the local workers, a Steam Deck sent 2 at a time to 12 idle helper workers (2026-10-22)
+            if self.s.far_pool is not None and not self.s.hm_here and workers >= self.s.tile_workers:
+                workers += FAR_DEPTH        # (not while the governor keeps a far process free for the blocks)
             workers += self.s.remote_slots()
             while anchor is not None and not self.teleport_pending and len(self.inflight) < workers:
-                t = self._next_tile()
+                t = self._next_tile(workers)
                 if t is None:
                     break
                 self.inflight[(anchor.id, t.key)] = (self.s.tile(anchor, t), t)
@@ -4907,6 +4985,20 @@ class Connection:
                     log.info("live retexture: %s, %d waiting", self.s.retex_stats, len(self.s.retex_todo))
                 if not any(ck[0] != anchor.id for ck in self.shown):
                     self.s.schedule_prune(anchor.id)
+            if perftrace.ON and anchor is not None and time.monotonic() - self.far_traced >= 1.0:
+                self.far_traced = time.monotonic()
+                bl = Counter()
+                (fx, fy), (vx, vy) = self.focus, self.vel
+                for k, t in self.desired.items():
+                    if (anchor.id, k) not in self.shown:
+                        x0, y0, x1, y1 = t.bbox
+                        side = "a" if (x0 + x1) / 2 * vx + (y0 + y1) / 2 * vy >= fx * vx + fy * vy else "b"
+                        bl[f"bl{'m' if t.level < 0 else ''}{abs(t.level)}{side}"] += 1
+                perftrace.counter("farbl", **bl)
+                perftrace.counter("far", backlog=self.backlog(), desired=len(self.desired), sent=len(self.sent),
+                                  groups=len(self.groups), queue=len(self.queue) - self.qi, inflight=len(self.inflight),
+                                  workers=workers, superseded=self.far_waste[0], dropped=self.far_waste[1],
+                                  swaps=self.batch[2])
             await self.writer.drain()
             if waker is None:
                 waker = asyncio.ensure_future(self.wake.wait())
@@ -4924,6 +5016,7 @@ class Connection:
                     self.failed.add(t.key)
                     continue
                 if ck[0] != self.active or t.key not in self.desired or ck in self.shown or t.key in self.sent:
+                    self.far_waste[0] += 1
                     continue            # superseded meanwhile; the file stays cached
                 # the server's latest record: a live retexture may have finished since this build
                 info = self.s.tiles.get(ck, fut.result())
@@ -4949,6 +5042,13 @@ class Connection:
                     if self.s.layout.format >= 4:   # M1: texture px, the mod's governor unit kind
                         m["tex"] = self.s.tex_size(t.level)
                 self.send(m)
+                if perftrace.ON:
+                    (fx, fy), (vx, vy) = self.focus, self.vel
+                    x0, y0, x1, y1 = t.bbox
+                    dx, dy, v = (x0 + x1) / 2 - fx, (y0 + y1) / 2 - fy, math.hypot(vx, vy)
+                    perftrace.instant("far sent", "far", key=t.key, lvl=t.level, d=round(math.hypot(dx, dy)),
+                                      along=round((dx * vx + dy * vy) / v) if v > 1 else None,
+                                      ms=round(1000 * (time.perf_counter() - self.batch[0])))
                 if self.batch[1] % 50 == 0:
                     left = sum(1 for g in self.groups for k in g[0] if k not in self.sent)
                     # this change's tiles (sent / sent + still to send), not the whole far field
