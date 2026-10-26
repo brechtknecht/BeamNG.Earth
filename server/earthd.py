@@ -550,7 +550,7 @@ class Server:
                  colormatch="off", credits=None, cache=None, retex_rate=RETEX_RATE, surface=None,
                  mapdata=None, grading=False, road_widths=False, block_pools=(), sidewalks=True, buildings=False, traffic=False, far_pool=None,
                  road_pool=None, airports_db=None, sea=None, vegetation=None, leaf_on=True, season_mode="off",
-                 far_bld_pool=None, gas_stations=False):
+                 far_bld_pool=None, gas_stations=False, photo_pool=None):
         """kfun: K(L) for every level (default: the layout's K table); near_radii: the min-level
         radii (default: the layout's); cells: 32 (v1.3.1) or 64 (M1, mesh mode only); tex: texture
         px per level from the finest (default: tex_near, tex_near, tex_far with 32 cells,
@@ -698,6 +698,10 @@ class Server:
         # hundreds of them queued ahead of the road tiles under the car, which drove on bare ground for minutes
         # (Sinaia 2026-10-15); falls back to the road pool
         self.far_bld_pool = far_bld_pool or road_pool
+        # detail mode's block photos (blockworker.base_photo) in a process of their own (main_async: not on a small
+        # machine): in the other lane's block process a photo waited for that lane's block, 77 s of a Munich block's
+        # 78 s behind a first visit's road plans, while the photo itself took 0.4-4 s (2026-10-26); None: _base_process
+        self.photo_pool = photo_pool
         self.warm_cv = threading.Condition()
         self.warm_thread = None
         self.tile_workers = tile_workers
@@ -1840,11 +1844,13 @@ class Server:
         return s - m <= anchor.lat <= n + m and w - m <= lon <= e + m
 
     def _base_process(self, lane, anchor):
-        """The block process that renders the base photo of a block built in lane (blockworker.base_photo): the
-        other lane's, usually idle while this one builds the heights; None (rendered here) with the imagery
-        analyses at work there (analyses_here) or without block processes."""
+        """The process that renders the base photo of a block built in lane (blockworker.base_photo): the photo
+        process (photo_pool), else the other lane's block process, usually idle while this one builds the heights;
+        None (rendered here) with the imagery analyses at work there (analyses_here) or without block processes."""
         if not self.block_pools or self.imagery is None or self.analyses_here(anchor):
             return None
+        if self.photo_pool is not None:
+            return self.photo_pool
         return self.block_pools[LANE_PREFETCH if lane == LANE_REQUEST else LANE_REQUEST][0]
 
     def _base_photo(self, anchor, cx, cy, pool=None, urgent=False, quick=False):
@@ -1860,12 +1866,12 @@ class Server:
                 name = self.write_base(anchor, cx, cy, photo=photo, quick=quick)
         return name, photo, time.perf_counter() - t1
 
-    def _base_elsewhere(self, anchor, cx, cy, pool, photo):
+    def _base_elsewhere(self, anchor, cx, cy, pool, photo, rev=0):
         """write_base in a block process (blockworker.base_photo): the file name, or None when it lacked an imagery
         tile on disk or failed (then rendered here)."""
         size = self.layout.block * heightmap.SQUARE
         key = (anchor.id, cx, cy)
-        name = self.base_name(key)
+        name = self.base_name(key, rev)
         im = self.imagery
         tex = {"chain": [s.name for s in im.chain], "tone": self.tone, "leaf_on": im.leaf_on,
                "season_mode": im.season_mode}
@@ -4018,11 +4024,19 @@ class Connection:
             return
         self.base_busy = True
 
+        def render(rev):
+            # in the photo process when there is one (as the block's first photo): rendered here it was 3-10 s of
+            # this interpreter's lock, its BC7 encode queued behind the prefetch lane's block (Munich, 2026-10-26)
+            if s.photo_pool is not None and not s.analyses_here(anchor):
+                name = s._base_elsewhere(anchor, key[1], key[2], s.photo_pool, [], rev)
+                if name is not None:
+                    return name
+            pool = s.block_pools[LANE_PREFETCH][0] if s.block_pools else None     # its BC7 encode
+            return s.write_base(anchor, key[1], key[2], pool, rev)
+
         async def run():
             try:
-                pool = s.block_pools[LANE_PREFETCH][0] if s.block_pools else None     # its BC7 encode
-                name = await self.loop.run_in_executor(s.hm_pool, s.write_base, anchor, key[1], key[2], pool,
-                                                       next(s.base_rev))
+                name = await self.loop.run_in_executor(s.hm_pool, render, next(s.base_rev))
                 info = s.hm.get(key)
                 if name is None or info is None:
                     return
@@ -4745,6 +4759,16 @@ async def main_async(args):
             initargs=(args.cache_dir, args.offline, True, args.grading == "on", args.road_widths == "on",
                       args.surface == "on", ctx.Queue(maxsize=1), logging.getLogger().level,
                       args.airports == "on", args.sea == "on", NICE_FAR_BUILDINGS, roadsmod.ROADS_IN_GROUND))
+    import budget
+    photo_pool = None
+    if block_pools and args.near_visual == "detail" and args.imagery and not budget.small():
+        photo_pool = poolsmod.RespawningPool(     # detail mode's block photos (blockworker.base_photo)
+            "base photo", 1, mp_context=ctx, initializer=blockworker.init,
+            initargs=(args.cache_dir, args.offline, args.roads == "on",
+                      args.grading == "on" and args.roads == "on",
+                      args.road_widths == "on" and args.roads == "on", args.surface == "on", ctx.Queue(maxsize=1),
+                      logging.getLogger().level, args.airports == "on", args.sea == "on", 0,
+                      roadsmod.ROADS_IN_GROUND, args.gas_stations == "on" and args.roads == "on"))
     server = Server(args.user_dir, args.cache_dir, args.workers, kfun, args.hysteresis, args.far_radius, fmt,
                     imagery=args.imagery, near_visual=args.near_visual, tex_near=args.tex_near,
                     tex_far=args.tex_far, tone=args.tone, near_radii=radii,
@@ -4766,7 +4790,7 @@ async def main_async(args):
                     gas_stations=args.gas_stations == "on" and args.roads == "on",
                     traffic=args.traffic == "on" and args.roads == "on",
                     block_pools=block_pools, far_pool=far_pool, road_pool=road_pool, airports_db=airports_db,
-                    far_bld_pool=far_bld_pool,
+                    far_bld_pool=far_bld_pool, photo_pool=photo_pool,
                     sea=seacarvemod.SeaCarver(mapdata, args.cache_dir) if args.sea == "on" else None,
                     vegetation=(vegetationmod.Vegetation(mapdata, args.cache_dir) if args.trees == "on" else None))
     server.update_check = args.update_check == "on"

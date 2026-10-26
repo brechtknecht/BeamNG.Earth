@@ -197,8 +197,8 @@ class BasePhotoTest(unittest.TestCase):
 
 
 class BaseRoutingTest(unittest.TestCase):
-    """earthd: the base photo goes to the other lane's block process when the server has no imagery analyses; with
-    them (or a tile missing on disk) it is rendered in the server (write_base)."""
+    """earthd: the base photo goes to the photo process, else the other lane's block process, when the server has no
+    imagery analyses; with them (or a tile missing on disk) it is rendered in the server (write_base)."""
 
     def test_routing_and_fallback(self):
         import earthd
@@ -207,7 +207,7 @@ class BaseRoutingTest(unittest.TestCase):
 
         def server(**kw):
             o = SimpleNamespace(block_pools=[("request", None), ("prefetch", None)], imagery=object(), deshadow=None,
-                                colormatch=None)
+                                colormatch=None, photo_pool=None)
             vars(o).update(kw)
             o.analyses_here = lambda anchor: S.analyses_here(o, anchor)
             return o
@@ -219,6 +219,10 @@ class BaseRoutingTest(unittest.TestCase):
             # they correct only the USGS tiles: elsewhere the photo goes to the block process as without them
             self.assertEqual(S._base_process(server(**{k: object()}), earthd.LANE_REQUEST, europe), "prefetch", k)
         self.assertIsNone(S._base_process(server(block_pools=[]), earthd.LANE_REQUEST, us))
+        # the photo process when there is one: never behind the other lane's block (main_async, not on a small machine)
+        for lane in (earthd.LANE_REQUEST, earthd.LANE_PREFETCH):
+            self.assertEqual(S._base_process(server(photo_pool="photo"), lane, us), "photo")
+        self.assertIsNone(S._base_process(server(photo_pool="photo", deshadow=object()), earthd.LANE_REQUEST, us))
         aleutians = SimpleNamespace(lat=52.9, lon=173.0)
         self.assertTrue(S.analyses_here(server(deshadow=object()), aleutians))
         calls = []

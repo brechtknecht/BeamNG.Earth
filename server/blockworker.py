@@ -946,11 +946,13 @@ def base_photo(lat, lon, x0, y0, size, px, tex, buildings, rock_zoom, path, cach
     im = _imagery(tex)
     frame = geodesy.EnuFrame(lat, lon)
     pending = set()
+    t0, c0 = time.perf_counter(), time.thread_time()
     try:
         rgb, used = im.render(frame, x0, y0, size, px, pending)
     except imagerymod.ImageryError:
         return None
     rgb = np.asarray(rgb, np.uint8)
+    stamps = [("imagery", time.perf_counter())]
     if buildings and _s.md is not None:
         try:
             mask = buildingsmod.photo_mask(frame, x0, y0, size, px, _s.md)
@@ -958,12 +960,14 @@ def base_photo(lat, lon, x0, y0, size, px, tex, buildings, rock_zoom, path, cach
                 rgb = buildingsmod.fill_photo(rgb, mask, size, px)
         except Exception as e:      # the photo stays as it is
             log.info("base photo: building mask: %s", e)
+    stamps.append(("buildings", time.perf_counter()))
     if roadsmod.ROADS_IN_GROUND:          # (earthd.Server.write_base)
         try:
             import surface as surfacemod
             rgb = surfacemod.paint_square(rgb, frame, x0, y0, size, getattr(_s, "surface", None), _s.widths)
         except Exception as e:      # the photo stays as it is
             log.info("base photo: roads: %s", e)
+    stamps.append(("roads", time.perf_counter()))
     try:            # (earthd.Server.write_base)
         n = 65
         xs = x0 + np.arange(n) * (size / (n - 1))
@@ -972,13 +976,18 @@ def base_photo(lat, lon, x0, y0, size, px, tex, buildings, rock_zoom, path, cach
         rgb = rockfacemod.rock(rgb, frame, x0, y0, size, U, x0, y0, size / (n - 1))
     except Exception as e:
         log.debug("base photo: rock faces: %s", e)
+    stamps.append(("rock", time.perf_counter()))
     tmp = staging.tmp_for(path)
     # stored, not deflated: the game reads the packed cache entry (terraincache), this file only if that is stale;
     # level 1 was 0.15 s of a block photo on a Steam Deck, level 0 0.08 (3 MB, a session keeps a few)
     Image.fromarray(rgb, "RGB").save(tmp, format="PNG", compress_level=0)
     staging.replace(tmp, path)
     user_dir, base_vfs, ao_vfs, ao_value = cache
+    stamps.append(("png", time.perf_counter()))
     terraincache.base_entry(user_dir, base_vfs, ao_vfs, rgb, ao_value)
+    stamps.append(("cache", time.perf_counter()))
+    log.debug("base photo %s in %.2f s (cpu %.2f s): %s", os.path.basename(path), stamps[-1][1] - t0,
+              time.thread_time() - c0, " ".join(f"{k} {b - a:.2f}" for (_, a), (k, b) in zip([("", t0)] + stamps, stamps)))
     return rgb, used, pending
 
 
