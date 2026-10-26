@@ -1274,31 +1274,98 @@ fn grade_points<'py>(py: Python<'py>, px: PyReadonlyArray1<'py, f64>, pyy: PyRea
                      rh: PyReadonlyArray1<'py, f64>, rid: PyReadonlyArray1<'py, i64>, abut: PyReadonlyArray1<'py, u8>, cut: PyReadonlyArray2<'py, f64>, lift: f64, slope_run: f64,
                      t_min: f64, t_max: f64, blend_r: f64,
                      bucket: f64, wall_cut: f64, wall_t: f64, wall_flat: f64, wall_ahead: f64,
-                     sep: bool, sep_from: f64, sep_full: f64, core_fade: f64, side_fade: f64, sharp_step: f64)
+                     sep: bool, sep_from: f64, sep_full: f64, core_fade: f64, side_fade: f64, sharp_step: f64,
+                     threads: usize)
                      -> Bound<'py, PyArray1<f64>> {
     let (px, pyy, base) = (px.as_array(), pyy.as_array(), base.as_array());
-    let (a, b, za, zb, h) = (a.as_array(), b.as_array(), za.as_array(), zb.as_array(), h.as_array());
-    let (rh, rid) = (rh.as_array(), rid.as_array());
-    let abut = abut.as_array();
-    let cut = cut.as_array();               // (segments, 6): a cutting's wall, top and top offset, left then right
+    let segs = GradeSegs { a: a.as_array(), b: b.as_array(), za: za.as_array(), zb: zb.as_array(), h: h.as_array(),
+                           rh: rh.as_array(), rid: rid.as_array(), abut: abut.as_array(), cut: cut.as_array() };
+    let prm = GradeParams { lift, slope_run, t_min, t_max, blend_r, bucket, wall_cut, wall_t, wall_flat, wall_ahead, sep,
+                            sep_from, sep_full, core_fade, side_fade, sharp_step };
+    let n = px.len();
+    if n == 0 {
+        return Vec::<f64>::new().into_pyarray(py);
+    }
+    let px_: Vec<f64> = px.iter().copied().collect();
+    let py_: Vec<f64> = pyy.iter().copied().collect();
+    let base_: Vec<f64> = base.iter().copied().collect();
+    // Without the GIL (the block's region threads, its whole plans and the lookahead waited behind a block's grading,
+    // 2026-10-26), and on large calls over a few threads: the points split into bands of rows (y), each band graded
+    // alone. Every point still sums its segments in their order, the same heights as one pass.
+    let work = n.saturating_mul(segs.h.len().max(1));
+    let out = release(py, work, || {
+        let t = if work >= GRADE_SPLIT_MIN && n >= 4096 { threads.clamp(1, 16) } else { 1 };
+        if t <= 1 {
+            return grade_core(&px_, &py_, &base_, &segs, &prm);
+        }
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|&i, &j| py_[i].partial_cmp(&py_[j]).unwrap_or(std::cmp::Ordering::Equal));
+        let per = n.div_ceil(t);
+        let mut out = vec![0.0f64; n];
+        let parts: Vec<Vec<f64>> = std::thread::scope(|sc| {
+            let hs: Vec<_> = order.chunks(per).map(|ch| {
+                let (segs, prm) = (&segs, &prm);
+                let (px_, py_, base_) = (&px_, &py_, &base_);
+                sc.spawn(move || {
+                    let qx: Vec<f64> = ch.iter().map(|&i| px_[i]).collect();
+                    let qy: Vec<f64> = ch.iter().map(|&i| py_[i]).collect();
+                    let qb: Vec<f64> = ch.iter().map(|&i| base_[i]).collect();
+                    grade_core(&qx, &qy, &qb, segs, prm)
+                })
+            }).collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        for (ch, got) in order.chunks(per).zip(parts) {
+            for (&i, v) in ch.iter().zip(got) {
+                out[i] = v;
+            }
+        }
+        out
+    });
+    out.into_pyarray(py)
+}
+
+/// grade_points' plan segments (views of the caller's arrays).
+struct GradeSegs<'a> {
+    a: numpy::ndarray::ArrayView2<'a, f64>, b: numpy::ndarray::ArrayView2<'a, f64>,
+    za: numpy::ndarray::ArrayView1<'a, f64>, zb: numpy::ndarray::ArrayView1<'a, f64>,
+    h: numpy::ndarray::ArrayView1<'a, f64>, rh: numpy::ndarray::ArrayView1<'a, f64>,
+    rid: numpy::ndarray::ArrayView1<'a, i64>, abut: numpy::ndarray::ArrayView1<'a, u8>,
+    cut: numpy::ndarray::ArrayView2<'a, f64>,
+}
+
+/// grade_points' settings (grading.py's constants).
+struct GradeParams {
+    lift: f64, slope_run: f64, t_min: f64, t_max: f64, blend_r: f64, bucket: f64, wall_cut: f64, wall_t: f64,
+    wall_flat: f64, wall_ahead: f64, sep: bool, sep_from: f64, sep_full: f64, core_fade: f64, side_fade: f64,
+    sharp_step: f64,
+}
+
+/// Work (points x segments) from which grade_points spreads a call over its threads (below: one, no thread start).
+const GRADE_SPLIT_MIN: usize = 20_000_000;
+
+/// grade_points for the points (px_, py_) with their ungraded heights base_.
+fn grade_core(px_: &[f64], py_: &[f64], base_: &[f64], sg: &GradeSegs, p: &GradeParams) -> Vec<f64> {
+    let (a, b, za, zb, h, rh, rid, abut, cut) = (&sg.a, &sg.b, &sg.za, &sg.zb, &sg.h, &sg.rh, &sg.rid, &sg.abut, &sg.cut);
+    let (lift, slope_run, t_min, t_max, blend_r, bucket) = (p.lift, p.slope_run, p.t_min, p.t_max, p.blend_r, p.bucket);
+    let (wall_cut, wall_t, wall_flat, wall_ahead, sep) = (p.wall_cut, p.wall_t, p.wall_flat, p.wall_ahead, p.sep);
+    let (sep_from, sep_full, core_fade, side_fade, sharp_step) = (p.sep_from, p.sep_full, p.core_fade, p.side_fade,
+                                                                  p.sharp_step);
     let sharp = cut.iter().any(|v| v.is_finite());
     let has_cut: Vec<bool> = (0..h.len()).map(|s| (0..6).any(|k| cut[[s, k]].is_finite())).collect();
     let cut_reach: Vec<f64> = (0..h.len()).map(|s| {
         let r = cut[[s, 2]].max(cut[[s, 5]]).max(cut[[s, 0]]).max(cut[[s, 3]]);
         if r.is_finite() { r + 0.5 + 2.0 * sharp_step } else { 0.0 }
     }).collect();
-    let n = px.len();
-    let mut out: Vec<f64> = base.iter().copied().collect();
-    if n == 0 {
-        return out.into_pyarray(py);
-    }
+    let n = px_.len();
+    let mut out: Vec<f64> = base_.to_vec();
     let (mut x0, mut y0, mut x1, mut y1) = (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
     for i in 0..n {
-        x0 = x0.min(px[i]); x1 = x1.max(px[i]);
-        y0 = y0.min(pyy[i]); y1 = y1.max(pyy[i]);
+        x0 = x0.min(px_[i]); x1 = x1.max(px_[i]);
+        y0 = y0.min(py_[i]); y1 = y1.max(py_[i]);
     }
-    let bxs: Vec<i64> = (0..n).map(|i| ((px[i] - x0) / bucket).floor() as i64).collect();
-    let bys: Vec<i64> = (0..n).map(|i| ((pyy[i] - y0) / bucket).floor() as i64).collect();
+    let bxs: Vec<i64> = (0..n).map(|i| ((px_[i] - x0) / bucket).floor() as i64).collect();
+    let bys: Vec<i64> = (0..n).map(|i| ((py_[i] - y0) / bucket).floor() as i64).collect();
     let nbx = bxs.iter().copied().max().unwrap() + 1;
     let keys: Vec<i64> = (0..n).map(|i| bys[i] * nbx + bxs[i]).collect();
     let mut order: Vec<usize> = (0..n).collect();
@@ -1315,7 +1382,7 @@ fn grade_points<'py>(py: Python<'py>, px: PyReadonlyArray1<'py, f64>, pyy: PyRea
     let mut csum = vec![0.0f64; n];
     let mut cz = vec![0.0f64; n];
     let mut raised = vec![f64::NEG_INFINITY; n];    // (sharp) the cuttings' tops over the points beside them
-    let mut beff: Vec<f64> = base.iter().copied().collect();
+    let mut beff: Vec<f64> = base_.to_vec();
     // the carriageway each point is deepest in (d - rh, most negative) and its height there
     let mut cdeep = vec![0.0f64; n];
     let mut carz = vec![f64::NAN; n];
@@ -1328,7 +1395,7 @@ fn grade_points<'py>(py: Python<'py>, px: PyReadonlyArray1<'py, f64>, pyy: PyRea
     for pass in 0..2 {
         if pass == 1 && sharp {
             for i in 0..n {
-                beff[i] = base[i].max(raised[i]);
+                beff[i] = base_[i].max(raised[i]);
             }
         }
         for s in 0..h.len() {
@@ -1352,7 +1419,7 @@ fn grade_points<'py>(py: Python<'py>, px: PyReadonlyArray1<'py, f64>, pyy: PyRea
                 let i1 = sk.partition_point(|&k| k <= row * nbx + cx1);
                 for j in i0..i1.max(i0) {
                     let idx = order[j];
-                    let (qx, qy) = (px[idx] - ax, pyy[idx] - ay);
+                    let (qx, qy) = (px_[idx] - ax, py_[idx] - ay);
                     let t = if l2 > 1e-12 { ((qx * abx + qy * aby) / l2).clamp(0.0, 1.0) } else { 0.0 };
                     let (ddx, ddy) = (qx - t * abx, qy - t * aby);
                     let d = (ddx * ddx + ddy * ddy).sqrt();       // (not hypot: libm's is ~5x dearer, the pairs loop's main cost)
@@ -1448,7 +1515,7 @@ fn grade_points<'py>(py: Python<'py>, px: PyReadonlyArray1<'py, f64>, pyy: PyRea
             out[i] = beff[i] + wmax[i] * (num[i] / den[i] - beff[i] + lift);
         }
     }
-    out.into_pyarray(py)
+    out
 }
 
 /// roads.tunnel_sections: a tunnel's road level and its sections from the ground over it, sampled at arc lengths s.
@@ -2560,6 +2627,53 @@ fn bilinear_grid<'py>(
             let wy = (y - iy as f64).clamp(0.0, 1.0);
             let (v00, v10) = (g[[iy, ix]] as f64, g[[iy, ix + 1]] as f64);
             let (v01, v11) = (g[[iy + 1, ix]] as f64, g[[iy + 1, ix + 1]] as f64);
+            (v00 * (1.0 - wx) + v10 * wx) * (1.0 - wy) + (v01 * (1.0 - wx) + v11 * wx) * wy
+        })
+    });
+    Ok(out.into_pyarray(py))
+}
+
+/// bilinear_grid over a mosaic of equal tiles (each tile x tile float32) without building it: tiles in row-major order,
+/// nx per row, ny rows; the same pixels, clamps and float64 arithmetic as bilinear_grid on the copied mosaic (dem.sample
+/// copied every tile of the points' box into one array per call: 3 ms for a road profile's 500 points over 1.5 km,
+/// 2026-10-26).
+#[pyfunction]
+fn bilinear_tiles<'py>(
+    py: Python<'py>,
+    tiles: Vec<PyReadonlyArray2<'py, f32>>,
+    nx: usize,
+    ny: usize,
+    fx: PyReadonlyArray1<'py, f64>,
+    fy: PyReadonlyArray1<'py, f64>,
+) -> PyResult<Bound<'py, PyArray1<f64>>> {
+    if nx == 0 || ny == 0 || tiles.len() != nx * ny {
+        return Err(pyo3::exceptions::PyValueError::new_err("bilinear_tiles: nx * ny tiles needed"));
+    }
+    let views: Vec<numpy::ndarray::ArrayView2<f32>> = tiles.iter().map(|t| t.as_array()).collect();
+    let t = views[0].shape()[0];
+    if t < 2 || views.iter().any(|v| v.shape()[0] != t || v.shape()[1] != t) {
+        return Err(pyo3::exceptions::PyValueError::new_err("bilinear_tiles: square tiles of one size needed"));
+    }
+    let (xs, ys) = (fx.as_array(), fy.as_array());
+    if xs.len() != ys.len() {
+        return Err(pyo3::exceptions::PyValueError::new_err("bilinear_tiles: fx and fy differ in length"));
+    }
+    let (h, w) = (ny * t, nx * t);
+    let out = release(py, xs.len() * 8, || {
+        let (pow2, sh, mask) = (t.is_power_of_two(), t.trailing_zeros(), t - 1);     // (dem.TILE 512: shifts)
+        let at = |r: usize, c: usize| if pow2 {
+            unsafe { *views.get_unchecked(((r >> sh) * nx) + (c >> sh)).uget([r & mask, c & mask]) as f64 }
+        } else {
+            views[(r / t) * nx + c / t][[r % t, c % t]] as f64
+        };
+        numpy::ndarray::Array1::from_shape_fn(xs.len(), |i| {
+            let (x, y) = (xs[i], ys[i]);
+            let ix = (x.floor() as i64).clamp(0, w as i64 - 2) as usize;
+            let iy = (y.floor() as i64).clamp(0, h as i64 - 2) as usize;
+            let wx = (x - ix as f64).clamp(0.0, 1.0);
+            let wy = (y - iy as f64).clamp(0.0, 1.0);
+            let (v00, v10) = (at(iy, ix), at(iy, ix + 1));
+            let (v01, v11) = (at(iy + 1, ix), at(iy + 1, ix + 1));
             (v00 * (1.0 - wx) + v10 * wx) * (1.0 - wy) + (v01 * (1.0 - wx) + v11 * wx) * wy
         })
     });
@@ -4405,6 +4519,7 @@ fn earthfast(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(season_noise, m)?)?;
     m.add_function(wrap_pyfunction!(terrarium_heights, m)?)?;
     m.add_function(wrap_pyfunction!(bilinear_grid, m)?)?;
+    m.add_function(wrap_pyfunction!(bilinear_tiles, m)?)?;
     m.add_function(wrap_pyfunction!(float_predictor_f32, m)?)?;
     m.add_function(wrap_pyfunction!(segment_crossings, m)?)?;
     m.add_function(wrap_pyfunction!(seg_hits, m)?)?;
@@ -4446,6 +4561,6 @@ fn earthfast(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(paint_lines, m)?)?;
     m.add_function(wrap_pyfunction!(photofill::fill_photo, m)?)?;
     m.add_function(wrap_pyfunction!(rtin_mesh, m)?)?;
-    m.add("VERSION", 75)?;
+    m.add("VERSION", 77)?;
     Ok(())
 }

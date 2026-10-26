@@ -47,13 +47,28 @@ log = logging.getLogger("earthd.mapdata")
 # pinned release that is gone raises ReleaseGone for cells not cached yet.
 RELEASE = "2026-09-23.1"
 STAC_ROOT = "https://stac.overturemaps.org"
-DUCKDB_THREADS = 2              # DuckDB worker threads per query (the server is niced; the game comes first)
+# DuckDB worker threads per query (the server is niced; the game comes first). 1: a cell's scans are small, and a second
+# thread spun more than it worked (6 Munich cells' layers: 10.2 CPU-s at 2 threads, 7.0 at 1, the same wall time,
+# 2026-10-26); the cells are read in parallel by mapdata's pool anyway. BNGE_DUCKDB_THREADS=2: as before.
+DUCKDB_THREADS = int(os.environ.get("BNGE_DUCKDB_THREADS", "1"))
+# The geometry read as the file's own WKB (GeoParquet conversion off): DuckDB decoded every geometry to its GEOMETRY type
+# only for ST_AsWKB to encode it back (~15 % of a cell's scan). BNGE_GEO_CONVERSION=1: as before.
+RAW_WKB = os.environ.get("BNGE_GEO_CONVERSION", "0") != "1"
 REMOTE_FILES = 32               # open RemoteFiles kept (their blocks share rangeread's memory LRU)
 # DuckDB's own prefetching reads whole row groups one after the other; Reader._plan fetches what the
 # query needs in parallel first, so DuckDB reads lazily from the block cache
 PARQUET_CONFIG = {"disable_parquet_prefetching": True}
 FETCH_THREADS = 4               # parallel range requests per Reader (the hosts allow 4 at once)
-FOOTER_GUESS = 256 * 1024       # bytes read from a file's end first for its footer (one block)
+# bytes read from a file's end first for its footer: the release's footers are 0.16-2.05 MB (2026-09-23.1), so one guess
+# of a block took a second round trip to Oregon for most files (the I/O audit, 2026-10-26). The guess is learnt per
+# theme/type: a footer grows with its file's row groups, so the largest footer-to-file ratio seen there (x FOOTER_PAD)
+# times the file's size, at least FOOTER_MIN; FOOTER_GUESS before the first. BNGE_FOOTER_GUESS=262144 (and no
+# learning, BNGE_FOOTER_LEARN=0): as before
+FOOTER_GUESS = int(os.environ.get("BNGE_FOOTER_GUESS", str(1024 * 1024)))
+FOOTER_MIN = 256 * 1024
+FOOTER_MAX = 4 * 1024 * 1024
+FOOTER_PAD = 1.3
+FOOTER_LEARN = os.environ.get("BNGE_FOOTER_LEARN", "1") != "0"
 MERGE_GAP = 64 * 1024           # column chunks closer than this are fetched in one range
 BASE_COLUMNS = {"id", "geometry", "bbox", "sources", "version"}
 # Row-group shards (2026-10-26, first visit): a source row group holds ~20-120 k features over 10-50 km, so the cells of a
@@ -388,6 +403,8 @@ class Reader:
         self._shard_locks = {}
         self.shards_ok = SHARDS             # False after SHARD_FAILURES shard reads failed (then the sources are read)
         self._shard_failures = 0
+        self._footer_ratio = {}         # theme/type -> the largest footer / file size seen (_plan's footer guess)
+        self._footer_len = {}           # path -> its footer's length (+ 8)
 
     def close(self):
         self.pool.shutdown(wait=False)
@@ -434,6 +451,12 @@ class Reader:
                                      "autoload_known_extensions": False})
         for k, v in PARQUET_CONFIG.items():
             con.execute(f"SET {k} = {str(v).lower()}")
+        global RAW_WKB
+        if RAW_WKB:
+            try:
+                con.execute("SET enable_geoparquet_conversion = false")
+            except Exception:       # (a DuckDB without the setting: ST_AsWKB as before)
+                RAW_WKB = False
         con.register_filesystem(fs)
         return con, fs.protocol, errors
 
@@ -507,7 +530,7 @@ class Reader:
             # only the row groups the plan fetched (DuckDB would otherwise read every row group whose
             # statistics it cannot rule out, lazily, one request each)
             only = " OR ".join(f"(filename = '{u}' AND file_row_number BETWEEN {a} AND {b})" for u, a, b in rows)
-            out = self._run(con, src, only, "ST_AsWKB(geometry)", layer, spec, bounds)
+            out = self._run(con, src, only, "geometry" if RAW_WKB else "ST_AsWKB(geometry)", layer, spec, bounds)
             log.debug("mapdata %s %s: index %.2f s, plan %.2f s, query %.2f s", layer, cell, t1 - t0, t2 - t1,
                       time.perf_counter() - t2)
             return out
@@ -547,6 +570,42 @@ class Reader:
                     con.execute(f"DROP TABLE IF EXISTS {t}")
                 except Exception:   # (the connection is unusable: a new one next time)
                     self._local.con = None
+
+    def fetch_only(self, layer, cell, kind="prefetch"):
+        """Only the network part of query(): the bytes it will read (footers, bbox columns, the columns of the row
+        groups that hold the cell's rows) into the block cache, no rows read, nothing decoded or stored. The map data
+        ahead of the player on a machine that builds none ahead (mapdata.WARM_THREADS 0: 8 CPUs or fewer) waited on
+        its downloads (Oregon's buckets: 3-4 round trips a new file) in the block's own build (the I/O audit,
+        2026-10-26). Raises what the fetches raised (netfetch.Deferred for a refused prefetch)."""
+        spec = LAYERS[layer]
+        bounds = cell.bounds()
+        hits = self.index.files(spec["theme"], spec["type"], bounds, kind)
+        if not hits:
+            return
+        files = {f"{spec['theme']}/{spec['type']}/{name}": self._remote(spec["theme"], spec["type"], name, urls, size)
+                 for name, urls, size in hits}
+        if self.shards_ok:          # (the row groups' boxes, kept: no per-cell bbox query, and none for a shard)
+            con = LazyConnection(self, files, kind)
+            try:
+                self._shard_plan(con, con.proto, sorted(files), files, spec, bounds, kind, write=False)
+            except Exception as e:
+                real = self._real_error(e, con.errors)
+                if real is not e:
+                    raise real from e
+                raise
+            finally:
+                con.close()
+            return
+        con, proto, errors = self._connect(files, kind)
+        try:
+            self._plan(con, proto, sorted(files), files, spec, bounds, kind)
+        except Exception as e:
+            real = next((x for x in errors if isinstance(x, (netfetch.FetchError, rangeread.RangeError))), None)
+            if real is not None and real is not e:
+                raise real from e
+            raise
+        finally:
+            con.close()
 
     # --- fetch planning ------------------------------------------------------------------------
     def _parallel(self, tasks):
@@ -595,12 +654,25 @@ class Reader:
         new = [p for p in new if p not in disk]
         parsed = {}
         if new:
-            def footer(r):              # the last 8 bytes: footer length + "PAR1"
-                tail = r.read(max(0, r.size - FOOTER_GUESS), r.size, kind)
+            def footer(path, r):            # the last 8 bytes: footer length + "PAR1"
+                kind_dir = path.rsplit("/", 1)[0]
+                guess = FOOTER_GUESS
+                if FOOTER_LEARN:
+                    with self._lock:
+                        known, ratio = self._footer_len.get(path), self._footer_ratio.get(kind_dir)
+                    if known is not None:       # (its exact footer: a learnt guess never reads more of a file it read)
+                        guess = known
+                    elif ratio is not None:
+                        guess = int(min(FOOTER_MAX, max(FOOTER_MIN, ratio * FOOTER_PAD * r.size)))
+                tail = r.read(max(0, r.size - guess), r.size, kind)
                 n = int.from_bytes(tail[-8:-4], "little")
+                if FOOTER_LEARN and r.size:
+                    with self._lock:
+                        self._footer_ratio[kind_dir] = max(self._footer_ratio.get(kind_dir, 0.0), (n + 8) / r.size)
+                        self._footer_len[path] = n + 8
                 if n + 8 > len(tail):
                     r.read(r.size - n - 8, r.size, kind)
-            self._parallel([lambda r=files[p]: footer(r) for p in new])
+            self._parallel([lambda p=p: footer(p, files[p]) for p in new])
             meta = con.execute(f"""SELECT file_name, row_group_id, row_group_num_rows, path_in_schema, stats_min,
                 stats_max, dictionary_page_offset, data_page_offset, total_compressed_size
                 FROM parquet_metadata([{", ".join(f"'{proto}://{p}'" for p in new)}])
@@ -645,9 +717,9 @@ class Reader:
     def _used(spec):
         return set(re.findall(r"[A-Za-z_]+", spec["cols"] + " " + spec.get("extra", ""))) | BASE_COLUMNS
 
-    def _shard_plan(self, con, proto, paths, files, spec, bounds, kind):
+    def _shard_plan(self, con, proto, paths, files, spec, bounds, kind, write=True):
         """The local shards of the row groups that hold a feature of the cell (built here when missing), [] when none
-        does."""
+        does. write=False: only the bytes of the missing ones fetched (fetch_only)."""
         groups = self._groups(con, proto, paths, files, kind)
         rgs = [RowGroup((p, rg), files[p], f"'{proto}://{p}'", p, rg, groups[(p, rg)]["first"], groups[(p, rg)]["n"],
                         groups[(p, rg)]["cols"]) for p, rg in self._candidates(groups, bounds)]
@@ -658,8 +730,8 @@ class Reader:
         if not rgs:
             return []
         present = {c for g in rgs for c in g.cols}
-        shards = self.shards(con, files, rgs, sorted(self._used(spec) & present), kind)
-        return [shards[g.key] for g in rgs]
+        shards = self.shards(con, files, rgs, sorted(self._used(spec) & present), kind, write=write)
+        return [shards[g.key] for g in rgs if g.key in shards]
 
     # --- row-group shards (SHARDS) --------------------------------------------------------------
     @staticmethod
@@ -743,10 +815,11 @@ class Reader:
                 lk = self._shard_locks[path] = threading.Lock()
             return lk
 
-    def shards(self, con, files, rgs, columns, kind, src_row=False):
+    def shards(self, con, files, rgs, columns, kind, src_row=False, write=True):
         """{key: local shard path} of the row groups (RowGroup list), with these top-level columns (and the source's
         file_row_number as src_row): the missing ones fetched (in parallel) and written here, once per machine
-        (xproc: another process writing one is waited for)."""
+        (xproc: another process writing one is waited for). write=False: the missing ones only fetched (and left
+        out)."""
         tag = "%d-%08x" % (SHARD_VERSION, _crc(json.dumps([sorted(columns), bool(src_row)])))
         out, todo = {}, []
         for g in rgs:
@@ -762,6 +835,8 @@ class Reader:
             for c in columns:
                 want.setdefault(g.path, []).extend(g.cols.get(c, []))
         self._fetch(files, want, kind)
+        if not write:
+            return out
         con.execute("SET enable_geoparquet_conversion = false")    # (the geometry as its WKB bytes)
         for g, path in todo:
             with self._shard_lock(path):

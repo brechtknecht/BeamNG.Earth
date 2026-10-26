@@ -7,6 +7,7 @@ import os
 import sys
 import tempfile
 import math
+import time
 import unittest
 
 import numpy as np
@@ -838,6 +839,59 @@ class TrackerTest(unittest.TestCase):
         asyncio.run(go())
         self.assertEqual(built.count((0, 0)), 2)
         self.assertIn((1, "0_0"), {(m["anchorId"], m["key"]) for m in conn.sent if m["type"] == "roads_tile"})
+
+    def test_not_ready_and_region_graded_tiles(self):
+        """A tile whose plans another process makes comes back NotReady and is asked again after NOT_READY_S (not
+        waited for in a road process); one graded from region plans is checked against the whole plans later (build
+        verify=True) and sent again only when it came out otherwise."""
+        from unittest import mock
+        conn = FakeConn()
+        tr = roads.Tracker()
+        calls = []
+        state = {"ready": False, "same": {(0, 0)}}
+
+        def build(aid, tx, ty, verify=False):
+            calls.append((tx, ty, verify))
+            if verify:
+                if not state["ready"]:
+                    raise roads.NotReady("whole plans not made")
+                return roads.UNCHANGED if (tx, ty) in state["same"] else (f"/p/{aid}_{tx}_{ty}b", 1)
+            if (tx, ty) == (1, 1) and not state["ready"]:
+                raise roads.NotReady("being made elsewhere")
+            return (f"/p/{aid}_{tx}_{ty}", 1, (tx, ty) in ((0, 0), (0, 1)))
+        clock = [1000.0]
+
+        class Clock:            # (the Tracker's clock only: asyncio's own runs on)
+            def __getattr__(self, name):
+                return getattr(time, name)
+
+            def monotonic(self):
+                return clock[0]
+
+        async def go(n=40):
+            loop = asyncio.get_running_loop()
+            with mock.patch.object(roads, "time", Clock()):
+                for _ in range(n):
+                    tr.on_pose(conn, 1, 0.0, 0.0, loop, build)
+                    await asyncio.sleep(0.01)
+        asyncio.run(go())
+        self.assertNotIn((1, 1), tr.sent)
+        self.assertEqual(set(tr.regioned), {(0, 0), (0, 1)})
+        self.assertFalse([c for c in calls if c[2]], "not checked before VERIFY_AFTER_S")
+        clock[0] += roads.NOT_READY_S + 0.1
+        asyncio.run(go(5))
+        self.assertEqual(calls.count((1, 1, False)), 2, "asked again after NOT_READY_S, once")
+        clock[0] += roads.VERIFY_AFTER_S
+        asyncio.run(go(5))
+        self.assertTrue([c for c in calls if c[2]], "checked")
+        self.assertEqual(set(tr.regioned), {(0, 0), (0, 1)}, "kept while the whole plans are not made")
+        state["ready"] = True
+        clock[0] += roads.VERIFY_RETRY_S
+        sent0 = len(conn.sent)
+        asyncio.run(go(10))
+        self.assertEqual(tr.regioned, {})
+        again = [m for m in conn.sent[sent0:] if m["type"] == "roads_tile"]
+        self.assertEqual([m["key"] for m in again if m["path"].endswith("b")], ["0_1"], "only the one that differs")
 
     def test_a_tile_failing_again_and_again_is_logged(self):
         # (GitHub #91) network errors are expected and retried quietly, but a tile that never comes left no trace

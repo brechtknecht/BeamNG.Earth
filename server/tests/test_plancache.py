@@ -123,6 +123,22 @@ class PlanCacheTest(unittest.TestCase):
         locks = [n for _r, _d, fs in os.walk(self.dir) for n in fs if n.endswith(".lock")]
         self.assertEqual(locks, [], "its lock released")
 
+    def test_region_plans_round_trip(self):
+        f = features([[(-300, 20), (300, 20)], [(0, -300), (0, 300)]], ["residential", "secondary"])
+        g = self.grader(FakeMD(f))
+        got = g._make_cell(KEY, (-100.0, -100.0, 100.0, 100.0))
+        pc = g.shared
+        self.assertTrue(pc.store_region(KEY, (-100.4, -100.0, 100.0, 100.6), got, ["14/1/2"]))
+        self.assertIsNone(pc.region(KEY, (-200.0, -50.0, 50.0, 50.0)), "not within its box")
+        self.assertIsNone(pc.region((14, 4000, 6001), (-50.0, -50.0, 50.0, 50.0)), "another cell")
+        box, back, missed = pc.region(KEY, (-50.0, -50.0, 50.0, 50.0))
+        self.assertEqual(box, (-100.4, -100.0, 100.0, 100.6))
+        self.assertEqual(missed, ["14/1/2"])
+        self.assertEqual([fid for fid, _p in back[0]], [fid for fid, _p in got[0]])
+        for (_f, p), (_g, q) in zip(back[0], got[0]):
+            self.assertTrue(np.array_equal(p.xy, q.xy) and np.array_equal(p.z, q.z))
+        self.assertIsNone(pc.load(KEY), "not the cell's whole plans")
+
     def test_prune_old_runs(self):
         root = os.path.join(self.dir, "plans")
         for run in ("old", "new"):

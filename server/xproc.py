@@ -13,16 +13,70 @@ a background fetch or a road tile's process below it. A lock older than STALE_S 
 wait longer than wait_s does the work itself.
 """
 import os
+import threading
 import time
 
 STALE_S = 120.0
 POLL_S = 0.05
 PRIORITY = 0                # this process's niceness above the server's (blockworker.init's nice)
 KIND_RANK = {"urgent": 0, "demand": 1, "prefetch": 2, "background": 3, "predownload": 4}
+# Where niceness exists (os.nice): a process skips a lock held by a less favoured one, which runs slower. On Windows
+# every server process runs at one priority (no os.nice), so the holder is as fast as the one asking, and doing the
+# work twice only halved both (the CPU audit, 2026-10-26): there only the request kind counts.
+NICE_RANKS = hasattr(os, "nice") and os.environ.get("BNGE_XPROC_NICE", "1") != "0"
+# The holder's heartbeat (2026-10-26): every HEARTBEAT_S the process touches the locks it holds, so a lock is stale
+# only when its process stopped touching it, not after STALE_S of honest work (a fresh place's cell plans took up to
+# 87 s on 4 cores, longer on a game PC's 2 server cores), and a waiter past wait_s keeps waiting for a holder that is
+# alive (at most LIVE_WAIT_X times wait_s) instead of doing the same work again. BNGE_XPROC_BEAT=0: as before.
+BEAT_ON = os.environ.get("BNGE_XPROC_BEAT", "1") != "0"
+HEARTBEAT_S = 5.0
+LIVE_S = 20.0               # a lock touched this recently has a live holder (BEAT_ON)
+LIVE_WAIT_X = 3.0
+HOLD_MAX_S = 900.0          # a lock held longer is no longer touched (a holder that never released it)
+_held = {}                  # lock path -> monotonic time taken (this process's)
+_held_lock = threading.Lock()
+_beat = None
 
 
 def _rank(kind):
-    return KIND_RANK.get(kind, 1), int(PRIORITY)
+    return KIND_RANK.get(kind, 1), int(PRIORITY) if NICE_RANKS else 0
+
+
+def _beating():
+    while True:
+        time.sleep(HEARTBEAT_S)
+        now = time.monotonic()
+        with _held_lock:
+            locks = [lk for lk, t in _held.items() if now - t < HOLD_MAX_S]
+        for lk in locks:
+            try:
+                os.utime(lk, None)
+            except OSError:
+                pass
+
+
+def _hold(lock):
+    global _beat
+    if not BEAT_ON:
+        return
+    with _held_lock:
+        _held[lock] = time.monotonic()
+        if _beat is None:
+            _beat = threading.Thread(target=_beating, daemon=True, name="xproc-beat")
+            _beat.start()
+
+
+def _live(lock):
+    """Whether lock's holder touched it within LIVE_S (heartbeat)."""
+    try:
+        return time.time() - os.path.getmtime(lock) <= LIVE_S
+    except OSError:
+        return False
+
+
+def stale_s():
+    """Seconds after which an untouched lock's holder counts as gone."""
+    return LIVE_S * 3 if BEAT_ON else STALE_S
 
 
 def take(lock, kind="demand"):
@@ -34,7 +88,7 @@ def take(lock, kind="demand"):
             fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
         except FileExistsError:
             try:
-                if time.time() - os.path.getmtime(lock) > STALE_S:
+                if time.time() - os.path.getmtime(lock) > stale_s():
                     os.remove(lock)         # its process died doing it
                     continue
             except OSError:
@@ -46,6 +100,7 @@ def take(lock, kind="demand"):
             os.write(fd, ("%d %d" % _rank(kind)).encode())
         finally:
             os.close(fd)
+        _hold(lock)
         return True
     return False
 
@@ -82,7 +137,8 @@ def once(lock, ready, wait_s, kind="demand", on_wait=None):
             waited = True
             if on_wait is not None:
                 on_wait()
-        if time.monotonic() - t0 > wait_s:
+        waited_s = time.monotonic() - t0
+        if waited_s > wait_s and not (BEAT_ON and waited_s < wait_s * LIVE_WAIT_X and _live(lock)):
             return None, False
         time.sleep(POLL_S)
         got = ready()
@@ -91,6 +147,8 @@ def once(lock, ready, wait_s, kind="demand", on_wait=None):
 
 
 def release(lock):
+    with _held_lock:
+        _held.pop(lock, None)
     try:
         os.remove(lock)
     except OSError:

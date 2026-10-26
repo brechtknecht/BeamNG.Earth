@@ -153,6 +153,37 @@ class OsmTags:
                 self._forget()
         return {}, []
 
+    def fetch_only(self, bounds, kind="prefetch"):
+        """Only the network part of cell(): the tag columns of the row groups that touch bounds into the block cache
+        (overture.Reader.fetch_only; the raceways' geometry is left to cell())."""
+        etag, remote = self.version(kind)
+        rd = self._reader
+        files = {PATH: remote}
+        con = overture.LazyConnection(rd, files, kind)
+        errors = con.errors
+        try:
+            uri = f"'{con.proto}://{PATH}'"
+            groups = self._groups(con, uri, remote, kind)
+            cand = self._candidates(groups, bounds)
+            if rd.shards_ok:        # (the candidates' boxes, kept; the bytes of the missing shards only)
+                rgs = [overture.RowGroup(rg, remote, uri, PATH, rg, groups[rg]["first"], groups[rg]["n"],
+                                         groups[rg]["cols"]) for rg in cand]
+                boxes = rd.boxes(con, files, rgs, kind)
+                rgs = [g for g in rgs if overture.box_hit(boxes.get(g.key), bounds)]
+                present = {c for g in rgs for c in g.cols}
+                rd.shards(con, files, rgs, sorted((USED | {"highway"}) & present), kind, src_row=True, write=False)
+                return
+            want = {c for rg in cand for c in groups[rg]["cols"] if c in USED or c == "highway"}
+            rd._fetch(files, {PATH: [r for rg in cand for c, rs in groups[rg]["cols"].items() if c in want
+                                     for r in rs]}, kind)
+        except Exception as e:
+            real = next((x for x in errors if isinstance(x, (netfetch.FetchError, rangeread.RangeError))), None)
+            if real is not None and real is not e:
+                raise real from e
+            raise
+        finally:
+            con.close()
+
     def _groups(self, con, uri, remote, kind):
         """{row group: {"first", "n", "bbox": {leaf: (min, max)}, "cols": {column: [byte ranges]}}} of the file,
         parsed once per version (0.6 s of every cell's two queries, 2026-10-22: Central Park's first block waited
