@@ -2231,7 +2231,14 @@ function M.updatePhotoless()
     want = ground.photoless
     if not want and st.clock >= (st.photolessCheckAt or -1) then
       st.photolessCheckAt = st.clock + M.PHOTOLESS_CHECK_S
-      want = farfield.tilesCoverBlock()
+      local share
+      want, share = farfield.tilesCoverBlock()
+      local b = st.block
+      if st.photolessLog ~= b then -- once a block: its tile cover when it came without its photo (the drive's log)
+        st.photolessLog = b
+        log('I', 'beamngEarth', string.format('block %d,%d without its photo: far tiles cover %d %%%s', b.cx, b.cy,
+          math.floor(share * 100 + 0.5), want and ', they stand in' or ' (stand in once they cover it all)'))
+      end
     end
   end
   if want == ground.photoless then return want end

@@ -920,15 +920,16 @@ end
 
 function M.photoless() return photoless end
 
--- Is the committed block's whole footprint shown by loaded tiles with their own aerial texture at L0 or finer
--- (graded like the block there, so the roads and trees on it still sit on them)? Checked on the 64 m grid.
-M.PHOTOLESS_MAX_LEVEL = 0
+-- Is the committed block's whole footprint shown by loaded tiles with their own aerial texture (64 m grid)? Also
+-- the share covered. The tiles under the block are L-1 and graded like it (levels <= 0), so the roads and trees on
+-- it still sit on them; coarser ones (ungraded) only fill its edges, where the server's L-1 split is still coming.
+M.PHOTOLESS_MAX_LEVEL = 2
 function M.tilesCoverBlock()
   local b = block
-  if not b then return false end
+  if not b then return false, 0 end
   local S = 64
   local nx, ny = floor((b.x1 - b.x0) / S + 0.5), floor((b.y1 - b.y0) / S + 0.5)
-  if nx < 1 or ny < 1 then return false end
+  if nx < 1 or ny < 1 then return false, 0 end
   local hit, n = {}, 0
   for _, inst in pairs(live) do
     if inst.id and inst.material and not inst.failed and not inst.doomed and inst.level <= M.PHOTOLESS_MAX_LEVEL
@@ -946,7 +947,7 @@ function M.tilesCoverBlock()
       end
     end
   end
-  return n == nx * ny
+  return n == nx * ny, n / (nx * ny)
 end
 
 -- The terrain block moved (terrain-follow commit frame, after importMaps + setPosition). Covers and

@@ -97,7 +97,8 @@ end
 step()
 farfield.onSwap({ type = 'far_swap', anchorId = 1, id = 4, add = tex, remove = {} })
 step(30)
-T.check(not farfield.tilesCoverBlock(), '[256, 512]² only under an untextured tile: not covered')
+local whole, share = farfield.tilesCoverBlock()
+T.check(not whole and math.abs(share - 60 / 64) < 1e-9, '[256, 512]² only under an untextured tile: 60 of 64 cells covered')
 tex = {}
 for i = 2, 3 do
   for j = 2, 3 do farfield.onTile(texTile(-1, i, j)); tex[#tex + 1] = key(-1, i, j) end
