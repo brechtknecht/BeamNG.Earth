@@ -4824,7 +4824,8 @@ async def main_async(args):
                       args.airports == "on", args.sea == "on", NICE_FAR_BUILDINGS, roadsmod.ROADS_IN_GROUND))
     import budget
     photo_pool = None
-    if block_pools and args.near_visual == "detail" and args.imagery and not budget.small():
+    if (block_pools and args.near_visual == "detail" and args.imagery and not budget.small()
+            and os.environ.get("BNGE_PHOTO_PROC", "1") != "0"):      # 0: photos in the other lane's block process
         photo_pool = poolsmod.RespawningPool(     # detail mode's block photos (blockworker.base_photo)
             "base photo", 1, mp_context=ctx, initializer=blockworker.init,
             initargs=(args.cache_dir, args.offline, args.roads == "on",

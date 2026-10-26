@@ -29,8 +29,11 @@ more blocks ahead do not bring its downloads sooner.
 
 Pure apart from the clock; earthd asks it (Server.quality) at its decisions.
 """
+import os
 import threading
 import time
+
+ON = os.environ.get("BNGE_QUALITY", "1") != "0"     # 0: always level 0 (measured and logged, nothing shed)
 
 LEVELS = 3
 EMA = 0.4               # weight of the newest block in the load's moving average
@@ -86,6 +89,8 @@ class Governor:
             # a block late on its road plans (a fresh place's downloads) is helped by the cores and the lookahead,
             # not by less far field: at most level 1 for it
             top = 1 if plan_s >= PLAN_SHARE * budget else LEVELS
+            if not ON:
+                top = 0
             if (min(self.load, load) > UP_LOAD or load > 1.0) and self.level < top and now - self.step_t >= UP_HOLD_S:
                 self.level += 1
                 self.step_t = now
