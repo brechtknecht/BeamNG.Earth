@@ -409,6 +409,10 @@ SURVEY_ZOOM = 10
 DELTA_MARGIN = 0.1          # m added to measured swap-group deltas (crossings between vertices)
 NICE = 10                   # default niceness of the server process (§4.5)
 NICE_ROADS = 3              # the road tile workers' niceness on top of it (blockworker.init: the terrain blocks first)
+# The prefetch lanes' block processes (blocks ahead of the request, speculative): the server's niceness. BNGE_PREFETCH_NICE=2
+# put them a step below (the stand-in's thread ran ~0.15 s of CPU in its 1-3 s at 300 km/h on 2 cores): no better in two
+# A/B pairs (pauses 13.0 / 12.4 s at 0, 16.8 / 10.8 s at 2, 2026-10-26; the stand-in waited for the interpreter lock).
+NICE_PREFETCH = int(os.environ.get("BNGE_PREFETCH_NICE", "0") or 0)
 NICE_FAR = 6                # the far field's (the scenery far away last)
 NICE_FAR_BUILDINGS = 9      # the far buildings': after the far field (on a Steam Deck's four cores a teleport's far
                             # buildings took ~23 s of CPU, next to the road tiles and the far field)
@@ -706,8 +710,11 @@ class Server:
         # ~20 s behind the old place's on a Deck, 2026-10-23)
         self.urgent_base_pool = ThreadPoolExecutor(2, thread_name_prefix="base-urgent")
         # late follow blocks without their road grading (make_follow_provisional): never behind the graded builds
-        self.prov_pool = ThreadPoolExecutor(1, thread_name_prefix="provisional")
+        # (Windows: a step above the server's other threads, as the request lane's builds: budget.raise_thread)
+        self.prov_pool = ThreadPoolExecutor(1, thread_name_prefix="provisional", initializer=_raise_thread)
         self.prov_est = FOLLOW_PROV_EST_S   # s a provisional follow block takes (measured)
+        self.stand_in_pool = None       # its process (blockworker.stand_in; main: STAND_IN_PROCESS), else built here
+        self.prov_done = OrderedDict()     # the last stand-ins' infos (donors), by block key
         self.base_futs = {}             # block -> its base photo's future while it builds (the provisional shares it)
         self.ground_pool = ThreadPoolExecutor(1, thread_name_prefix="ground-ahead")   # groundahead.py
         # the world map's requests (GPS route, address search, map tiles): their own threads, so a teleport's tile
@@ -1721,13 +1728,30 @@ class Server:
             base = self.base_futs[key] = self.urgent_base_pool.submit(self._base_photo, anchor, cx, cy, None, True)
         urgent = getattr(self.dem, "urgent", None)     # (test DEMs have no lane)
         try:
-            with urgent() if urgent is not None else contextlib.nullcontext():
-                info = self._make_heightmap_here(anchor, cx, cy, None, t0, self.anchor_q(anchor), base,
-                                                 provisional=True, fast=FOLLOW_PROV_FAST)
+            info = None
+            if self.stand_in_pool is not None and FOLLOW_PROV_FAST:
+                try:
+                    info = self.stand_in_pool.submit(
+                        blockworker.stand_in, anchor.id, anchor.lat, anchor.lon, anchor.hm_zoom,
+                        self.anchor_q(anchor), cx, cy, self.layout.block, self.out_dir, self.hm_name(key, True),
+                        self.ter_name(key), self.donors(anchor, cx, cy) if FOLLOW_PROV_DONORS else (),
+                        self.block_fuel_pads(anchor, cx, cy, self.layout.block),
+                        PROVISIONAL_GRADE and self.grading).result(timeout=STAND_IN_TIMEOUT_S)
+                except Exception:       # (its process died or hung: built here)
+                    log.exception("stand-in %s in its process", key)
+                else:
+                    info = self._finish_heightmap(anchor, cx, cy, info, t0, base, FOLLOW_PROV_PHOTO_WAIT_S)
+            if info is None:
+                with urgent() if urgent is not None else contextlib.nullcontext():
+                    info = self._make_heightmap_here(anchor, cx, cy, None, t0, self.anchor_q(anchor), base,
+                                                     provisional=True, fast=FOLLOW_PROV_FAST)
         finally:
             if key not in self.hm_inflight:     # (the graded one done meanwhile: its photo future is not wanted)
                 self.base_futs.pop(key, None)
         dt = time.perf_counter() - t0
+        self.prov_done[key] = info
+        while len(self.prov_done) > FOLLOW_PROV_DONOR_MAX:
+            self.prov_done.popitem(last=False)
         self.prov_est = min(4 * FOLLOW_PROV_EST_S, 0.7 * self.prov_est + 0.3 * dt)
         log.info("provisional follow block %s in %.2f s (%s)", key, dt,
                  " ".join(f"{k} {v:.2f}" for k, v in info.get("stages", {}).items()))
@@ -1847,19 +1871,24 @@ class Server:
                 return roadsmod.block_arch_raise(tun, cell_fn, anchor.frame, la, lo, elev(la, lo),
                                                  (cx - half, cy - half, cx + half, cy + half))
         hm = self.hm_name((anchor.id, cx, cy), provisional)
+        chunks = None if provisional else anchor.chunks
+        if fast and FOLLOW_PROV_DONORS:
+            chunks = self.donor_chunks(anchor, cx, cy)
         info = heightmap.generate(anchor.frame, gen,
                                   os.path.join(self.out_dir, hm), cx, cy, q=q,
-                                  size=self.layout.block, keep=keep, chunks=None if provisional else anchor.chunks,
+                                  size=self.layout.block, keep=keep, chunks=chunks,
                                   ground_at=ground_at)
         stages = {"heights": time.perf_counter() - t0, "grading": grade_s[0], "gradingCpu": grade_s[1],
                   "heightsCpu": time.thread_time() - c0}
+        if getattr(chunks, "donated", 0):
+            stages["donorChunks"] = chunks.donated
         idx = None
         if self.surface is not None:
             # ground models per 2 m sample from the cached land cover and the slope (surface.py);
             # rows flipped as the heightmap's (row 0 = north)
             t1 = time.perf_counter()
             lc, complete = surfacemod.base_chunked(self.surface, anchor.frame, keep["lat"], keep["lon"], cx, cy,
-                                                     self.layout.block, coarse=fast)
+                                                     self.layout.block, getattr(chunks, "landcover", None), coarse=fast)
             idx = surfacemod.slope_rock(lc, keep["u"], heightmap.SQUARE)
             if self.sea is not None and not provisional:    # under water: the bed (no grass through the surface)
                 idx[self.sea.depth(keep["lat"], keep["lon"]) > blockworker.WATER_BED_M] = surfacemod.MUD
@@ -1892,6 +1921,24 @@ class Server:
         if stood_in[0]:
             stages["demStandIn"] = stood_in[0]
         return self._finish_heightmap(anchor, cx, cy, info, t0, base, FOLLOW_PROV_PHOTO_WAIT_S if fast else None)
+
+    def donors(self, anchor, cx, cy):
+        """The graded blocks around (cx, cy) built already, for its stand-in's heights and ground models
+        (blockworker.donor_chunks): [(.ter path, zBase, maxHeight, cx, cy)], at most FOLLOW_PROV_DONOR_MAX, nearest
+        first (the block the car is on, the prefetched ones ahead), overlapping it."""
+        reach = self.layout.block * heightmap.SQUARE
+        # (the last stand-ins too, after the graded ones: at 300 km/h the car drove on stand-ins, and a graded block
+        # was near one stand-in in 19, 2026-10-26)
+        near = sorted((max(abs(k[1] - cx), abs(k[2] - cy)), p, k, info)
+                      for p, blocks in ((0, self.hm), (1, self.prov_done)) for k, info in list(blocks.items())
+                      if k[0] == anchor.id and k[1:] != (cx, cy) and info.get("ter") and info.get("q"))
+        return [(os.path.join(self.out_dir, info["ter"]), info["zBase"], info["maxHeight"], k[1], k[2])
+                for d, _p, k, info in near[:FOLLOW_PROV_DONOR_MAX] if d < reach]
+
+    def donor_chunks(self, anchor, cx, cy):
+        """blockworker.donor_chunks of the donors around (cx, cy), or None."""
+        donors = self.donors(anchor, cx, cy)
+        return blockworker.donor_chunks(anchor.frame, cx, cy, self.layout.block, donors) if donors else None
 
     def tunnels_of(self, anchor, elev, g):
         """anchor.tunnels (roads.TunnelProfiles), made now if not yet (elev: the caller's ground; g: the anchor's
@@ -3014,7 +3061,29 @@ FOLLOW_PROV_EST_S = 3.0     # s a provisional follow block takes, until measured
 # it stood in for; the photo follows as block_base), nor for DEM downloads (its coarser tiles stand in), its land cover
 # every other sample. BNGE_PROVISIONAL_FAST=0: built as the first block's provisional one.
 FOLLOW_PROV_FAST = os.environ.get("BNGE_PROVISIONAL_FAST", "1") != "0"
+
+
+def _raise_thread():
+    """A thread pool's initializer: its threads a step above the server's others (budget.raise_thread; Windows only)."""
+    try:
+        import budget
+        budget.raise_thread()
+    except (OSError, AttributeError) as e:
+        log.debug("thread priority: %s", e)
 FOLLOW_PROV_PHOTO_WAIT_S = 0.0
+# ... and its heights where the graded blocks around (the one the car is on, the prefetched ones) have them already
+# (Server.donor_chunks). BNGE_PROVISIONAL_DONORS=0: all computed.
+FOLLOW_PROV_DONORS = os.environ.get("BNGE_PROVISIONAL_DONORS", "1") != "0"
+FOLLOW_PROV_DONOR_MAX = 3
+# ... built in a process of its own (blockworker.stand_in): in this one its thread waited for the interpreter lock
+# behind ~20 busy threads (heights: 0.1 s of CPU in 1-4 s at 300 km/h on 2 cores, 2026-10-26; a numpy loop of 25 ms
+# took 5.8 s next to six busy threads here, 16 ms in another process). BNGE_STANDIN_PROCESS=0: in this one.
+STAND_IN_PROCESS = os.environ.get("BNGE_STANDIN_PROCESS", "1") != "0"
+STAND_IN_TIMEOUT_S = 60.0
+# The interpreter lock's switch interval in ms (Python's: 5): a thread that gave it up (numpy, a file) waits up to this
+# long per busy thread to get it back - a numpy loop of 25 ms took 5.8 s next to six busy threads at 5 ms, 1.2 s at 1
+# (2026-10-26). 0: Python's own.
+SWITCH_MS = float(os.environ.get("BNGE_SWITCH_MS", "0") or 0)
 FOLLOW_PROV_MIN_V = 2.0     # m/s: slower, a block is late only for a car standing ...
 FOLLOW_PROV_HELD_M = 40.0   # ... this close to a stop line (the edge guard holds it there)
 FOLLOW_PROV_CHECK_S = 0.25  # a waiting follow request looks at the clock this often
@@ -4888,6 +4957,8 @@ async def main_async(args):
     mapdata = (mapdatamod.MapData(args.cache_dir, fetcher=net)
                if "on" in (args.surface, args.roads, args.sea, args.trees) else None)
     pacer.DUTY = args.background_duty
+    if SWITCH_MS:       # (BNGE_SWITCH_MS) the interpreter lock handed between this process's threads this often
+        sys.setswitchinterval(SWITCH_MS / 1000.0)
     global DETAIL_RING_M, AHEAD_ON, ROUTE_AHEAD_ON, ROUTE_AHEAD_MAX_M
     DETAIL_RING_M = args.detail_ring
     AHEAD_ON = args.download_ahead == "on"
@@ -4908,7 +4979,7 @@ async def main_async(args):
                           args.grading == "on" and args.roads == "on",
                           args.road_widths == "on" and args.roads == "on", args.surface == "on", warm_q,
                           logging.getLogger().level, args.airports == "on", args.sea == "on",
-                          -1 if lane == LANE_REQUEST else 0,
+                          -1 if lane == LANE_REQUEST else NICE_PREFETCH,
                           roadsmod.ROADS_IN_GROUND, args.gas_stations == "on" and args.roads == "on")), warm_q))
         far_pool = poolsmod.RespawningPool(
             "far tile", args.workers, mp_context=ctx, initializer=blockworker.init,
@@ -4982,6 +5053,15 @@ async def main_async(args):
                     far_bld_pool=far_bld_pool, photo_pool=photo_pool,
                     sea=seacarvemod.SeaCarver(mapdata, args.cache_dir) if args.sea == "on" else None,
                     vegetation=(vegetationmod.Vegetation(mapdata, args.cache_dir) if args.trees == "on" else None))
+    if block_pools and STAND_IN_PROCESS:
+        server.stand_in_pool = poolsmod.RespawningPool(   # late follow blocks' stand-ins (blockworker.stand_in)
+            "stand-in", 1, mp_context=ctx, initializer=blockworker.init,
+            initargs=(args.cache_dir, args.offline, args.roads == "on",
+                      args.grading == "on" and args.roads == "on",
+                      args.road_widths == "on" and args.roads == "on", args.surface == "on", ctx.Queue(maxsize=1),
+                      logging.getLogger().level, args.airports == "on", args.sea == "on", -1,
+                      roadsmod.ROADS_IN_GROUND, args.gas_stations == "on" and args.roads == "on"))
+        server.stand_in_pool.submit(blockworker.ready)      # (started now: not with the first late block)
     server.update_check = args.update_check == "on"
     server.lod_px = args.lod_px
 

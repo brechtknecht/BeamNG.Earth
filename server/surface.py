@@ -172,6 +172,11 @@ class LandcoverChunks:
 _LC_CHUNKS = LandcoverChunks()
 
 
+def frame_tag(frame):
+    """The frame's part of a LandcoverChunks key."""
+    return round(float(frame.lat0), 9), round(float(frame.lon0), 9)
+
+
 def base_chunked(surface, frame, lat, lon, cx, cy, size, cache=None, coarse=False):
     """(base_index of the samples (lat, lon: [row j, col i] of the size² block centred (cx, cy) in frame), complete):
     surface.classes and base_index only for the chunks not kept from an earlier block of the same frame. coarse (a
@@ -186,7 +191,7 @@ def base_chunked(surface, frame, lat, lon, cx, cy, size, cache=None, coarse=Fals
             return b.repeat(2, 0).repeat(2, 1)[:lat.shape[0], :lat.shape[1]], complete
         classes, complete = surface.classes(lat, lon)
         return base_index(classes, lat, lon), complete
-    tag = (round(float(frame.lat0), 9), round(float(frame.lon0), 9))
+    tag = frame_tag(frame)
     nc = size // ch
     out = np.empty((size, size), np.uint8)
     missing = []

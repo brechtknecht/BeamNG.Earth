@@ -174,5 +174,89 @@ class DropBuildTest(unittest.TestCase):
         self.assertEqual(s.hm_dropped, set())
 
 
+class StandInTest(unittest.TestCase):
+    """blockworker.stand_in: the stand-in built in a process of its own, its heights the donors' where they overlap."""
+
+    def test_heights_from_dem_and_donor(self):
+        import numpy as np
+        import blockworker
+        import heightmap
+        size = 512
+
+        class Dem:
+            def sample_local(self, la, lo, zoom):
+                return np.full(np.shape(la), 12.0), 0
+        old = blockworker._s
+        blockworker._s = SimpleNamespace(dem=Dem(), airports=None, surface=None, anchor=lambda *a: (None, None))
+        self.addCleanup(setattr, blockworker, "_s", old)
+        with tempfile.TemporaryDirectory() as d:
+            xs, ys = heightmap.sample_coords(0.0, 0.0, size)
+            u = 30.0 + 0.01 * xs[None, :] + 0.02 * ys[:, None]
+            q, zb, mh, qgrid = heightmap.write_png(os.path.join(d, "hm.png"), u)
+            heightmap.write_ter(os.path.join(d, "old.ter"), qgrid, None, ["dirt"])
+            info = blockworker.stand_in(1, 52.2, 13.5, 14, 0.01, 0.0, 384.0, size, d, "hm_1_0_384_p.png", "new.ter",
+                                        [(os.path.join(d, "old.ter"), zb, mh, 0.0, 0.0)])
+            self.assertEqual(info["hm"], "hm_1_0_384_p.png")
+            self.assertEqual(info["stages"]["donorChunks"], 40)
+            self.assertTrue(os.path.exists(os.path.join(d, info["ter"])))
+            with open(os.path.join(d, info["ter"]), "rb") as f:
+                f.read(5)
+                got = heightmap.heights(np.frombuffer(f.read(2 * size * size), "<u2").reshape(size, size),
+                                        info["zBase"], info["maxHeight"])
+            ch = heightmap.CHUNK
+            stored = heightmap.heights(qgrid, zb, mh)
+            np.testing.assert_allclose(got[0:5 * ch], stored[3 * ch:8 * ch], atol=0.1)    # the old block's rows 3-7
+            np.testing.assert_allclose(got[5 * ch + 1:], 12.0, atol=0.1)                  # north of it: the DEM
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class DonorChunksTest(unittest.TestCase):
+    """Server.donor_chunks: a stand-in's heights from the graded blocks around (their .ter), chunk for chunk."""
+
+    def test_overlap_from_the_graded_block(self):
+        import numpy as np
+        import heightmap
+        from collections import OrderedDict
+        size = 512
+        with tempfile.TemporaryDirectory() as d:
+            xs, ys = heightmap.sample_coords(0.0, 0.0, size)
+            u = 30.0 + 0.01 * xs[None, :] + 0.02 * ys[:, None]       # [gy, gx], row 0 south
+            q, zb, mh, qgrid = heightmap.write_png(os.path.join(d, "hm.png"), u)
+            import surface as sf
+            idx = np.full((size, size), sf.DIRT, np.uint8)
+            idx[:, 256:] = sf.ROCK
+            idx[300:304, 300:304] = heightmap.TER_HOLE           # a tunnel mouth
+            sf.write_ter(d, "old.ter", qgrid, np.where(idx == heightmap.TER_HOLE, sf.DIRT, idx))
+            raw = bytearray(open(os.path.join(d, "old.ter"), "rb").read())     # (write_ter keeps no holes inside)
+            lay = np.frombuffer(raw, np.uint8, size * size, 5 + 2 * size * size).reshape(size, size).copy()
+            lay[300:304, 300:304] = heightmap.TER_HOLE
+            raw[5 + 2 * size * size:5 + 3 * size * size] = lay.tobytes()
+            open(os.path.join(d, "old.ter"), "wb").write(bytes(raw))
+            s = SimpleNamespace(layout=SimpleNamespace(block=size), out_dir=d, hm=OrderedDict(
+                {(1, 0.0, 0.0): {"ter": "old.ter", "q": q, "zBase": zb, "maxHeight": mh},
+                 (2, 0.0, 0.0): {"ter": "other-anchor.ter", "q": q, "zBase": zb, "maxHeight": mh}}))
+            import geodesy
+            anchor = SimpleNamespace(id=1, frame=geodesy.EnuFrame(52.2, 13.5))
+            s.donors = lambda *a: earthd.Server.donors(s, *a)
+            s.prov_done = OrderedDict()
+            got = earthd.Server.donor_chunks(s, anchor, 0.0, 384.0)     # moved 384 m north: 5 of 8 chunk rows shared
+            self.assertEqual(got.donated, 8 * 5)
+            ch = heightmap.CHUNK
+            stored = heightmap.heights(qgrid, zb, mh)
+            k0x, k0y = heightmap.lattice_index(0.0, size) // ch, heightmap.lattice_index(384.0, size) // ch
+            c = got.get((k0x + 2, k0y + 1))            # the new block's chunk row 1 = the old one's row 4
+            np.testing.assert_array_equal(c, stored[4 * ch:5 * ch, 2 * ch:3 * ch])
+            self.assertIsNone(got.get((k0x, k0y + 5)), "north of the old block: computed")
+            tag = sf.frame_tag(anchor.frame)
+            lc = got.landcover.get((tag, k0x + 5, k0y + 1))      # old chunk (5, 4): rock
+            self.assertTrue((lc == sf.ROCK).all())
+            self.assertTrue((got.landcover.get((tag, k0x + 2, k0y + 1)) == sf.DIRT).all())
+            self.assertIsNone(got.landcover.get((tag, k0x + 0, k0y + 1)), "the old edge ring's holes: computed")
+            self.assertIsNone(got.landcover.get((tag, k0x + 4, k0y + 1)), "a tunnel mouth's holes: computed")
+            self.assertEqual(len(got.landcover.chunks), 4 * 6 - 1)     # not the edge ring (side columns, top row), not the mouth
+            self.assertIsNone(earthd.Server.donor_chunks(s, anchor, 0.0, 1024.0), "no overlap: none")
+            s.prov_done[(1, 0.0, 768.0)] = s.hm.pop((1, 0.0, 0.0))        # a stand-in's .ter: a donor too
+            self.assertEqual(earthd.Server.donor_chunks(s, anchor, 0.0, 1024.0).donated, 8 * 6)
