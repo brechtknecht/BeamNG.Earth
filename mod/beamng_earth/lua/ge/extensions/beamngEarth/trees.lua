@@ -863,6 +863,11 @@ end
 -- Tree work every EVERY_N-th frame, N times the items: a frame with any Forest change costs the engine's tick a few
 -- ms whatever the count (2026-10-15, 100 mph forest drive: tick 3.5 -> 1.65 ms a frame on average, 50 -> 54 fps)
 M.EVERY_N = 3
+-- ... and at most WORK_MS of wall time in a work frame (looked at every 32 rows; 0 = no cap): its 750 items at the
+-- ~19 us probed in game made a ~14 ms bump every 3rd frame, a regular one the dt filter passes (Felix 2026-10-26,
+-- "lehmig"; the collision thread's replay: a work frame's p50 2.6 ms, so the cap trims the peaks only)
+M.WORK_MS = 6
+local workT0 = 0
 local frameN = 0
 -- the order's sort: by class, then pathKey (a module function: one made per call kept LuaJIT from compiling update)
 local function byClassThenPath(a, b)
@@ -889,6 +894,7 @@ function M.update(anchorId, player, view, gov)
   end
   if frameN % M.EVERY_N ~= 0 then return end
   local budget = M.PER_FRAME * M.EVERY_N
+  workT0 = now()
   M.lastShapeItems = touchedItems        -- the previous frame's (diagnostics)
   touched, touchedItems = {}, 0
   coldBase, coldSpell = 0, 0
@@ -1018,6 +1024,7 @@ function M.update(anchorId, player, view, gov)
       rowsScanned = rowsScanned + nrows
       for k = 1, nrows do
         local i = k > n1 and more[k - n1] or idxs and idxs[k] or k
+        if k % 32 == 0 and M.WORK_MS > 0 and now() - workT0 >= M.WORK_MS then budget = 0 end
         if budget <= 0 then          -- (the rest another frame)
           for k2 = k, nrows do left[#left + 1] = k2 > n1 and more[k2 - n1] or idxs and idxs[k2] or k2 end
           break
@@ -1085,6 +1092,7 @@ function M.clear()
   end
   expireWarm(frameN, true)
   tiles, frameN = {}, 0
+  clock = nil             -- (a new one at the next use)
 end
 
 -- Level end: the level deletes its objects itself.

@@ -1955,8 +1955,9 @@ local function onUpdate(dtReal, dtSim)
     M.updatePhotoless()
     t = mark('far', t)
     sea.update(st.anchorId, st.player)
+    t = mark('sea', t)
     trees.update(st.anchorId, st.player, M.viewAway(), gov)
-    t = mark('sea+trees', t)
+    t = mark('trees', t)
     local pb = nil
     if st.block then
       pb = st.parkBox or {}

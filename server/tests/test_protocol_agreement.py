@@ -176,7 +176,6 @@ SERVER_TO_MOD = {
               # the world map's credits for its view: [[credit, w, s, e, n] or [credit]] per imagery source, and
               # the rest (weather, elevation); with imagery on only
               "imageryCredits": F(list, OPT), "otherCredits": F(str, OPT),
-              "terrainBaseTex": F(int, OPT),    # A/B BNGE_TERRAIN_BASE_TEX only: the block's baseTexSize
               "grassSpread": F(int, OPT)},      # BNGE_GRASS_SPREAD only: frames a swap's grass rebuild is spread over
     "status": {"text": F(str),
                "backlog": F(int),           # v1.4 M0: desired - shown far tiles of the current anchor

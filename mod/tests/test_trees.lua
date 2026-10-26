@@ -431,4 +431,22 @@ for _ = 1, 30 do trees.update(22, { x = 50, y = 50 }, nil, { heavyPending = true
 T.check(count() == n0 + 100, 'YIELD off: made regardless')
 trees.YIELD = true
 trees.clear()
+-- a work frame stops after WORK_MS (looked at every 32 rows): the rest another frame
+do
+  local w0 = trees.WORK_MS
+  trees.WORK_MS = 1e-9
+  trees.clear()
+  local n0 = count()
+  trees.onTile({ anchorId = 23, key = '0_0', path = '/t/v.json', n = 100 }, 23)
+  local made = {}
+  for _ = 1, 40 do
+    trees.update(23, { x = 50, y = 50 })
+    made[#made + 1] = count() - n0
+  end
+  local most = 0
+  for k = 2, #made do most = math.max(most, made[k] - made[k - 1]) end
+  T.check(most > 0 and most <= 32 and made[#made] >= 100, 'capped: at most 32 a work frame, all of them in the end: ' .. most .. ' / ' .. made[#made])
+  trees.WORK_MS = w0
+  trees.clear()
+end
 T.done('test_trees')
