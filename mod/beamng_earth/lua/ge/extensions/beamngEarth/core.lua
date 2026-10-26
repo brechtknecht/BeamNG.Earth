@@ -374,7 +374,7 @@ local function loadBlock(tr)
   local ter = M.TER_SWAP and type(tr.ter) == 'string'
   if ter and terrain.swap(tr.ter, sq, maxH, x, y, tr.zBase, layers, base, tonumber(tr.baseSize)) then
     roads.terrainSwapped()      -- its collision follows by itself next frame: no other rebuild meanwhile
-    groundcover.afterBlockChange()
+    groundcover.afterSwap()     -- (over the next frames: groundcover.SPREAD)
     return true, nil, true
   end
   local ok, err = terrain.load(tr.heightmap, sq, maxH, x, y, tr.zBase, layers, base, tonumber(tr.baseSize))
@@ -626,14 +626,41 @@ local function commitHitchLine(cf)
   local frames = {}
   for i, ms in ipairs(cf.f) do frames[i] = string.format('%.0f', ms) end
   return string.format('terrain commit hitch at %s,%s: frames %s ms (worst #%d: %s) | commit: load %.1f (.ter %s), '
-    .. 'collision %.1f, far cover %.1f ms (%s tiles) | %s, photo %s, %s materials, new: %s',
+    .. 'collision %.1f, far cover %.1f ms (%s tiles) | %s, photo %s, %s materials, new: %s, grass spread %s',
     tostring(cf.at and cf.at[1]), tostring(cf.at and cf.at[2]), table.concat(frames, '/'), wi,
     #parts > 0 and table.concat(parts, ', ') or 'no engine metrics', cf.load or 0,
     cf.ter and string.format('%.1f', cf.ter) or '-', cf.coll or 0, cf.cover or 0, tostring(cf.coverN or '?'),
     cf.swap and 'swap' or 'import', cf.photo and 'new' or 'none', tostring(cf.mats or '?'),
-    cf.fresh and table.concat(cf.fresh, ' ') or 'none')
+    cf.fresh and table.concat(cf.fresh, ' ') or 'none', tostring(cf.spread or 0))
 end
 M.commitHitchLine = commitHitchLine
+
+-- Every SWAP_SUMMARY_N swaps, one line over the last of them (all swaps, not only those over COMMIT_HITCH_MS: an A/B
+-- of the grass spread or the base texture compares these): per frame of the three, p50 / p90 / max ms and the
+-- engine's Render p50 (0 where it was not among the frame's 8 largest).
+M.SWAP_SUMMARY_N = 20
+function M.swapSummaryLine(commits, spreadN)
+  local function pct(xs, p)
+    if #xs == 0 then return 0 end
+    table.sort(xs)
+    return xs[math.max(1, math.min(#xs, math.ceil(p * #xs)))]
+  end
+  local n, parts = 0, {}
+  for i = 1, 3 do
+    local ms, render = {}, {}
+    for _, c in ipairs(commits) do
+      if c.swap and c.f and #c.f >= 3 then
+        ms[#ms + 1] = c.f[i]
+        render[#render + 1] = (c.e and c.e[i] and c.e[i].Render) or 0
+      end
+    end
+    n = #ms
+    parts[i] = string.format('#%d %.0f/%.0f/%.0f (Render %.0f)', i, pct(ms, 0.5), pct(ms, 0.9), pct(ms, 1), pct(render, 0.5))
+  end
+  if n == 0 then return nil end
+  return string.format('terrain swaps (last %d): frames p50/p90/max ms %s | grass spread over %d frames', n,
+    table.concat(parts, ', '), spreadN or 0)
+end
 
 local function logCommitHitch(cf)
   local line = commitHitchLine(cf)
@@ -660,7 +687,8 @@ local function commitTerrain(msg)
   local c = { load = tLoad, coll = tColl - tLoad, cover = sw() - tColl, f = {}, e = {}, swap = swapped or nil,
     coverN = tonumber(coverN), photo = type(msg.base) == 'string',
     ter = ls and ls.apply or nil,   -- the .ter load alone (ms)
-    mats = ls and ls.mats or nil, fresh = ls and ls.fresh or nil, at = { msg.cx, msg.cy } }
+    mats = ls and ls.mats or nil, fresh = ls and ls.fresh or nil, at = { msg.cx, msg.cy },
+    spread = groundcover.spreading() and groundcover.SPREAD or 0 }
   table.insert(st.commits, c)
   if #st.commits > COMMIT_LOG then table.remove(st.commits, 1) end
   st.commitFrames = c
@@ -812,6 +840,8 @@ local function onMessage(msg)
     M.setNearVisual(msg.nearVisual)
     -- (A/B, server BNGE_TERRAIN_BASE_TEX) the block's baked base colour's size; none: the mod's own
     terrain.setBaseTexSize(tonumber(msg.terrainBaseTex))
+    -- (server BNGE_GRASS_SPREAD) frames a block swap's grass rebuild is spread over; none: the mod's own
+    if msg.grassSpread ~= nil then groundcover.setSpread(msg.grassSpread) end
     -- M1h: horizon mode (a server without hello.horizon: the level's sky and 100 km view distance)
     M.setHorizon(msg.horizon == true)
     serverAttribution = (type(msg.attribution) == 'string' and msg.attribution ~= '') and msg.attribution or nil
@@ -1787,6 +1817,7 @@ local function onUpdate(dtReal, dtSim)
   prevMarks, marks = marks, prevMarks
   for k in pairs(marks) do marks[k] = nil end
   local t = hitchClock()
+  groundcover.frame()           -- (a block swap's grass, spread over the frames after it: before this frame can swap)
   postfx.update(st.inOurLevel)
   local stg = rawget(_G, 'beamngEarth_settings')
   if stg and stg.redirectBigMap then stg.redirectBigMap(st.inOurLevel) end
@@ -1821,6 +1852,13 @@ local function onUpdate(dtReal, dtSim)
     if #cf.f >= 3 then
       st.commitFrames = nil
       pcall(logCommitHitch, cf)
+      if cf.swap then
+        st.swapsDone = (st.swapsDone or 0) + 1
+        if st.swapsDone % M.SWAP_SUMMARY_N == 0 then
+          local okS, line = pcall(M.swapSummaryLine, st.commits, groundcover.SPREAD)
+          if okS and line then log('I', 'beamngEarth', line) end
+        end
+      end
       if cf.f[1] and cf.f[1] > COMMIT_SLOW_MS then
         -- a terrain commit's slow first frame (the user's freezes driving through towns, 2026-10-21: 2.7 s of
         -- RenderShadows in one): what it listed, for the log

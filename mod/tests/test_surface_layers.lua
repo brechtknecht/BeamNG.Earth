@@ -99,6 +99,46 @@ do
   end
   T.check(gc.status().objects == #gc.DEFS, 'one object per definition')
   T.check(gc.afterBlockChange() == true and flushes == 1, 'a block change rebuilds the grass in the same tick')
+  -- a block SWAP (follow move): the rebuild spread over the next SPREAD frames, the later groups hidden till theirs
+  do
+    local names = {}
+    for _, d in ipairs(gc.DEFS) do names[#names + 1] = gc.PREFIX .. (d.name or d.src) end
+    local function shown()
+      local n = 0
+      for _, nm in ipairs(names) do if not scenetree.findObject(nm).hidden then n = n + 1 end end
+      return n
+    end
+    T.check(gc.SPREAD == 2, 'spread over 2 frames by default')
+    gc.frame()
+    local f0 = flushes
+    T.check(gc.afterSwap() == true and flushes == f0 and gc.spreading(), 'swap: no flush in its own frame')
+    local hidden1 = #names - shown()
+    T.check(hidden1 > 0 and hidden1 < #names, 'swap: the second group hidden (' .. hidden1 .. ' of ' .. #names .. ')')
+    gc.frame()
+    T.check(flushes == f0 + 1 and #names - shown() == hidden1, 'frame 1 after: the first group generated')
+    gc.frame()
+    T.check(flushes == f0 + 2 and shown() == #names and not gc.spreading(), 'frame 2 after: the second group shown and generated')
+    gc.frame()
+    T.check(flushes == f0 + 2, 'nothing more after the spread')
+    -- an import / rebuild during a spread: everything shown and generated at once
+    gc.afterSwap()
+    T.check(shown() < #names, 'second swap: hidden again')
+    T.check(gc.afterBlockChange() == true and shown() == #names and not gc.spreading() and flushes == f0 + 3,
+      'an import during a spread: all shown, rebuilt now')
+    -- 0: the old same-frame rebuild
+    T.check(gc.setSpread(0) == 0, 'spread 0')
+    f0 = flushes
+    T.check(gc.afterSwap() == true and flushes == f0 + 1 and shown() == #names and not gc.spreading(), 'spread 0: same frame')
+    T.check(gc.setSpread(99) == gc.SPREAD_MAX and gc.setSpread(-1) == 0 and gc.setSpread('x') == 0, 'spread clamped')
+    gc.setSpread(2)
+  end
+  -- groups of about equal weight
+  do
+    local g = gc.groupsOf({ 'a', 'b', 'c', 'd' }, { a = 100, b = 60, c = 50, d = 5 }, 2)
+    T.check(#g == 2 and table.concat(g[1], ',') == 'a,d' and table.concat(g[2], ',') == 'b,c', 'groups by weight')
+    g = gc.groupsOf({ 'a' }, { a = 1 }, 3)
+    T.check(#g == 1 and g[1][1] == 'a', 'no empty groups')
+  end
   -- a GE Lua reload: the module starts over, the level's objects stay (here with an old field)
   o.fields.useNewPlacementGpu = '1'
   local matLoads, realLoad = {}, _G.loadJsonMaterialsFile

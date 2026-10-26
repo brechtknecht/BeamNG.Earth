@@ -3088,6 +3088,11 @@ STAND_IN_TIMEOUT_S = 60.0
 # block's base colour at, sent to the mod in hello (its TerrainBlock baseTexSize; the mod's default 1024, used when 0).
 # Try BNGE_TERRAIN_BASE_TEX=256: the block's far part may look softer.
 TERRAIN_BASE_TEX = int(os.environ.get("BNGE_TERRAIN_BASE_TEX", "0") or 0)
+# The same hitch, its likely cause (Felix's 1-hour drive on 55b89f3, Windows: Render 40-94 ms in the swap's own frame
+# in 42 of 374 swaps, photo or not): the grass the engine drops over the moved block, all regenerated in that frame
+# (tools/gcpatch prevents the drop on Linux only). The mod spreads that rebuild over the frames after the swap
+# (groundcover.SPREAD, its default 2); BNGE_GRASS_SPREAD=0 rebuilds it in the swap's frame as before, 1-4 frames.
+GRASS_SPREAD = os.environ.get("BNGE_GRASS_SPREAD", "")
 SWITCH_MS = float(os.environ.get("BNGE_SWITCH_MS", "0") or 0)
 # Once a follow block was stood in for (its graded one came after the car), the next one's stand-in starts at the
 # usual time without asking whether its graded one would be in time: quality.build_s is measured on the graded blocks
@@ -3612,6 +3617,8 @@ class Connection:
                  "nearVisual": self.s.near_visual, "attribution": self.s.attribution()}
             if TERRAIN_BASE_TEX:        # (A/B) the block's baked base colour's size (mod terrain.setBaseTexSize)
                 m["terrainBaseTex"] = TERRAIN_BASE_TEX
+            if GRASS_SPREAD.strip().isdigit():     # (A/B) frames a swap's grass rebuild is spread over (mod groundcover)
+                m["grassSpread"] = int(GRASS_SPREAD)
             if self.s.imagery is not None:      # the world map credits the sources its view shows
                 m["imageryCredits"] = self.s.imagery.credits_by_area()
                 m["otherCredits"] = self.s.attribution_rest()

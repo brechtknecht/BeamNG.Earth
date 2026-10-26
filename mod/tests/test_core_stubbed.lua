@@ -321,6 +321,7 @@ gcmod.afterBlockChange = function() gcAt[#gcAt + 1] = calls.importMaps; return g
 T.check(pumpUntil(function() return calls.importMaps == imports + 1 end, 100), 'terrain-follow commit once the strip is live')
 T.check(#gcAt == 1 and gcAt[1] == imports + 1, 'grass rebuild requested once, right after the import')
 gcmod.afterBlockChange = gcOrig
+T.check(not gcmod.spreading(), 'an import (not a swap) rebuilds the grass in its own frame')
 T.check(core._governor():isHeavyFrame(), 'the commit ran in a governor heavy slot')
 T.check(colObj.pos.z == 1100 and not colObj.hidden, 'uncovered strip tile at true height in the commit frame')
 T.check(tb.lastImport.maxH == 1024, 'maxHeight = q * 65536')
@@ -843,7 +844,19 @@ do -- a commit with a slow frame: logged with each frame, the worst one's engine
   local line = core.commitHitchLine(cf)
   T.check(line and line:find('frames 18/152/31 ms %(worst #2: Render 120.5, RenderShadows 22%)') ~= nil, line)
   T.check(line:find('far cover 0.4 ms %(3 tiles%)') and line:find('swap, photo new, 7 materials, new: none'), line)
+  T.check(line:find('grass spread 0', 1, true) ~= nil, line)
   cf.f = { 18, 60, 31 }
   T.check(core.commitHitchLine(cf) == nil, 'no frame of 80 ms: not logged')
+  -- every 20 swaps: all swaps' frames (not only the slow ones), per frame p50 / p90 / max and Render p50
+  local cs = {}
+  for i = 1, 10 do
+    cs[i] = { swap = true, f = { 40 + i, 20, 10 }, e = { { Render = 30 + i }, { Render = 5 }, {} } }
+  end
+  cs[11] = { f = { 500, 500, 500 } }            -- an import (teleport): not a swap
+  cs[12] = { swap = true, f = { 999 } }        -- frames still to come
+  local sl = core.swapSummaryLine(cs, 2)
+  T.check(sl == 'terrain swaps (last 10): frames p50/p90/max ms #1 45/49/50 (Render 35), #2 20/20/20 (Render 5), '
+    .. '#3 10/10/10 (Render 0) | grass spread over 2 frames', sl)
+  T.check(core.swapSummaryLine({ cs[11] }, 0) == nil, 'no swap: no line')
 end
 T.done('test_core_stubbed')

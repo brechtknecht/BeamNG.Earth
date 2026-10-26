@@ -962,6 +962,14 @@ three days of testing: dem 741 MB / 7.5k files, imagery 1.4 GB / 35k, deshadow 7
   which works with or without the library. Measured: a 3 km drive at 30 m/s, 10 block moves, zero
   blank-grass frames, no rebuild frame (each move only the import's ~25 ms frame), median 7.6 ms
   per frame versus 10.0 ms without it.
+- Without that library (Windows: no preload) every follow swap paid the rebuild in its own frame: Felix's 1-hour
+  drive (2026-10-26, 512² detail blocks) had the swap frame at 81-144 ms in 42 of 374 swaps, always with the
+  engine's Render at 40-94 ms next to the mod's 13 ms .ter load. So a swap no longer flushes in its own frame
+  (`groundcover.SPREAD`, default 2, server `BNGE_GRASS_SPREAD`): the GroundCovers split into SPREAD groups of
+  about equal element count, frame k after the swap shows group k (the later ones hidden till then) and flushes,
+  in the governor's two quiet frames after the heavy one. Each group's grass is missing for its 1-2 frames.
+  Imports, teleports and rebases still rebuild in their own frame. Every 20 swaps the game log gets a line
+  `terrain swaps (last 20): frames p50/p90/max ms #1 ... (Render ..)` for an A/B.
 - A second TerrainBlock (even 5 km away with disableCollision) drops the player's vehicle through the
   ground at once (in-game, twice): never create one while a vehicle is in the world.
 
