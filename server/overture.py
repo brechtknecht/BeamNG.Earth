@@ -38,6 +38,7 @@ import mapgeom as mg
 import netfetch
 import rangeread
 import staging
+import xproc
 
 log = logging.getLogger("earthd.mapdata")
 
@@ -55,6 +56,19 @@ FETCH_THREADS = 4               # parallel range requests per Reader (the hosts 
 FOOTER_GUESS = 256 * 1024       # bytes read from a file's end first for its footer (one block)
 MERGE_GAP = 64 * 1024           # column chunks closer than this are fetched in one range
 BASE_COLUMNS = {"id", "geometry", "bbox", "sources", "version"}
+# Row-group shards (2026-10-26, first visit): a source row group holds ~20-120 k features over 10-50 km, so the cells of a
+# drive along it read the same few row groups again and again (Berlin's 8 km profiler route: 87 road cells from 6 Overture
+# row groups and 2 Layercake ones, each decompressed and decoded 22-86 times, most of a cell's build). A row group a cell
+# needs is therefore decoded once per machine into a local Parquet file of just the columns the layer reads ("shard",
+# rg<N>.<tag>.parquet beside the source file's blocks, its rows ordered by place in small row groups), which every
+# later cell, in every process, filters natively (no fsspec, no GIL); a row group's feature boxes (rg<N>.bbox.npy) say
+# which candidates hold a feature of the cell at all. BNGE_MD_SHARDS=0: every cell reads the source row groups itself.
+SHARDS = os.environ.get("BNGE_MD_SHARDS", "1") != "0"
+SHARD_VERSION = 1               # bump when a shard's layout changes (its file name changes with it)
+SHARD_ROWS = 1024               # rows per row group of a shard (its bbox statistics skip the rest)
+SHARD_BAND = 50.0               # rows ordered by band of 1/SHARD_BAND degree of their box centre (y, then x)
+SHARD_WAIT_S = 120.0            # a shard another process is writing is waited for this long (xproc.once)
+BOX_PAD = 1e-6                  # degrees the cell is grown by for the box test (float32 boxes: never a feature missed)
 
 # Overture's attribution (https://docs.overturemaps.org/attribution/, read 2026-10-11): the line its
 # own viewer shows, and each theme's licence with the sources that ask for credit, whole (the CC BY
@@ -172,6 +186,19 @@ def _duckdb():
     return duckdb
 
 
+def _is_duckdb_error(e):
+    try:
+        import duckdb
+    except ImportError:
+        return False
+    return isinstance(e, duckdb.Error)
+
+
+def _crc(text):
+    import zlib
+    return zlib.crc32(text.encode())
+
+
 def intersects(b, bounds):
     """STAC bbox [xmin, ymin, xmax, ymax] against (lon0, lat0, lon1, lat1), edges inclusive."""
     lon0, lat0, lon1, lat1 = bounds
@@ -241,6 +268,104 @@ class StacIndex:
 
 
 META_FILES = 2048        # files whose parsed Parquet metadata Reader keeps (a few hundred row groups each)
+BOX_BYTES = 64 * 1024 * 1024    # row groups' feature boxes kept in memory per process (Reader.boxes)
+
+
+def _lit(text):
+    """text as a SQL string literal (a cache path may hold a quote, a user named O'Neil)."""
+    return "'" + str(text).replace("'", "''") + "'"
+
+
+class RowGroup:
+    """One row group of a source file: key (the caller's), remote (its RemoteFile), uri (as the connection's filesystem
+    reads it, quoted), path (the files key of Reader._fetch), rg (its index), first row and n rows, cols ({top-level
+    column: [byte ranges]})."""
+    __slots__ = ("key", "remote", "uri", "path", "rg", "first", "n", "cols")
+
+    def __init__(self, key, remote, uri, path, rg, first, n, cols):
+        self.key, self.remote, self.uri, self.path, self.rg = key, remote, uri, path, rg
+        self.first, self.n, self.cols = first, n, cols
+
+
+def box_hit(boxes, bounds):
+    """Whether any feature box (n, 4: xmin, ymin, xmax, ymax) touches bounds (grown by BOX_PAD); None: unknown, True."""
+    if boxes is None:
+        return True
+    lon0, lat0, lon1, lat1 = bounds
+    return bool(np.any((boxes[:, 0] <= lon1 + BOX_PAD) & (boxes[:, 2] >= lon0 - BOX_PAD)
+                       & (boxes[:, 1] <= lat1 + BOX_PAD) & (boxes[:, 3] >= lat0 - BOX_PAD)))
+
+
+def parse_metadata(meta):
+    """{path: {rg: {"first", "n", "bbox": {leaf: (min, max)}, "cols": {top: [range]}}}} from parquet_metadata rows
+    (file_name, row_group_id, row_group_num_rows, path_in_schema, stats_min, stats_max, dictionary_page_offset,
+    data_page_offset, total_compressed_size), ordered by file, row group, column."""
+    parsed, next_row = {}, {}
+    for fname, rg, nrows, col, smin, smax, dict_off, data_off, size in meta:
+        path = fname.split("://", 1)[-1]
+        pg = parsed.setdefault(path, {})
+        g = pg.get(rg)
+        if g is None:
+            first = next_row.get(path, 0)
+            next_row[path] = first + nrows
+            g = pg[rg] = {"first": first, "n": nrows, "bbox": {}, "cols": {}}
+        offs = [o for o in (dict_off, data_off) if o]
+        if not offs:
+            continue
+        top, leaf = col.split(", ")[0], col.split(", ")[-1]
+        g["cols"].setdefault(top, []).append((min(offs), min(offs) + size))
+        if top == "bbox":
+            g["bbox"][leaf] = (smin, smax)
+    return parsed
+
+
+def save_metadata(remote, groups):
+    """A file's parsed row groups (parse_metadata) kept beside its blocks: every server process parsed the same
+    footers again (0.2-0.6 s a file, ~10 processes; a release file never changes, nor a pinned version)."""
+    path = os.path.join(remote.cache_dir, "rgmeta.json")
+    try:
+        os.makedirs(remote.cache_dir, exist_ok=True)
+        tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+        with open(tmp, "w") as f:
+            json.dump({"size": remote.size, "groups": {str(rg): g for rg, g in groups.items()}}, f)
+        staging.replace_cached(tmp, path)
+    except OSError as e:
+        log.debug("mapdata: %s: %s", path, e)
+
+
+def load_metadata(remote):
+    """The row groups save_metadata kept for this file, None when there are none (or of another size)."""
+    try:
+        with open(os.path.join(remote.cache_dir, "rgmeta.json")) as f:
+            d = json.load(f)
+        if d.get("size") != remote.size:
+            return None
+        return {int(rg): {"first": g["first"], "n": g["n"], "bbox": {k: tuple(v) for k, v in g["bbox"].items()},
+                          "cols": {k: [tuple(r) for r in v] for k, v in g["cols"].items()}}
+                for rg, g in d["groups"].items()}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
+class LazyConnection:
+    """Reader._connect's connection for files and kind, opened by its first statement: a cell whose metadata, boxes
+    and shards are all there already needs none (each one is a DuckDB database of its own, 10-20 ms to open)."""
+
+    def __init__(self, reader, files, kind):
+        self.reader, self.files, self.kind = reader, files, kind
+        self.proto = rangeread.PROTOCOLS[kind]
+        self.errors = []
+        self._con = None
+
+    def execute(self, sql):
+        if self._con is None:
+            self._con, _, _ = self.reader._connect(self.files, self.kind, self.errors)
+        return self._con.execute(sql)
+
+    def close(self):
+        if self._con is not None:
+            self._con.close()
+            self._con = None
 
 
 class Reader:
@@ -256,6 +381,11 @@ class Reader:
         # files never change). Re-reading it for every cell was most of a map cell's CPU (the Deck's mapdata-layer
         # thread, 36 CPU-s of a teleport, 2026-10-23); osmtags._groups keeps its file's the same way.
         self._meta = OrderedDict()
+        self._boxes = OrderedDict()         # box file -> (n, 4) array (boxes())
+        self._boxes_bytes = 0
+        self._local = threading.local()     # each thread's DuckDB connection for the shards (local_con)
+        self._shard_locks = {}
+        self.shards_ok = SHARDS             # False after a shard could not be read (then the source is read again)
 
     def close(self):
         self.pool.shutdown(wait=False)
@@ -273,10 +403,11 @@ class Reader:
             self._remotes.move_to_end(key)
             return r
 
-    def _connect(self, files, kind):
-        """A DuckDB connection whose filesystem serves `files` ({path: RemoteFile}) with `kind`."""
+    def _connect(self, files, kind, errors=None):
+        """A DuckDB connection whose filesystem serves `files` ({path: RemoteFile}) with `kind`; errors: the list the
+        fetch errors DuckDB swallows are put in."""
         duckdb = _duckdb()
-        errors = []
+        errors = [] if errors is None else errors
 
         def resolve(path):
             return files.get(path)
@@ -304,6 +435,29 @@ class Reader:
         con.register_filesystem(fs)
         return con, fs.protocol, errors
 
+    def local_con(self):
+        """This thread's DuckDB connection for local files (the shards): no filesystem of ours, kept for the thread's
+        life (a connection is a database of its own: 10-15 ms to open, every cell opened one or two)."""
+        con = getattr(self._local, "con", None)
+        if con is None:
+            duckdb = _duckdb()
+            con = duckdb.connect(config={"threads": self.threads, "autoinstall_known_extensions": False,
+                                         "autoload_known_extensions": False})
+            con.execute("SET enable_geoparquet_conversion = false")
+            self._local.con = con
+        return con
+
+    def _real_error(self, e, errors):
+        """The error to raise for e: the fetch error DuckDB swallowed, else e (Missing as ReleaseGone)."""
+        real = next((x for x in errors if isinstance(x, (netfetch.FetchError, rangeread.RangeError))), None)
+        if real is None or isinstance(e, (netfetch.FetchError, rangeread.RangeError)):
+            real = e
+        if isinstance(real, rangeread.Missing):
+            # a file the (cached) STAC index lists answers 404: Overture removed the release
+            return ReleaseGone(f"Overture release {self.release}: {real}; bump overture.RELEASE "
+                               "(mapdata.py --latest)")
+        return real
+
     def query(self, layer, cell, kind="demand"):
         """The layer's Features of one cell (lon/lat only; mapdata localises and marks `own`), and
         {(dataset, license): count} of the sources of its features."""
@@ -316,6 +470,29 @@ class Reader:
             return empty(layer), {}
         files = {f"{spec['theme']}/{spec['type']}/{name}": self._remote(spec["theme"], spec["type"], name, urls, size)
                  for name, urls, size in hits}
+        if self.shards_ok:
+            con = LazyConnection(self, files, kind)
+            try:
+                local = self._shard_plan(con, con.proto, sorted(files), files, spec, bounds, kind)
+            except Exception as e:
+                real = self._real_error(e, con.errors)
+                if real is not e:
+                    raise real from e
+                raise
+            finally:
+                con.close()
+            if not local:
+                return empty(layer), {}
+            t2 = time.perf_counter()
+            try:
+                out = self._run_local(layer, spec, bounds, local)
+                log.debug("mapdata %s %s: index %.2f s, shards %.2f s (%d), query %.2f s", layer, cell, t1 - t0,
+                          t2 - t1, len(local), time.perf_counter() - t2)
+                return out
+            except Exception as e:
+                if not _is_duckdb_error(e):
+                    raise
+                self.shard_failed(local, e)
         con, proto, errors = self._connect(files, kind)
         try:
             paths = sorted(files)
@@ -323,23 +500,46 @@ class Reader:
             if not rows:
                 return empty(layer), {}         # no row of these files lies in the cell
             t2 = time.perf_counter()
-            out = self._run(con, proto, paths, layer, spec, bounds, rows)
+            src = ("read_parquet([" + ", ".join(f"'{proto}://{p}'" for p in paths) + "], filename = true, "
+                   "file_row_number = true)")
+            # only the row groups the plan fetched (DuckDB would otherwise read every row group whose
+            # statistics it cannot rule out, lazily, one request each)
+            only = " OR ".join(f"(filename = '{u}' AND file_row_number BETWEEN {a} AND {b})" for u, a, b in rows)
+            out = self._run(con, src, only, "ST_AsWKB(geometry)", layer, spec, bounds)
             log.debug("mapdata %s %s: index %.2f s, plan %.2f s, query %.2f s", layer, cell, t1 - t0, t2 - t1,
                       time.perf_counter() - t2)
             return out
         except Exception as e:
-            real = next((x for x in errors if isinstance(x, (netfetch.FetchError, rangeread.RangeError))), None)
-            if real is None or isinstance(e, (netfetch.FetchError, rangeread.RangeError)):
-                real = e
-            if isinstance(real, rangeread.Missing):
-                # a file the (cached) STAC index lists answers 404: Overture removed the release
-                raise ReleaseGone(f"Overture release {self.release}: {real}; bump overture.RELEASE "
-                                  "(mapdata.py --latest)") from real
+            real = self._real_error(e, errors)
             if real is not e:
                 raise real from e
             raise
         finally:
             con.close()
+
+    def shard_failed(self, local, e):
+        """A shard query failed in DuckDB (a damaged file, a path DuckDB cannot open): the shards are removed and this
+        process reads the sources itself from now on."""
+        log.warning("mapdata: reading the local row-group shards failed (%s: %s); reading the sources instead",
+                    type(e).__name__, e)
+        self.shards_ok = False
+        for p in local:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+    def _run_local(self, layer, spec, bounds, local):
+        con = self.local_con()
+        try:
+            return self._run(con, "read_parquet([" + ", ".join(_lit(p) for p in local) + "])", None, "geometry",
+                             layer, spec, bounds)
+        finally:
+            for t in ("t", "s"):
+                try:
+                    con.execute(f"DROP TABLE IF EXISTS {t}")
+                except Exception:   # (the connection is unusable: a new one next time)
+                    self._local.con = None
 
     # --- fetch planning ------------------------------------------------------------------------
     def _parallel(self, tasks):
@@ -375,55 +575,42 @@ class Reader:
                                                             kind))
         self._parallel(tasks)
 
-    def _plan(self, con, proto, paths, files, spec, bounds, kind):
-        """Fetch, in parallel and before the real query, what it will read: the footers, then the
-        bbox columns of the row groups whose statistics touch the cell, then every column the query
-        uses of the row groups that hold a matching row; False when no row matches. DuckDB (its own sequential prefetching
-        off) then reads from the block cache. A row group whose bbox statistics touch the cell but
-        that holds no matching row costs only its bbox columns: in sparse areas row groups span
-        hundreds of km (a desert cell's roads and water: 16 MB instead of 27 MB, 4 s instead of
-        13 s with DuckDB reading lazily on its own)."""
-        lon0, lat0, lon1, lat1 = bounds
-        t0 = time.perf_counter()
-
-        def footer(r):                  # the last 8 bytes: footer length + "PAR1"
-            tail = r.read(max(0, r.size - FOOTER_GUESS), r.size, kind)
-            n = int.from_bytes(tail[-8:-4], "little")
-            if n + 8 > len(tail):
-                r.read(r.size - n - 8, r.size, kind)
-        self._parallel([lambda r=files[p]: footer(r) for p in paths])
-        uris = ", ".join(f"'{proto}://{p}'" for p in paths)
+    def _groups(self, con, proto, paths, files, kind):
+        """{(path, rg): {"first": row, "n", "bbox": {leaf: (min, max)}, "cols": {top: [range]}}} of the files: from
+        memory, from the copy beside the file's blocks (save_metadata), or read from the footers."""
         with self._lock:
             new = [p for p in paths if p not in self._meta]
+        disk = {}
+        for p in new:
+            got = load_metadata(files[p])
+            if got is not None:
+                disk[p] = got
+        new = [p for p in new if p not in disk]
+        parsed = {}
         if new:
+            def footer(r):              # the last 8 bytes: footer length + "PAR1"
+                tail = r.read(max(0, r.size - FOOTER_GUESS), r.size, kind)
+                n = int.from_bytes(tail[-8:-4], "little")
+                if n + 8 > len(tail):
+                    r.read(r.size - n - 8, r.size, kind)
+            self._parallel([lambda r=files[p]: footer(r) for p in new])
             meta = con.execute(f"""SELECT file_name, row_group_id, row_group_num_rows, path_in_schema, stats_min,
                 stats_max, dictionary_page_offset, data_page_offset, total_compressed_size
                 FROM parquet_metadata([{", ".join(f"'{proto}://{p}'" for p in new)}])
                 ORDER BY file_name, row_group_id, column_id""").fetchall()
-            parsed = {}                 # path -> {rg: {"first": row, "n", "bbox": {leaf: (min, max)}, "cols": {top: [range]}}}
-            next_row = {}
-            for fname, rg, nrows, col, smin, smax, dict_off, data_off, size in meta:
-                path = fname.split("://", 1)[-1]
-                pg = parsed.setdefault(path, {})
-                g = pg.get(rg)
-                if g is None:
-                    first = next_row.get(path, 0)
-                    next_row[path] = first + nrows
-                    g = pg[rg] = {"first": first, "n": nrows, "bbox": {}, "cols": {}}
-                offs = [o for o in (dict_off, data_off) if o]
-                if not offs:
-                    continue
-                top, leaf = col.split(", ")[0], col.split(", ")[-1]
-                g["cols"].setdefault(top, []).append((min(offs), min(offs) + size))
-                if top == "bbox":
-                    g["bbox"][leaf] = (smin, smax)
+            parsed = parse_metadata(meta)
+            for p in new:
+                save_metadata(files[p], parsed.get(p, {}))
+        if disk or parsed:
             with self._lock:
                 for p in new:
                     self._meta[p] = parsed.get(p, {})
+                for p, g in disk.items():
+                    self._meta[p] = g
                 while len(self._meta) > META_FILES:
                     self._meta.popitem(last=False)
         with self._lock:
-            groups = {}                 # (path, rg) -> {"first": row, "bbox": {leaf: (min, max)}, "cols": {top: [range]}}
+            groups = {}
             for p in paths:
                 pg = self._meta.get(p)
                 if pg is None:          # (evicted meanwhile by another thread's files: read again next time)
@@ -431,15 +618,184 @@ class Reader:
                 self._meta.move_to_end(p)
                 for rg, g in pg.items():
                     groups[(p, rg)] = g
+        return groups
+
+    @staticmethod
+    def _candidates(groups, bounds):
+        """The keys of the row groups whose bbox statistics touch bounds."""
+        lon0, lat0, lon1, lat1 = bounds
 
         def stat(g, leaf, i, default):
             try:
                 return float(g["bbox"][leaf][i])
             except (KeyError, TypeError, ValueError):
                 return default
-        cand = [k for k, g in groups.items()
+        return [k for k, g in sorted(groups.items())
                 if stat(g, "xmin", 0, -1e9) <= lon1 and stat(g, "xmax", 1, 1e9) >= lon0
                 and stat(g, "ymin", 0, -1e9) <= lat1 and stat(g, "ymax", 1, 1e9) >= lat0]
+
+    @staticmethod
+    def _used(spec):
+        return set(re.findall(r"[A-Za-z_]+", spec["cols"] + " " + spec.get("extra", ""))) | BASE_COLUMNS
+
+    def _shard_plan(self, con, proto, paths, files, spec, bounds, kind):
+        """The local shards of the row groups that hold a feature of the cell (built here when missing), [] when none
+        does."""
+        groups = self._groups(con, proto, paths, files, kind)
+        rgs = [RowGroup((p, rg), files[p], f"'{proto}://{p}'", p, rg, groups[(p, rg)]["first"], groups[(p, rg)]["n"],
+                        groups[(p, rg)]["cols"]) for p, rg in self._candidates(groups, bounds)]
+        if not rgs:
+            return []
+        boxes = self.boxes(con, files, rgs, kind)
+        rgs = [g for g in rgs if box_hit(boxes.get(g.key), bounds)]
+        if not rgs:
+            return []
+        present = {c for g in rgs for c in g.cols}
+        shards = self.shards(con, files, rgs, sorted(self._used(spec) & present), kind)
+        return [shards[g.key] for g in rgs]
+
+    # --- row-group shards (SHARDS) --------------------------------------------------------------
+    @staticmethod
+    def _rg_dir(g):
+        return os.path.join(g.remote.cache_dir, "rg")
+
+    def _keep_boxes(self, path, b):
+        with self._lock:
+            old = self._boxes.pop(path, None)
+            if old is not None:
+                self._boxes_bytes -= old.nbytes
+            self._boxes[path] = b
+            self._boxes_bytes += b.nbytes
+            while self._boxes_bytes > BOX_BYTES and len(self._boxes) > 1:
+                self._boxes_bytes -= self._boxes.popitem(last=False)[1].nbytes
+
+    def boxes(self, con, files, rgs, kind):
+        """{key: (n, 4) xmin, ymin, xmax, ymax} of every feature of the row groups (RowGroup list), in the source's
+        own precision: kept in memory and beside the file's blocks (rg<N>.bbox.npy); the missing ones read from their
+        bbox columns in one query per file. A row group whose boxes cannot be told is left out (box_hit: True)."""
+        out, todo = {}, []
+        for g in rgs:
+            path = os.path.join(self._rg_dir(g), f"rg{g.rg}.bbox.npy")
+            with self._lock:
+                b = self._boxes.get(path)
+                if b is not None:
+                    self._boxes.move_to_end(path)
+            if b is None:
+                try:
+                    b = np.load(path, allow_pickle=False)
+                except (OSError, ValueError, EOFError):
+                    b = None
+                if b is not None and b.shape != (g.n, 4):
+                    b = None
+                if b is not None:
+                    self._keep_boxes(path, b)
+            if b is None:
+                todo.append((g, path))
+            else:
+                out[g.key] = b
+        if not todo:
+            return out
+        want = {}
+        for g, _ in todo:
+            want.setdefault(g.path, []).extend(g.cols.get("bbox", []))
+        self._fetch(files, want, kind)
+        by_uri = {}
+        for g, path in todo:
+            by_uri.setdefault(g.uri, []).append((g, path))
+        for uri, gs in by_uri.items():
+            only = " OR ".join(f"file_row_number BETWEEN {g.first} AND {g.first + g.n - 1}" for g, _ in gs)
+            got = con.execute(f"""SELECT file_row_number AS r, bbox.xmin AS x0, bbox.ymin AS y0, bbox.xmax AS x1,
+                bbox.ymax AS y1 FROM read_parquet({uri}, file_row_number = true) WHERE {only}
+                ORDER BY file_row_number""").fetchnumpy()
+            rows = np.asarray(got["r"])
+            cols = [np.ma.filled(got[c], np.nan) if np.ma.isMaskedArray(got[c]) else np.asarray(got[c])
+                    for c in ("x0", "y0", "x1", "y1")]
+            arr = np.stack(cols, axis=1)
+            for g, path in gs:
+                i0, i1 = np.searchsorted(rows, [g.first, g.first + g.n])
+                b = np.ascontiguousarray(arr[i0:i1])
+                if b.shape != (g.n, 4):         # (not the whole row group: unknown, every cell takes it)
+                    continue
+                out[g.key] = b
+                self._keep_boxes(path, b)
+                try:
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp.npy"
+                    np.save(tmp, b, allow_pickle=False)
+                    staging.replace_cached(tmp, path)
+                except OSError as e:
+                    log.debug("mapdata: %s: %s", path, e)
+        return out
+
+    def _shard_lock(self, path):
+        with self._lock:
+            lk = self._shard_locks.get(path)
+            if lk is None:
+                if len(self._shard_locks) > 4096:
+                    self._shard_locks.clear()
+                lk = self._shard_locks[path] = threading.Lock()
+            return lk
+
+    def shards(self, con, files, rgs, columns, kind, src_row=False):
+        """{key: local shard path} of the row groups (RowGroup list), with these top-level columns (and the source's
+        file_row_number as src_row): the missing ones fetched (in parallel) and written here, once per machine
+        (xproc: another process writing one is waited for)."""
+        tag = "%d-%08x" % (SHARD_VERSION, _crc(json.dumps([sorted(columns), bool(src_row)])))
+        out, todo = {}, []
+        for g in rgs:
+            path = os.path.join(self._rg_dir(g), f"rg{g.rg}.{tag}.parquet")
+            if os.path.exists(path):
+                out[g.key] = path
+            else:
+                todo.append((g, path))
+        if not todo:
+            return out
+        want = {}
+        for g, _ in todo:
+            for c in columns:
+                want.setdefault(g.path, []).extend(g.cols.get(c, []))
+        self._fetch(files, want, kind)
+        con.execute("SET enable_geoparquet_conversion = false")    # (the geometry as its WKB bytes)
+        for g, path in todo:
+            with self._shard_lock(path):
+                got, mine = xproc.once(path + ".lock", lambda p=path: p if os.path.exists(p) else None,
+                                       SHARD_WAIT_S, kind)
+                if got is None:
+                    try:
+                        self._write_shard(con, g, path, columns, src_row)
+                    finally:
+                        if mine:
+                            xproc.release(path + ".lock")
+            out[g.key] = path
+        return out
+
+    @staticmethod
+    def _write_shard(con, g, path, columns, src_row):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+        sel = ", ".join(f'"{c}"' for c in columns) + (", file_row_number AS src_row" if src_row else "")
+        order = "file_row_number"
+        if "bbox" in columns:           # (by place: the shard's small row groups each cover a small area)
+            order = (f"floor((bbox.ymin + bbox.ymax) * {SHARD_BAND / 2}), "
+                     f"floor((bbox.xmin + bbox.xmax) * {SHARD_BAND / 2}), file_row_number")
+        con.execute(f"""COPY (SELECT {sel} FROM read_parquet({g.uri}, file_row_number = true)
+            WHERE file_row_number BETWEEN {g.first} AND {g.first + g.n - 1} ORDER BY {order})
+            TO {_lit(tmp)} (FORMAT parquet, COMPRESSION zstd, ROW_GROUP_SIZE {SHARD_ROWS})""")
+        staging.replace_cached(tmp, path)
+
+    def _plan(self, con, proto, paths, files, spec, bounds, kind):
+        """Fetch, in parallel and before the real query, what it will read: the footers, then the
+        bbox columns of the row groups whose statistics touch the cell, then every column the query
+        uses of the row groups that hold a matching row; False when no row matches. DuckDB (its own sequential prefetching
+        off) then reads from the block cache. A row group whose bbox statistics touch the cell but
+        that holds no matching row costs only its bbox columns: in sparse areas row groups span
+        hundreds of km (a desert cell's roads and water: 16 MB instead of 27 MB, 4 s instead of
+        13 s with DuckDB reading lazily on its own). (Without SHARDS.)"""
+        lon0, lat0, lon1, lat1 = bounds
+        t0 = time.perf_counter()
+        uris = ", ".join(f"'{proto}://{p}'" for p in paths)
+        groups = self._groups(con, proto, paths, files, kind)
+        cand = self._candidates(groups, bounds)
         t1 = time.perf_counter()
         if not cand:
             return []
@@ -463,7 +819,7 @@ class Reader:
             rgs = firsts[path]
             ks = np.searchsorted(np.array([f for f, _ in rgs]), np.asarray(rows), side="right") - 1
             matched.update((path, rgs[int(k)][1]) for k in np.unique(ks))
-        used = set(re.findall(r"[A-Za-z_]+", spec["cols"] + " " + spec.get("extra", ""))) | BASE_COLUMNS
+        used = self._used(spec)
         wanted = {}
         for path, rg in sorted(matched):
             for top, chunks in groups[(path, rg)]["cols"].items():
@@ -481,25 +837,23 @@ class Reader:
             rows.append((f"{proto}://{path}", g["first"], g["first"] + g["n"] - 1))
         return rows
 
-    def _run(self, con, proto, paths, layer, spec, bounds, rows):
+    def _run(self, con, src, only, wkb, layer, spec, bounds):
+        """The layer's (Features, sources) from src (a read_parquet(...) of the rows; only: a further WHERE on them,
+        or None; wkb: the geometry's WKB bytes as SQL)."""
         lon0, lat0, lon1, lat1 = bounds
-        src = ("read_parquet([" + ", ".join(f"'{proto}://{p}'" for p in paths) + "], filename = true, "
-               "file_row_number = true)")
-        # only the row groups the plan fetched (DuckDB would otherwise read every row group whose
-        # statistics it cannot rule out, lazily, one request each)
-        only = " OR ".join(f"(filename = '{u}' AND file_row_number BETWEEN {a} AND {b})" for u, a, b in rows)
         bbox = (f"bbox.xmin <= {lon1!r} AND bbox.xmax >= {lon0!r} AND "
                 f"bbox.ymin <= {lat1!r} AND bbox.ymax >= {lat0!r}")
+        where = f"({only}) AND {bbox}" if only else bbox
         extra = f", {spec['extra']}" if spec.get("extra") else ""
         # The scan first, the dedup (by id, highest version) and numbering from the copy: with the
         # window in the same statement DuckDB 1.5 stopped skipping row groups by their statistics and
         # read every row group of the file between the matches (12 MB more, 9 s, for a city cell).
-        con.execute(f"""CREATE TEMP TABLE s AS
-              SELECT id, version, {spec['cols']}, ST_AsWKB(geometry) AS wkb,
+        con.execute(f"""CREATE OR REPLACE TEMP TABLE s AS
+              SELECT id, version, {spec['cols']}, {wkb} AS wkb,
                      (bbox.xmin + bbox.xmax) / 2 AS cx, (bbox.ymin + bbox.ymax) / 2 AS cy,
                      sources{extra}
-              FROM {src} WHERE ({only}) AND {bbox}""")
-        con.execute("""CREATE TEMP TABLE t AS
+              FROM {src} WHERE {where}""")
+        con.execute("""CREATE OR REPLACE TEMP TABLE t AS
             SELECT row_number() OVER (ORDER BY id) - 1 AS fi, * FROM (
               SELECT * EXCLUDE (version) FROM s
               QUALIFY row_number() OVER (PARTITION BY id ORDER BY version DESC, wkb) = 1)""")
