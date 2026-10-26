@@ -148,5 +148,40 @@ class RulesTest(unittest.TestCase):
         self.assertFalse(navgraph.road_rules(None)["rightHandDrive"], "unknown: US rules")
 
 
+class TrackerTest(unittest.TestCase):
+    def test_ahead_at_speed_and_not_back_to_back(self):
+        """At speed a graph is centred ahead by the last one's build time and the next starts no sooner than that
+        after it (a road process for the graph at most half the time)."""
+        import asyncio
+        from types import SimpleNamespace
+        from unittest import mock
+        clock = [100.0]
+        centres = []
+
+        def build(aid, x, y, serial):
+            centres.append((round(x), round(y)))
+            clock[0] += 10.0            # (each build takes 10 s)
+            return "/p", 1, 1
+        conn = SimpleNamespace(sent=[], send=lambda m: conn.sent.append(m))
+        tr = navgraph.Tracker()
+
+        async def pose(x, vx):
+            tr.on_pose(conn, 1, x, 0.0, asyncio.get_running_loop(), build, vel=(vx, 0.0))
+            for _ in range(50):
+                await asyncio.sleep(0.005)
+                if not tr.building:
+                    break
+
+        async def go():
+            with mock.patch.object(navgraph, "time", SimpleNamespace(monotonic=lambda: clock[0])):
+                await pose(0.0, 0.0)                    # the first: at the car
+                await pose(500.0, 80.0)                 # at once after it: not yet (10 s build, 10 s rest)
+                clock[0] += 10.0
+                await pose(500.0, 80.0)                 # ahead by 10 s of driving, at most AHEAD_MAX_M
+        asyncio.run(go())
+        self.assertEqual(centres, [(0, 0), (500 + round(navgraph.AHEAD_MAX_M), 0)])
+        tr.close()
+
+
 if __name__ == "__main__":
     unittest.main()

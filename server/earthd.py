@@ -239,9 +239,17 @@ AHEAD_MAX_M = 4000.0
 AHEAD_MIN_V = 8.0               # m/s: slower, the blocks around (and surface.prefetch's 3 km) cover it
 AHEAD_MOVE_M = 150.0            # m the player moves before the next round
 AHEAD_MARGIN_M = 250.0          # m around the block's half width at each point
+# a round fetches bytes only: the map cells through mapdata.fetch_ahead (no build), the elevation tiles of all its
+# points at once. A round that built its cells (mapdata.cell, 5-17 s each behind the blocks' builds) took the whole 8 km
+# test drive: one round, 68 tiles; the blocks then fetched ~400 tiles themselves (the I/O work, 2026-10-26).
+# BNGE_AHEAD_BYTES=0: as before
+AHEAD_BYTES = os.environ.get("BNGE_AHEAD_BYTES", "1") != "0"
 # the road tiles' cells (landcover: surface.prefetch). With roads (surface.prefetch has them within 3 km, with the land
 # cover on) and water, which a road tile otherwise fetched itself when it needed it (from KyzoFox's 1.5.4, PR #64)
 AHEAD_LAYERS = ("roads", "buildings", "building_parts", "infrastructure", "water", "land_use")
+# the layers whose bytes warm_roads fetches ahead along its path (mapdata.fetch_ahead), per cell in this order: the road
+# plans' (roads, buildings for the widths) first
+FETCH_AHEAD_LAYERS = ("roads", "buildings", "water", "land_use", "infrastructure", "building_parts")
 # route_download: like download_ahead, but along the planned GPS route's own geometry (routeahead.py)
 # instead of the player's current heading, since a road route can wander off that heading entirely.
 ROUTE_AHEAD_ON = True            # --route-prefetch
@@ -1103,7 +1111,10 @@ class Server:
             t0 = time.perf_counter()
             cla, clo, _ = anchor.frame.enu_to_geodetic(x, y, 0.0)
             rules = navgraphmod.road_rules(navgraphmod.country_near(self.airports_db, float(cla), float(clo)))
-            path, n_nodes, n_edges = self.road_pool.submit(
+            # (in the far buildings' process when there is one: a graph held a road process for 10-35 s at 300 km/h,
+            # and the road tiles waited behind it, 2026-10-26; NAV_FAR_BLD)
+            pool = self.far_bld_pool if NAV_FAR_BLD and self.far_bld_pool is not None else self.road_pool
+            path, n_nodes, n_edges = pool.submit(
                 blockworker.navgraph, aid, anchor.lat, anchor.lon, anchor.zooms[0], x, y, self.out_dir,
                 self.vfs_dir, serial, self.left_hand(anchor), self.mph(anchor), rules).result()
             log.debug("navgraph %d of anchor %d: %d nodes in %.2f s (queue + build)", serial, aid, n_nodes,
@@ -1261,9 +1272,11 @@ class Server:
                        key=lambda kl: (self.WARM_ORDER.get(kl[1], 9), where(kl[0]), str(kl[0]), kl[1]))
         return self.mapdata.warm(order)
 
-    def build_roads_tile(self, aid, tx, ty):
+    def build_roads_tile(self, aid, tx, ty, verify=False):
         """roads.py: one road tile of anchor aid, written to the session folder. Returns (vfs path,
-        chunks) or None if the anchor is gone. Worker threads (fetches the map cells it lacks)."""
+        chunks[, True: graded from region plans]) or None if the anchor is gone; verify: roads.UNCHANGED when a tile
+        graded from region plans comes out the same from its cells' whole plans (roads.Tracker). Worker threads
+        (fetches the map cells it lacks)."""
         anchor = self.anchors.get(aid)
         if anchor is None or self.mapdata is None:
             return None
@@ -1273,10 +1286,15 @@ class Server:
                 blockworker.roads_tile, aid, anchor.lat, anchor.lon, anchor.zooms[0], tx, ty, self.out_dir,
                 self.vfs_dir, self.sidewalks, DETAIL_ROAD_LIFT if self.near_visual == "detail" else 0.0,
                 self.buildings, self.left_hand(anchor), self.mph(anchor), self.anchor_q(anchor),
-                self.gas_stations).result()
-            log.debug("road tile %d_%d: %.2f s (queue + build)", tx, ty, time.perf_counter() - t0)
+                self.gas_stations, verify).result()
+            log.debug("road tile %d_%d: %.2f s (queue + build%s)", tx, ty, time.perf_counter() - t0,
+                      ", check" if verify else "")
+            if isinstance(res, str):        # (roads.UNCHANGED)
+                return res
             self.keep_fuel_pads(res[2])
-            return res[:2]
+            return res[:2] + ((True,) if len(res) > 3 and res[3] else ())
+        if verify:                  # (graded here from the whole plans only: never from region plans)
+            return roadsmod.UNCHANGED
         self.mapdata.warm(roadsmod.tile_needs(anchor.frame, tx, ty, self.buildings, self.road_widths is not None,
                                               1 + seacarvemod.LINE_CELLS if self.sea is not None else 0))
         cells = [self.mapdata.cell(k, layers=("roads",), kind="demand").layers.get("roads")
@@ -1487,6 +1505,9 @@ class Server:
             for k in mapcells.cells_for_bbox(la - dlat, lo - dlon, la + dlat, lo + dlon):
                 if k not in keys:
                     keys.append(k)
+        if self.mapdata is not None:        # their downloads in this process at once, ahead of the plans and builds
+            self.mapdata.fetch_ahead([(k, ly) for k in keys
+                                      for ly in (FETCH_AHEAD_LAYERS if self.buildings else ("roads",))])
         for _, q in self.block_pools:
             try:
                 q.put_nowait((anchor.id, anchor.lat, anchor.lon, keys))
@@ -1522,6 +1543,30 @@ class Server:
         layers = (AHEAD_LAYERS if self.buildings else ("roads",)) if self.mapdata is not None else ()
         self.ahead_busy = True
 
+        def cells_at(la, lo):
+            dlat = reach / 111320.0
+            dlon = reach / (111320.0 * max(0.05, math.cos(math.radians(la))))
+            return mapcells.cells_for_bbox(la - dlat, lo - dlon, la + dlat, lo + dlon)
+
+        def run_bytes():
+            # the map cells' bytes queued first (mapdata.fetch_ahead: returns at once, its own threads), then all the
+            # points' elevation tiles in one go (dem.prefetch's threads), nearest point first
+            try:
+                if layers:
+                    self.mapdata.fetch_ahead([(key, ly) for la, lo in pts for key in cells_at(la, lo)
+                                              for ly in layers], source="ahead")
+                keys = [k for la, lo in pts for k in self.dem.keys_around(la, lo, reach, zoom)]
+                dem_n, deferred = self.dem.prefetch(keys)
+                self.ahead_stats["dem"] += dem_n
+                self.ahead_stats["deferred"] += int(deferred)
+                if dem_n:
+                    log.info("download ahead: %d elevation tiles (%.0f m/s; session: %s; map bytes ahead: %s)", dem_n,
+                             v, self.ahead_stats, self.mapdata.fa_stats if self.mapdata is not None else None)
+            except Exception as e:
+                log.debug("download ahead: %s: %s", type(e).__name__, e)
+            finally:
+                self.ahead_busy = False
+
         def run():
             try:
                 dem_n = cells_n = 0
@@ -1548,7 +1593,7 @@ class Server:
                 log.debug("download ahead: %s: %s", type(e).__name__, e)
             finally:
                 self.ahead_busy = False
-        self.ahead_pool.submit(run)
+        self.ahead_pool.submit(run_bytes if AHEAD_BYTES else run)
 
     def warm_imagery(self, anchor, x, y, vx, vy):
         """The lazy imagery sources (NAIP) along the player's straight path (WARM_STEPS_S), over the block's
@@ -3008,6 +3053,8 @@ REGION_FORGET_S = 900.0     # s a block's answer is waited for at most
 PROVISIONAL_FOLLOW = os.environ.get("BNGE_PROVISIONAL_FOLLOW", "1") != "0"
 # ... graded under the roads whose cells' plans are made already (Grader.adopt: the block processes' plans on disk)
 PROVISIONAL_GRADE = os.environ.get("BNGE_PROVISIONAL_GRADE", "1") != "0"
+# The AI graph is built in the far buildings' process (when there is one), not in a road process (build_navgraph).
+NAV_FAR_BLD = os.environ.get("BNGE_NAV_FARBLD", "1") != "0"
 FOLLOW_PROV_EST_S = 3.0     # s a provisional follow block takes, until measured (Server.prov_est)
 # A provisional follow block is the fallback for a late one: it waits for nothing that is not at hand (_make_heightmap_here_
 # fast): not for its photo (2.2 s of its typical 3.7 s in Felix's 285 km/h log, 2026-10-26, longer than the graded block
@@ -4160,7 +4207,7 @@ class Connection:
             self.bldfar.on_pose(self, aid, *self.focus, asyncio.get_running_loop(), self.s.build_far_bld_tile,
                                 view=self.view_at)
         if self.s.traffic and aid == self.active and self.nav_may_start(aid):
-            self.nav.on_pose(self, aid, *self.focus, asyncio.get_running_loop(), self.s.build_navgraph)
+            self.nav.on_pose(self, aid, *self.focus, asyncio.get_running_loop(), self.s.build_navgraph, vel=self.vel)
         if aid == self.active:
             self.send_progress(aid)
         self.refresh_status()

@@ -47,6 +47,10 @@ TILE = 512                  # sampling grid tile size (Mapterhorn)
 MEM_TILES = 512             # decoded tiles kept per process (Dem's default; budget.py: fewer on a small machine)
 PROBE_WORKERS = 16          # Dem._ahead(): raw downloads started ahead of the walk down the zooms
 URGENT_WORKERS = 16         # Dem.urgent(): its own fetch threads (with the 16 shared: Mapterhorn's 32 at once)
+# Dem.prefetch(): downloads at once (0/1 = one after another, as before). The download ahead asked ~80 tiles per round
+# one at a time, and a tile not in Cloudflare's edge cache takes 1.2-1.5 s to its first byte: it fell behind any car
+# (the I/O audit, 2026-10-26). They go as netfetch "prefetch": a slot of the host's only when one is free.
+PREFETCH_WORKERS = int(os.environ.get("BNGE_DEM_PREFETCH_PAR", "8"))
 # Decoded tiles mirrored on disk (<cache>/dem/decoded/...: float32 .npy), memory-mapped read-only: every server process
 # decoded the same tiles (WebP + Terrarium, ~3 ms a tile here, the z12 ground filter far more) and kept its own copy
 # (up to MEM_TILES MB a process, outside Python's traced memory); a mirrored tile is decoded once per machine and its
@@ -72,6 +76,7 @@ MAX_TILES_PER_SAMPLE = 1024
 SPARSE_MIN_TILES = 16       # a sample's box of more tiles than this with points in fewer than 1 / SPARSE_RATIO of them
 SPARSE_RATIO = 4            # is sampled in groups of SPARSE_GROUP x SPARSE_GROUP tiles (only the tiles near points)
 SPARSE_GROUP = 2
+MOSAIC_FREE = os.environ.get("BNGE_DEM_MOSAIC", "0") != "1"   # 1: the tiles copied into one mosaic per sample, as before
 
 MAPTERHORN = dict(name="mapterhorn", ext="webp", size=512,
                   url="https://tiles.mapterhorn.com/{z}/{x}/{y}.webp")
@@ -175,6 +180,8 @@ class Dem:
         # raw Mapterhorn downloads started ahead of need (_ahead): a fresh place's tiles walked z16 -> z15 -> z14 ->
         # z13 -> z12 and its 8 neighbours one request at a time, ~1 s each before the CDN has them (2026-10-22)
         self.probe_pool = ThreadPoolExecutor(PROBE_WORKERS, thread_name_prefix="dem-probe")
+        self.prefetch_pool = (ThreadPoolExecutor(PREFETCH_WORKERS, thread_name_prefix="dem-prefetch")
+                              if PREFETCH_WORKERS > 1 else None)
         self._probing = {}              # (z, x, y) -> Future of its raw download
         self._local = threading.local()
         self.mem_tiles = MEM_TILES if mem_tiles is None else mem_tiles
@@ -327,18 +334,39 @@ class Dem:
         "prefetch" priority (only spare tokens of the host: the blocks being built keep theirs), without
         decoding them. Returns (downloaded, deferred): deferred when the host refused one (no spare tokens
         now): the rest waits for the next call. Errors skip the tile (asked again on demand)."""
-        got = 0
-        for z, x, y in keys:
-            if os.path.exists(self._path(MAPTERHORN, z, x, y)):
-                continue
+        keys = [k for k in dict.fromkeys(keys) if not os.path.exists(self._path(MAPTERHORN, *k))]
+        if self.prefetch_pool is None:
+            got = 0
+            for z, x, y in keys:
+                try:
+                    if self._download(MAPTERHORN, z, x, y, kind="prefetch") is not None:
+                        got += 1
+                except netfetch.Deferred:
+                    return got, True
+                except netfetch.FetchError:
+                    continue
+            return got, False
+        # PREFETCH_WORKERS at once, nearest first (the pool takes them in order); the first refusal stops the rest
+        stop = threading.Event()
+        got = [0]
+
+        def one(k):
+            if stop.is_set():
+                return
+            with self._lock:
+                probing = self._probing.get(k)
+            if probing is not None:         # (a block's walk down the zooms asks it already)
+                return
             try:
-                if self._download(MAPTERHORN, z, x, y, kind="prefetch") is not None:
-                    got += 1
+                if self._download(MAPTERHORN, *k, kind="prefetch") is not None:
+                    with self._lock:
+                        got[0] += 1
             except netfetch.Deferred:
-                return got, True
+                stop.set()
             except netfetch.FetchError:
-                continue
-        return got, False
+                pass
+        self._wait([self.prefetch_pool.submit(one, k) for k in keys])
+        return got[0], stop.is_set()
 
     def has(self, z, x, y):
         """True when Mapterhorn tile (z, x, y) needs no download: on disk, a 404 remembered, or not in Mapterhorn's
@@ -869,12 +897,19 @@ class Dem:
             return out.reshape(shape)
         keys = {(tx, ty): (zoom, tx % n, ty) for ty in range(ty0, ty1 + 1) for tx in range(tx0, tx1 + 1)}
         got = (tiles_fn or self.tiles)(keys.values(), progress)
+        fx -= tx0 * TILE
+        fy -= ty0 * TILE
+        if MOSAIC_FREE:
+            fast.require(77, "bilinear_tiles")
+            # (the tiles as they are, row by row: copying them into one mosaic was most of a small call's time,
+            # 3 ms for a road profile's 500 points over 1.5 km, 2026-10-26; the same pixels and sums)
+            out[valid] = fast._ef.bilinear_tiles([got[keys[(tx, ty)]] for ty in range(ty0, ty1 + 1)
+                                                  for tx in range(tx0, tx1 + 1)], nx, ny, fx, fy)
+            return out.reshape(shape)
         mosaic = np.empty((ny * TILE, nx * TILE), np.float32)
         for (tx, ty), k in keys.items():
             c, r = (tx - tx0) * TILE, (ty - ty0) * TILE
             mosaic[r:r + TILE, c:c + TILE] = got[k]
-        fx -= tx0 * TILE
-        fy -= ty0 * TILE
         fast.require(55, "bilinear_grid")
         out[valid] = fast._ef.bilinear_grid(mosaic, fx, fy)
         return out.reshape(shape)

@@ -30,6 +30,11 @@ class FakeDem:
 class FakeMapdata:
     def __init__(self):
         self.cells = []
+        self.ahead = []                 # fetch_ahead's (cell, layer)s, per call: (needs, source)
+        self.fa_stats = {}
+
+    def fetch_ahead(self, needs, kind="prefetch", source="path"):
+        self.ahead.append((list(needs), source))
 
     def has(self, key, layer):
         return False
@@ -60,8 +65,22 @@ class DownloadAheadTest(unittest.TestCase):
         lats = [k[1] for k in s.dem.asked]
         self.assertEqual(lats, sorted(lats), "nearest point first, going north")
         self.assertAlmostEqual((lats[-1] - 36.17) * 111000, 40.0 * earthd.AHEAD_S[-1], delta=60)
-        self.assertTrue(s.mapdata.cells and all(k == "prefetch" for _, _, k in s.mapdata.cells))
+        self.assertTrue(s.mapdata.ahead and s.mapdata.ahead[0][0] and s.mapdata.ahead[0][1] == "ahead")
+        self.assertEqual(s.mapdata.cells, [], "bytes only: no build")
         self.assertFalse(s.ahead_busy)
+
+    def test_builds_cells_without_bytes_mode(self):
+        old = earthd.AHEAD_BYTES
+        earthd.AHEAD_BYTES = False
+        try:
+            s, a = server(), anchor()
+            self.run_at(s, a, 0.0, 0.0, 0.0, 40.0)
+            self.assertEqual(len(s.dem.asked), len(earthd.AHEAD_S))
+            self.assertTrue(s.mapdata.cells and all(k == "prefetch" for _, _, k in s.mapdata.cells))
+            self.assertEqual(s.mapdata.ahead, [])
+            self.assertFalse(s.ahead_busy)
+        finally:
+            earthd.AHEAD_BYTES = old
 
     def test_far_points_capped(self):
         s, a = server(), anchor()
@@ -86,7 +105,7 @@ class DownloadAheadTest(unittest.TestCase):
         s.buildings = False
         self.run_at(s, a, 0.0, 0.0, 30.0, 0.0)
         self.assertTrue(s.dem.asked)
-        self.assertTrue(s.mapdata.cells and all(layers == ("roads",) for _, layers, _ in s.mapdata.cells))
+        self.assertTrue(s.mapdata.ahead and all(ly == "roads" for needs, _ in s.mapdata.ahead for _, ly in needs))
 
 
 if __name__ == "__main__":

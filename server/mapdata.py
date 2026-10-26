@@ -81,6 +81,24 @@ OSM_THREADS = 8                 # cells whose OpenStreetMap tags are read at onc
 # (all 36 of a fresh place: 122 s -> 145-181 s over 8 places, 2026-10-25); on a 16-thread PC they came 2-10 s sooner.
 _CPUS = os.cpu_count() or 4
 WARM_THREADS = min(8, _CPUS // 2) if _CPUS > 8 else 0
+# (cell, layer)s whose bytes are fetched ahead at once (fetch_ahead: the network part of a build only, no decode, no
+# store), also where WARM_THREADS is 0; 0 = off. Off by default: 3 threads made the cloud test drive's pauses worse
+# (fresh cache, 300 km/h, 8 km: 30.0 / 35.6 / 33.8 s with them, 10.2 / 14.0 s without, the base 15.3-29.1 s; the
+# planning's DuckDB bbox queries took the main process's CPU, 2026-10-26). BNGE_FETCH_AHEAD=3 to try it
+FETCH_AHEAD_THREADS = int(os.environ.get("BNGE_FETCH_AHEAD", "0"))
+FETCH_AHEAD_SOURCES = ("path", "ahead")     # fetch_ahead's lists, first first: the road plans' path, the straight line
+
+
+def _fa_rank(source):
+    return FETCH_AHEAD_SOURCES.index(source) if source in FETCH_AHEAD_SOURCES else len(FETCH_AHEAD_SOURCES)
+
+
+# A cell layer's file deflated at this level (zlib; 6 was np.savez_compressed's): 1 wrote the 12 largest layers of a
+# Munich drive in 0.41 s instead of 1.69 s, 20 % larger, while other processes waited on the build's lock
+STORE_LEVEL = int(os.environ.get("BNGE_NPZ_LEVEL", "1"))
+# Builds of the kinds "prefetch" / "background" / "predownload" on a pool of their own (BG_THREADS), so a block's
+# demand build never queues behind the download ahead's
+BG_THREADS = int(os.environ.get("BNGE_MAPDATA_BG", "2"))
 VERSION = 2                     # pipeline version: bump when what a cell's layers contain changes
 # per layer, on top of VERSION (a layer's own change without re-fetching the others): roads 2 adds
 # the "oneway" rule (Overture access_restrictions by heading)
@@ -160,6 +178,12 @@ BUILD_WAIT_S = 180.0        # a cell layer another process is building is waited
 MIRROR_MB = 2048
 MIRROR_PRUNE_S = 120.0  # the mirror pruned at most this often per process (each prune walks it all)
 MIRROR_SMALL = 65536    # bytes: an array this small is read into memory (no mapping)
+# a layer's mirror as one file (<layer>.pack: a header, then the arrays 64-byte aligned, the large ones mapped as views
+# of one mapping) instead of a folder of ~28 .npy files and an "ok": a 3 km drive wrote 7,844 files, each a create, a
+# write and a scan on Windows, and a read opened every one (the I/O audit, 2026-10-26). BNGE_MIRROR_PACK=0: folders
+MIRROR_PACK = os.environ.get("BNGE_MIRROR_PACK", "1") != "0"
+_PACK_MAGIC = b"BNGEMIR1"
+_PACK_ALIGN = 64
 MEM_MB = 192        # decoded cell layers kept in memory per process (a road tile reads its ~4 cells, each read by
                     # its neighbours too: ~8 ms of decompression and a coordinate transform each time, 2026-10-15).
                     # A road tile's layers of Baltimore's 4 cells are ~124 MB by _nbytes (the infrastructure 65):
@@ -239,6 +263,13 @@ class MapData:
         self._locks = {}
         self._lock = threading.Lock()
         self.pool = ThreadPoolExecutor(LAYER_THREADS, thread_name_prefix="mapdata-layer")
+        self.bg_pool = ThreadPoolExecutor(BG_THREADS, thread_name_prefix="mapdata-bg") if BG_THREADS > 0 else None
+        self._fa_cv = threading.Condition()
+        self._fa_want = {}                  # fetch_ahead: source -> [(key str, layer), CellKey, layer] nearest first
+        self._fa_done = set()               # (key str, layer) whose bytes were fetched (or need none)
+        self._fa_busy = set()
+        self._fa_threads = []
+        self.fa_stats = {"layers": 0, "deferred": 0, "failed": 0, "s": 0.0}
         self._mem = OrderedDict()           # (cell, layer) -> (decoded layer, provenance, bytes): cell()'s LRU
         self._mem_bytes = 0
         self._mem_lock = threading.Lock()
@@ -247,6 +278,8 @@ class MapData:
 
     def close(self):
         self.pool.shutdown(wait=False)
+        if self.bg_pool is not None:
+            self.bg_pool.shutdown(wait=False)
         if self._warm_ex is not None:
             self._warm_ex.shutdown(wait=False, cancel_futures=True)
         self.overture.close()
@@ -329,7 +362,14 @@ class MapData:
     def _store(self, path, arrays):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp.npz"
-        np.savez_compressed(tmp, **arrays)
+        if STORE_LEVEL == 6:
+            np.savez_compressed(tmp, **arrays)
+        else:                   # (np.load reads it as any .npz)
+            import zipfile
+            with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED, compresslevel=STORE_LEVEL) as zf:
+                for k, v in arrays.items():
+                    with zf.open(k + ".npy", "w", force_zip64=True) as fh:
+                        np.lib.format.write_array(fh, np.asanyarray(v), allow_pickle=False)
         staging.replace_cached(tmp, path)
 
     def _build(self, key, layer, kind):
@@ -439,6 +479,8 @@ class MapData:
         """The mirrored arrays of a layer file (the large ones memory-mapped), or None (none, or not of this file)."""
         if MIRROR_MB <= 0:
             return None
+        if MIRROR_PACK:
+            return self._pack_load(path)
         d = self._mirror_dir(path)
         try:
             with open(os.path.join(d, "ok")) as fh:
@@ -470,6 +512,10 @@ class MapData:
                 lat_c, lon_c = key.center()
                 full["en.local"] = f.localize(geodesy.EnuFrame(lat_c, lon_c, 0.0)).en
             stamp = self._stamp(path)
+            if MIRROR_PACK:
+                self._mirror_note(_pack_write(d + ".pack", stamp, full))
+                got = self._pack_load(path)
+                return got if got is not None else arrays
             tmp = f"{d}.{os.getpid()}.{threading.get_ident()}.tmp"
             os.makedirs(tmp, exist_ok=True)
             size = 0
@@ -492,6 +538,16 @@ class MapData:
             return arrays
         got = self._mirror_load(path)
         return got if got is not None else arrays
+
+    def _pack_load(self, path):
+        d = self._mirror_dir(path)
+        try:
+            got = _pack_read(d + ".pack", self._stamp(path))
+            if got is not None:
+                os.utime(d + ".pack")           # (read: the last to go)
+            return got
+        except (OSError, ValueError, EOFError):
+            return None
 
     # (a process's first write prunes: the count of a session's own writes alone never reached the threshold when
     # each run wrote less, and the mirror grew past MIRROR_MB across sessions: 6.3 GB on a Steam Deck, 2026-10-23)
@@ -544,7 +600,9 @@ class MapData:
                 arrays = self._mirror_load(self.path(key, layer))
                 if arrays is not None:
                     results[layer] = (arrays, True, time.perf_counter() - t0)
-        futs = [(layer, self.pool.submit(timed, layer)) for layer in layers
+        pool = self.bg_pool if (self.bg_pool is not None and kind in ("prefetch", "background", "predownload")) \
+            else self.pool
+        futs = [(layer, pool.submit(timed, layer)) for layer in layers
                 if layer not in mem and layer not in results]
         err = None
         for layer, fut in futs:             # all finish before an error is raised (no stray fetches)
@@ -644,6 +702,81 @@ class MapData:
             self._warm_ex.submit(run, k, key, layer)
         return len(todo)
 
+    def fetch_ahead(self, needs, kind="prefetch", source="path"):
+        """Fetch the bytes the builds of needs [(cell, layer)] will read (overture.Reader.fetch_only, and the roads'
+        OpenStreetMap tags) into the block cache, FETCH_AHEAD_THREADS at once, in needs' order; replaces the list of
+        the previous call from the same source (the player moved on; FETCH_AHEAD_SOURCES: whose list goes first).
+        Vector layers only; those built already are skipped. Returns at once
+        with how many were queued. Never decodes or stores a layer: on a machine where builds ahead would take the
+        CPUs from the blocks (WARM_THREADS 0) the downloads still go ahead."""
+        if FETCH_AHEAD_THREADS <= 0 or self.fetcher is None:
+            return 0
+        want = []
+        for key, layer in needs:
+            if layer not in VECTOR_LAYERS:
+                continue
+            key = _key(key)
+            k = (str(key), layer)
+            if k in self._fa_done:
+                continue
+            if self.has(key, layer):
+                self._fa_done.add(k)
+                continue
+            want.append((k, key, layer))
+        with self._fa_cv:
+            self._fa_want[source] = want
+            if len(self._fa_done) > 200000:
+                self._fa_done.clear()
+            while len(self._fa_threads) < FETCH_AHEAD_THREADS:
+                t = threading.Thread(target=self._fa_loop, name="mapdata-fetch-ahead", daemon=True)
+                self._fa_threads.append(t)
+                t.start()
+            self._fa_cv.notify_all()
+        return len(want)
+
+    def _fa_loop(self):
+        while True:
+            with self._fa_cv:
+                job = None
+                while job is None:
+                    job = next((w for src in sorted(self._fa_want, key=_fa_rank) for w in self._fa_want[src]
+                                if w[0] not in self._fa_done and w[0] not in self._fa_busy), None)
+                    if job is None:
+                        self._fa_cv.wait()
+                self._fa_busy.add(job[0])
+            k, key, layer = job
+            done = True
+            t0 = time.perf_counter()
+            try:
+                if not self.has(key, layer):
+                    osm = None
+                    if layer == "roads":
+                        with self._lock:
+                            if getattr(self, "osmtags", None) is None:
+                                import osmtags
+                                self.osmtags = osmtags.OsmTags(self.raw_dir, self.fetcher)
+                        osm = self._osm_pool().submit(self.osmtags.fetch_only, key.bounds(), "prefetch")
+                    self.overture.fetch_only(layer, key, "prefetch")
+                    if osm is not None:
+                        try:
+                            osm.result()
+                        except Exception as e:      # (optional: cell() reads the tags itself)
+                            log.debug("mapdata fetch ahead: OSM tags of %s: %s: %s", key, type(e).__name__, e)
+                    self.fa_stats["layers"] += 1
+            except DEFERRED:
+                done = False                # the host had no room for a prefetch: again in a moment
+                self.fa_stats["deferred"] += 1
+            except Exception as e:          # the build asks again, on demand
+                self.fa_stats["failed"] += 1
+                log.debug("mapdata fetch ahead %s %s: %s: %s", key, layer, type(e).__name__, e)
+            self.fa_stats["s"] += time.perf_counter() - t0
+            with self._fa_cv:
+                self._fa_busy.discard(k)
+                if done:
+                    self._fa_done.add(k)
+                else:
+                    self._fa_cv.wait(1.0)
+
     def cell_at(self, lat, lon, layers=LAYERS, kind="demand"):
         return self.cell(mapcells.cell_of(lat, lon), layers, kind)
 
@@ -659,9 +792,66 @@ class MapData:
 
 
 
+def _pack_write(dest, stamp, arrays):
+    """arrays {name: array} written as one mirror file (MIRROR_PACK) under stamp, atomically; returns its data bytes."""
+    items, off = [], 0
+    for n, a in arrays.items():
+        a = np.asarray(a, order="C")          # (not ascontiguousarray: it makes a 0-d array 1-d)
+        if a.dtype.hasobject:
+            raise ValueError(f"{n}: object array")
+        items.append((n, a, off))
+        off += -(-a.nbytes // _PACK_ALIGN) * _PACK_ALIGN
+    head = json.dumps({"stamp": stamp, "arrays": [[n, a.dtype.str, list(a.shape), o] for n, a, o in items]}).encode()
+    start = -(-(len(_PACK_MAGIC) + 8 + len(head)) // _PACK_ALIGN) * _PACK_ALIGN
+    tmp = f"{dest}.{os.getpid()}.{threading.get_ident()}.tmp"
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    try:
+        with open(tmp, "wb") as fh:
+            fh.write(_PACK_MAGIC + len(head).to_bytes(8, "little") + head)
+            for n, a, o in items:
+                fh.seek(start + o)
+                fh.write(a.tobytes())
+            fh.truncate(start + off)
+        os.replace(tmp, dest)       # (Windows: refused while another process maps the old one; it stays, stale)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+    return off
+
+
+def _pack_read(src, stamp):
+    """The arrays of a mirror file, or None when it is another layer file's (stamp): the ones over MIRROR_SMALL as
+    read-only views of one memory mapping, the others in memory."""
+    with open(src, "rb") as fh:
+        pre = fh.read(len(_PACK_MAGIC) + 8)
+        if len(pre) < len(_PACK_MAGIC) + 8 or not pre.startswith(_PACK_MAGIC):
+            raise ValueError("not a mirror file")
+        head = json.loads(fh.read(int.from_bytes(pre[len(_PACK_MAGIC):], "little")))
+        if head["stamp"] != stamp:
+            return None
+        start = -(-fh.tell() // _PACK_ALIGN) * _PACK_ALIGN
+        specs = [(n, np.dtype(dt), tuple(shape), o) for n, dt, shape, o in head["arrays"]]
+        size = os.fstat(fh.fileno()).st_size
+        mm = None
+        out = {}
+        for n, dt, shape, o in specs:
+            nbytes = dt.itemsize * int(np.prod(shape, dtype=np.int64))
+            if start + o + nbytes > size:
+                raise EOFError(f"{src}: cut short")
+            if nbytes > MIRROR_SMALL:
+                if mm is None:
+                    mm = np.memmap(fh, np.uint8, "r")
+                # (a plain view of the mapping: np.memmap's Python hooks ran on every slice)
+                out[n] = np.ndarray(shape, dt, buffer=mm, offset=start + o)
+            else:
+                fh.seek(start + o)
+                out[n] = np.frombuffer(fh.read(nbytes), dt).reshape(shape).copy()
+        return out
+
+
 def prune_mirror(cache_dir):
-    """The uncompressed mirror cut back to 80 % of MIRROR_MB when over it, the least recently written folders first
-    (a process's writes, and earthd at start: a session that only reads it never pruned it)."""
+    """The uncompressed mirror cut back to 80 % of MIRROR_MB when over it, the least recently written folders and
+    files first (a process's writes, and earthd at start: a session that only reads it never pruned it)."""
     root = os.path.join(cache_dir, "mapdata-mirror")
     entries, total = [], 0
     for dirpath, dirnames, filenames in os.walk(root):
@@ -673,12 +863,27 @@ def prune_mirror(cache_dir):
             except OSError:
                 pass
             dirnames[:] = []
+            continue
+        for f in filenames:
+            if f.endswith(".pack"):
+                try:
+                    st = os.stat(os.path.join(dirpath, f))
+                    entries.append((st.st_mtime, st.st_size, os.path.join(dirpath, f)))
+                    total += st.st_size
+                except OSError:
+                    pass
     if total <= MIRROR_MB * 1e6:
         return 0
     import shutil
     removed = 0
     for _, n, dpath in sorted(entries):
-        shutil.rmtree(dpath, ignore_errors=True)
+        if dpath.endswith(".pack"):
+            try:
+                os.remove(dpath)
+            except OSError:         # (Windows: mapped by a process now)
+                continue
+        else:
+            shutil.rmtree(dpath, ignore_errors=True)
         total -= n
         removed += 1
         if total <= 0.8 * MIRROR_MB * 1e6:

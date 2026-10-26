@@ -2669,6 +2669,32 @@ class BridgeProfiles:
             cache.setdefault(str(key), got)
             return cache[str(key)]
 
+    def _pool_pairs(self, keys, pool):
+        """{part key: {part keys}} of the pool's parts that cross or lie side by side (solved together). A pure function
+        of the pool's parts, kept per pool: every part not in a chain yet gathered the same cells' pool and paired all
+        of it again (O(n^2) each; Munich's ~400 small tunnels: 426 pairings of 19 pools, 9 of 10 s, 2026-10-26)."""
+        sig = tuple((k, len(pool[k][1]), pool[k][4], float(pool[k][0].width)) for k in keys)
+        memo = self.__dict__.setdefault("_pairs_memo", {})
+        with self.lock:
+            got = memo.get(sig)
+        if got is not None:
+            return got
+        over = _deck_crossings([pool[k][1] for k in keys])
+        crossing = {}
+        for a, b, _, _ in over:
+            crossing.setdefault(keys[a], set()).add(keys[b])
+            crossing.setdefault(keys[b], set()).add(keys[a])
+        # and side by side / one over the other (solved apart, the Queensboro Bridge's two upper roadways met at
+        # a 0.5 m step and its tiles' decks at different heights stood as blocks in the lanes, 2026-10-17)
+        for a, b in _deck_beside([pool[k][1] for k in keys], [pool[k][0].width for k in keys]):
+            crossing.setdefault(keys[a], set()).add(keys[b])
+            crossing.setdefault(keys[b], set()).add(keys[a])
+        with self.lock:
+            if len(memo) > 64:
+                memo.clear()
+            memo[sig] = crossing
+        return crossing
+
     def _resolve(self, start, pool, ground, loaded):
         """The chain of part `start` (keys), loading the cell at each loose end until closed."""
         def nk(p):
@@ -2679,16 +2705,7 @@ class BridgeProfiles:
                 by_node.setdefault(nk(xy[0]), []).append(k)
                 by_node.setdefault(nk(xy[-1]), []).append(k)
             keys = sorted(pool)
-            over = _deck_crossings([pool[k][1] for k in keys])
-            crossing = {}
-            for a, b, _, _ in over:
-                crossing.setdefault(keys[a], set()).add(keys[b])
-                crossing.setdefault(keys[b], set()).add(keys[a])
-            # and side by side / one over the other (solved apart, the Queensboro Bridge's two upper roadways met at
-            # a 0.5 m step and its tiles' decks at different heights stood as blocks in the lanes, 2026-10-17)
-            for a, b in _deck_beside([pool[k][1] for k in keys], [pool[k][0].width for k in keys]):
-                crossing.setdefault(keys[a], set()).add(keys[b])
-                crossing.setdefault(keys[b], set()).add(keys[a])
+            crossing = self._pool_pairs(keys, pool)
             comp, stack = {start}, [start]
             while stack:                        # joined at nodes, or crossing (solved together)
                 k = stack.pop()
@@ -4399,6 +4416,9 @@ class Tracker:
         self.fails = {}         # tile -> builds failed in a row (TILE_FAILS_WARN)
         self.started = {}       # tile -> monotonic time its build started (TILE_STUCK_S)
         self.stuck_said = set()
+        # tiles graded from region plans (their cells not planned whole yet): tile -> [monotonic time it is checked
+        # against the whole plans (build verify=True; built again when they grade it otherwise), when it was sent]
+        self.regioned = {}
 
     def close(self):
         if self.pool is not None:
@@ -4413,7 +4433,8 @@ class Tracker:
 
     def on_pose(self, conn, aid, x, y, loop, build, vel=(0.0, 0.0), ground_busy=False, view=None, foci=()):
         """Called with the player's position (and velocity, m/s) in the active anchor's frame. build(aid, tx, ty) runs
-        in a worker and returns the tile's (path, n) or None; its result is announced with conn.send. ground_busy: a
+        in a worker and returns the tile's (path, n) or None (path, n, True: graded from region plans, then checked with
+        build(aid, tx, ty, True) later: UNCHANGED or the tile again); its result is announced with conn.send. ground_busy: a
         terrain block the mod asked for is being built: no tile beyond SEND_M starts meanwhile (the ground first; at
         180 mph the block ahead waited 7.5 s among them, 2026-10-19). view: the camera's (x, y) when it is away from
         the car (earthd camera_away): the tiles round it are wanted too, after the car's (which carry what it drives
@@ -4424,7 +4445,7 @@ class Tracker:
                 f.cancel()
             self.aid, self.sent, self.building, self.futs = aid, set(), set(), {}
             self.empty, self.retry, self.fails = set(), {}, {}
-            self.started, self.stuck_said = {}, set()
+            self.started, self.stuck_said, self.regioned = {}, set(), {}
         if self.pool is None:
             from concurrent.futures import ThreadPoolExecutor
             self.pool = ThreadPoolExecutor(BUILD_PER_POSE, thread_name_prefix="roads-tile")
@@ -4447,11 +4468,23 @@ class Tracker:
         def focus_d(k):
             return min(tile_distance(k[0], k[1], f[0], f[1]) for f in foci)
         want.sort(key=lambda k: (2, focus_d(k)) if k in others else (1, cam_key(k)) if k in seen else (0, car_key(k)))
-        for tx, ty in want[:max(0, BUILD_PER_POSE - len(self.building))]:   # in flight at most (vegetation.Tracker)
+        slots = max(0, BUILD_PER_POSE - len(self.building))
+        for tx, ty in want[:slots]:     # in flight at most (vegetation.Tracker)
             self.building.add((tx, ty))
             self.started[(tx, ty)] = now
             fut = self.futs[(tx, ty)] = loop.run_in_executor(self.pool, build, aid, tx, ty)
             fut.add_done_callback(lambda f, k=(tx, ty), a=aid: self._built(conn, a, k, f))
+        if self.regioned and len(want) < slots and not any(k in self.regioned for k in self.building):
+            # (a free slot, nothing else to build: a tile graded from region plans told apart from its whole plans,
+            # the nearest first, one at a time)
+            due = sorted((k for k, (t, _t0) in self.regioned.items() if t <= now and k in self.sent),
+                         key=lambda k: tile_distance(k[0], k[1], x, y))
+            if due:
+                k = due[0]
+                self.building.add(k)
+                self.started[k] = now
+                fut = self.futs[k] = loop.run_in_executor(self.pool, build, aid, k[0], k[1], True)
+                fut.add_done_callback(lambda f, k=k, a=aid: self._built(conn, a, k, f, True))
         # a build that never ends leaves the loading line at "roads & buildings 0/36" with nothing in the log (GitHub
         # #241, a Discord report): said once per tile, with how many are in flight
         for k in self.building:
@@ -4466,13 +4499,14 @@ class Tracker:
         drop = [k for k in self.sent if k not in wanted and far(k)]
         for k in drop:
             self.sent.discard(k)
+            self.regioned.pop(k, None)
             conn.send({"type": "roads_drop", "anchorId": aid, "key": f"{k[0]}_{k[1]}"})
         if self.empty:
             self.empty = {k for k in self.empty if k in wanted or not far(k)}
         if self.retry:
             self.retry = {k: t for k, t in self.retry.items() if t > now}
 
-    def _built(self, conn, aid, key, fut):
+    def _built(self, conn, aid, key, fut, verify=False):
         if aid != self.aid:                 # (an old anchor's: the same key may be in flight for the new one)
             return
         self.building.discard(key)
@@ -4480,26 +4514,57 @@ class Tracker:
         self.started.pop(key, None)
         if fut.cancelled():
             return
-        try:
-            res = fut.result()
-        except Exception as e:      # network trouble: the next pose asks again
-            # (a bug failed every tile on a Steam Deck with nothing in the log, 2026-10-20: each kind once, in full)
-            kind = f"{type(e).__name__}: {e}"[:200]
-            fails = self.fails[key] = self.fails.get(key, 0) + 1
-            if kind not in _FAILS_SEEN and not isinstance(e, (OSError, TimeoutError)):
-                _FAILS_SEEN.add(kind)
-                log.warning("roads tile %s failed: %s", key, kind, exc_info=e)
-            elif fails == TILE_FAILS_WARN:      # network trouble that does not pass (GitHub #91: no roads, no log)
-                log.warning("roads tile %s of anchor %d: %d builds failed in a row, the last: %s", key, aid, fails, kind)
-            else:
-                log.debug("roads tile %s: %s: %s", key, type(e).__name__, e)
-            self.retry[key] = time.monotonic() + TILE_RETRY_S
-            return
+        if verify:
+            v = self.regioned.get(key)
+            try:
+                res = fut.result()
+            except Exception as e:  # (NotReady: its whole plans not all made yet) asked again later
+                log.debug("roads tile %s against its whole plans: %s: %s", key, type(e).__name__, e)
+                if v is not None:
+                    if time.monotonic() - v[1] > VERIFY_GIVE_UP_S:
+                        self.regioned.pop(key, None)
+                    else:
+                        v[0] = time.monotonic() + VERIFY_RETRY_S
+                return
+            self.regioned.pop(key, None)
+            if isinstance(res, str) or key not in self.sent:     # (UNCHANGED; or dropped meanwhile)
+                return
+        else:
+            try:
+                res = fut.result()
+            except NotReady as e:   # its road plans are being made by another process: the other tiles meanwhile
+                log.debug("roads tile %s: %s", key, e)
+                self.retry[key] = time.monotonic() + NOT_READY_S
+                return
+            except Exception as e:  # network trouble: the next pose asks again
+                self._failed(aid, key, e)
+                return
+        self._send(conn, aid, key, res)
+
+    def _failed(self, aid, key, e):
+        """A tile's build failed (network trouble): the next pose asks again after TILE_RETRY_S."""
+        # (a bug failed every tile on a Steam Deck with nothing in the log, 2026-10-20: each kind once, in full)
+        kind = f"{type(e).__name__}: {e}"[:200]
+        fails = self.fails[key] = self.fails.get(key, 0) + 1
+        if kind not in _FAILS_SEEN and not isinstance(e, (OSError, TimeoutError)):
+            _FAILS_SEEN.add(kind)
+            log.warning("roads tile %s failed: %s", key, kind, exc_info=e)
+        elif fails == TILE_FAILS_WARN:      # network trouble that does not pass (GitHub #91: no roads, no log)
+            log.warning("roads tile %s of anchor %d: %d builds failed in a row, the last: %s", key, aid, fails, kind)
+        else:
+            log.debug("roads tile %s: %s: %s", key, type(e).__name__, e)
+        self.retry[key] = time.monotonic() + TILE_RETRY_S
+
+    def _send(self, conn, aid, key, res):
+        """A built tile's result (path, n[, graded from region plans]) announced (None: no roads there)."""
         self.fails.pop(key, None)
         if res is None:                     # no roads there: not built again while it stays within reach
             self.empty.add(key)
             return
-        path, n = res
+        path, n = res[0], res[1]
+        if len(res) > 2 and res[2]:         # (its cells not planned whole yet: checked against them later)
+            now = time.monotonic()
+            self.regioned[key] = [now + VERIFY_AFTER_S, now]
         self.sent.add(key)
         m = {"type": "roads_tile", "anchorId": aid, "key": f"{key[0]}_{key[1]}", "path": path, "n": n}
         out_dir = getattr(getattr(conn, "s", None), "out_dir", None)
@@ -4515,6 +4580,25 @@ class Tracker:
 
 
 TILE_RETRY_S = 3.0              # s before a road tile whose build failed is built again (Tracker._built)
+# A road tile whose cells' road plans another process is making (blockworker.roads_tile) comes back at once and is asked
+# again after NOT_READY_S: waiting for them in the road process (up to plancache.WAIT_S) held its slot, and the tiles
+# whose plans were there waited behind it (a fresh place at 200 km/h: 99-141 s of such waits per process, the CPU
+# audit 2026-10-26)
+NOT_READY_S = 1.0
+
+
+class NotReady(Exception):
+    """A tile's road plans are being made elsewhere (blockworker.roads_tile): build it again later."""
+
+
+# A tile graded from region plans (blockworker.TILE_REGION: its cells not planned whole when it was built) is checked
+# against its cells' whole plans VERIFY_AFTER_S after it was sent, when a road slot is free (again every VERIFY_RETRY_S
+# while they are not all made, for VERIFY_GIVE_UP_S at most), and sent again only when they grade it otherwise; the
+# check's answer when they do not: UNCHANGED.
+VERIFY_AFTER_S = 20.0
+VERIFY_RETRY_S = 10.0
+VERIFY_GIVE_UP_S = 600.0
+UNCHANGED = "unchanged"
 TILE_STUCK_S = 90.0             # s a road tile's build may take before the log says it may be stuck
 TILE_FAILS_WARN = 5             # a tile's builds failed in a row before an expected kind of failure is logged as a warning
 _FAILS_SEEN = set()             # the kinds of road tile failures logged in full (Tracker._built)

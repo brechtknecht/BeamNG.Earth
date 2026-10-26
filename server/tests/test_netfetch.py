@@ -265,6 +265,25 @@ class ConcurrencyTest(unittest.TestCase):
         h.sem.release()
         f.get(url(EOX), kind="prefetch")
 
+    def test_prefetch_holds_at_most_its_share_of_the_slots(self):
+        """With PREFETCH_SLOTS of a host's slots held by prefetch, another prefetch is dropped while slots are still
+        free (they stay for demand); a finished one gives its share back."""
+        pol = nf.with_policy(nf.POLICIES, EOX, max_conc=4)
+        f, clock, sleep, tr = fetcher(policies=pol)
+        h = f.host(EOX)
+        share = max(1, int(4 * nf.PREFETCH_SLOTS))
+        self.assertLess(share, 4)
+        for _ in range(share):              # prefetches in flight
+            h.ahead_sem.acquire()
+            h.sem.acquire()
+        with self.assertRaises(nf.Deferred):
+            f.get(url(EOX, 1), kind="prefetch")
+        f.get(url(EOX, 2))                  # demand still has a slot
+        h.ahead_sem.release()
+        h.sem.release()
+        f.get(url(EOX, 3), kind="prefetch")
+        self.assertEqual(len(tr.calls), 2)
+
 
 class TransportTest(unittest.TestCase):
     """HttpsTransport over a fake connection class (no sockets): a failed request is sent again on a

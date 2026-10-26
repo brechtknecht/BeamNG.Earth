@@ -10,6 +10,8 @@ GRADE per metre: the approach embankments, across segment ends and tile edges al
 around the tile). The ballast's sides go down past the ground, a low
 embankment on the flat and a tall one on a ramp. Where a road crosses at grade, the track stops either side of the
 carriageway (a level crossing: the road's own surface across it). Tunnels are left out. Pure given its inputs."""
+import os
+
 import numpy as np
 
 import mapgeom
@@ -604,6 +606,58 @@ def _piers(s, xy, u, t, zg, i, j):
     return np.c_[cx, cy], np.c_[un[:, 1], -un[:, 0]], un, zgs - PIER_FOOT_M, zt
 
 
+FEET_BATCH = os.environ.get("BNGE_RAIL_FEET_BATCH", "1") != "0"
+
+
+def _ballast_feet(rails, prof, ex, ground):
+    """{part index: [(foot (k,), ground z (k,)) left, right]} of the on-ground parts reaching the box ex (tile_mesh): the
+    ballast's sides to the ground beside, wider where the bed stands high (a ramp's embankment). Every part's points in
+    two ground calls (its cost is per call: one or two per part and side were ~half a rail tile's time, 2026-10-26); the
+    heights are per point, as before."""
+    near = BALLAST_TOP_M + BALLAST_SLOPE * (BALLAST_H + BALLAST_FOOT_M)
+    jobs = []
+    for n, ((_fid, _cls, kind, xy), (zb, _zg)) in enumerate(zip(rails, prof)):
+        if kind != "ground":
+            continue
+        inside = (xy[:, 0] >= ex[0] - STEP_M) & (xy[:, 0] <= ex[2] + STEP_M) & \
+                 (xy[:, 1] >= ex[1] - STEP_M) & (xy[:, 1] <= ex[3] + STEP_M)
+        if inside.any():
+            jobs.append((n, xy, _left(xy), zb + BALLAST_H))
+    if not jobs:
+        return {}
+    if not FEET_BATCH:                              # BNGE_RAIL_FEET_BATCH=0: one part at a time, as before
+        out = {}
+        for job in jobs:
+            out.update(_feet_of([job], ground, near))
+        return out
+    return _feet_of(jobs, ground, near)
+
+
+def _feet_of(jobs, ground, near):
+    """_ballast_feet's heights for jobs [(part index, xy, left normals, ballast top)] in two ground calls."""
+    pts = [xy + sg * u * near for _n, xy, u, _t in jobs for sg in (1, -1)]
+    zall = np.asarray(ground(np.concatenate(pts)), np.float64)
+    sides, k = [], 0
+    for (_n, xy, u, top), sg in ((j, sg) for j in jobs for sg in (1, -1)):
+        zs = zall[k:k + len(xy)]
+        k += len(xy)
+        foot = np.minimum(BALLAST_TOP_M + BALLAST_SLOPE * (np.maximum(top - zs, 0.0) + BALLAST_FOOT_M), FOOT_MAX_M)
+        sides.append((xy, u, sg, foot, zs.copy(), foot > near + 0.5))
+    far_pts = [xy[far] + sg * u[far] * foot[far, None] for xy, u, sg, foot, _zs, far in sides if far.any()]
+    if far_pts:
+        zf = np.asarray(ground(np.concatenate(far_pts)), np.float64)
+        k = 0
+        for _xy, _u, _sg, _foot, zs, far in sides:
+            m = int(far.sum())
+            if m:
+                zs[far] = zf[k:k + m]
+                k += m
+    out = {}
+    for i, (n, *_rest) in enumerate(jobs):
+        out[n] = [(sides[2 * i][3], sides[2 * i][4]), (sides[2 * i + 1][3], sides[2 * i + 1][4])]
+    return out
+
+
 GRADED_NEAR_M = 40.0        # m around the tile where the track's heights read the graded ground (tile_mesh far_ground)
 
 
@@ -652,7 +706,8 @@ def tile_mesh(frame, tx, ty, cells, ground, sign_style=None, far_ground=None):
     ballast, concrete, steel = mesh.mat(BALLAST), mesh.mat(CONCRETE), mesh.mat(STEEL)
     up = np.array([0.0, 0.0, 1.0])
     small = []                                      # sleepers and piers: drawn last, as room allows
-    for (fid, cls, kind, xy), (zb, zg) in zip(rails, prof):
+    feet_of = _ballast_feet(rails, prof, ex, ground)
+    for n_part, ((fid, cls, kind, xy), (zb, zg)) in enumerate(zip(rails, prof)):
         inside = (xy[:, 0] >= ex[0] - STEP_M) & (xy[:, 0] <= ex[2] + STEP_M) & \
                  (xy[:, 1] >= ex[1] - STEP_M) & (xy[:, 1] <= ex[3] + STEP_M)
         if not inside.any():
@@ -663,18 +718,7 @@ def tile_mesh(frame, tx, ty, cells, ground, sign_style=None, far_ground=None):
         top = zb + BALLAST_H
         if kind == "ground":
             cut = _blocked(xy, zb, crossers) | ~inside
-            # the ballast's sides to the ground beside: wider where the bed stands high (a ramp's embankment)
-            near = BALLAST_TOP_M + BALLAST_SLOPE * (BALLAST_H + BALLAST_FOOT_M)
-            feet = []
-            for sg in (1, -1):
-                zs = np.asarray(ground(xy + sg * u * near), np.float64)
-                foot = np.minimum(BALLAST_TOP_M + BALLAST_SLOPE * (np.maximum(top - zs, 0.0) + BALLAST_FOOT_M),
-                                  FOOT_MAX_M)
-                far = foot > near + 0.5
-                if far.any():
-                    zs = zs.copy()
-                    zs[far] = np.asarray(ground(xy[far] + sg * u[far] * foot[far, None]), np.float64)
-                feet.append((foot, zs))
+            feet = feet_of[n_part]
         else:
             cut = ~inside
         for i, j in _runs(cut):
