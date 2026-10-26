@@ -62,7 +62,7 @@ local PAIR = {}         -- the metatable of a sign's two items (face, body): one
 function M.addBody(fd, face, body, m, sc, solid, itemType)
   local d = itemType(body, solid)
   if not d then return nil end
-  local ok, it = pcall(function() return fd:createNewItem(d, m, sc) end)
+  local ok, it = pcall(fd.createNewItem, fd, d, m, sc)
   if not ok or not it then return nil end
   return setmetatable({ face, it }, PAIR)
 end
@@ -70,7 +70,7 @@ end
 -- Removes a pair made by addBody: true if it was one (both its items go), false for any other item (the caller's).
 function M.remove(fd, it)
   if getmetatable(it) ~= PAIR then return false end
-  for _, part in ipairs(it) do pcall(function() fd:removeItem(part) end) end
+  for q = 1, #it do pcall(fd.removeItem, fd, it[q]) end
   return true
 end
 

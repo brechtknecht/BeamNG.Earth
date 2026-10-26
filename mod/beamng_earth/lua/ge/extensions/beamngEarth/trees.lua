@@ -484,7 +484,7 @@ local function expireWarm(frame, all)
   local keep = {}
   for _, w in ipairs(warmItems) do
     if all or frame - w[2] >= M.WARM_KEEP_FRAMES then
-      if fd then pcall(function() fd:removeItem(w[1]) end) end
+      if fd then pcall(fd.removeItem, fd, w[1]) end
     else keep[#keep + 1] = w end
   end
   warmItems = keep
@@ -497,7 +497,7 @@ local function warmShape(shape, player, frame)
     local m = MatrixF(true)
     m:setPosition(vec3(player.x, player.y, (player.z or 0) - M.WARM_DEPTH_M))
     local fd = warmForest():getData()
-    local ok, it = pcall(function() return fd:createNewItem(d, m, 1) end)
+    local ok, it = pcall(fd.createNewItem, fd, d, m, 1)
     if ok and it then warmItems[#warmItems + 1] = { it, frame } end
   end
   markLoaded(shape)
@@ -530,7 +530,7 @@ local function makeItem(fd, f, j, shape, sc, solid, group, variant)
   -- diagonal walls askew, benches and lamps turned (read back in-game 2026-10-17: rows at 141.6 rendered at -141.6)
   m:setFromEuler(vec3(0, 0, -math.rad(f[j + 5])))
   m:setPosition(vec3(f[j + 2], f[j + 3], f[j + 4]))
-  local ok, it = pcall(function() return fd:createNewItem(d, m, sc) end)
+  local ok, it = pcall(fd.createNewItem, fd, d, m, sc)   -- no closure: one per item kept LuaJIT from compiling
   if not ok then M.errors = M.errors + 1; return nil end
   local body = vienna.body(group)
   if body then
@@ -544,7 +544,7 @@ local function makeItem(fd, f, j, shape, sc, solid, group, variant)
 end
 
 local function removeItem(fd, it, shape)
-  if not vienna.remove(fd, it) then pcall(function() fd:removeItem(it) end) end
+  if not vienna.remove(fd, it) then pcall(fd.removeItem, fd, it) end
   M.removed = M.removed + 1
   if shape then pop[shape] = math.max((pop[shape] or 1) - 1, 0) end
 end
@@ -709,6 +709,7 @@ end
 -- list). Read only by the caller: extra itself when no cell changed. (No set of extra's rows, no scan of every row:
 -- at 307 km/h that made ~3 MB of garbage a second, the replay 2026-10-26.)
 local changedCells, cellOrder, cellDist = {}, {}, {}
+local function nearerCell(a, b) return cellDist[a] < cellDist[b] end
 function M.changedRows(t, old, new, extra, car)
   local n = math.floor(256 / M.CELL_M)
   local nc = 0
@@ -726,7 +727,7 @@ function M.changedRows(t, old, new, extra, car)
   end
   if nc == 0 then return extra or {} end
   for q = nc + 1, #cellOrder do cellOrder[q] = nil end
-  table.sort(cellOrder, function(a, b) return cellDist[a] < cellDist[b] end)
+  table.sort(cellOrder, nearerCell)
   cellRows(t)
   local out, cr, cells = {}, t.cellRows, t.cells
   if extra then
@@ -827,12 +828,47 @@ releaseGhosts = function(anchorId, player)
   if not left then ghostSince = nil end
 end
 
+-- Rows put back because their shape could not change this frame (allow) wait by shape: t.wait (shape -> rows), t.waiting
+-- (row -> true). A frame looks at a shape's rows again only once allow lets it touch that shape, not at each row every
+-- frame (the replay, 2026-10-26, A13 at 307 km/h: 14 M rows looked at for 0.68 M items made or removed, 6 M of them
+-- only put back, again and again).
+local function wait(t, i, sh)
+  local w, ws = t.wait, t.waiting
+  if not w then w, ws = {}, {}; t.wait, t.waiting = w, ws end
+  if ws[i] then return end
+  local l = w[sh]
+  if not l then l = {}; w[sh] = l end
+  l[#l + 1] = i
+  ws[i] = true
+end
+
+-- The waiting rows whose shape this frame may touch (taken out of t.wait), or nil.
+local function unwait(t)
+  local w = t.wait
+  if not w then return nil end
+  local out = nil
+  for sh, l in pairs(w) do
+    if allow(sh) then
+      out = out or {}
+      local ws = t.waiting
+      for q = 1, #l do out[#out + 1] = l[q]; ws[l[q]] = nil end
+      w[sh] = nil
+    end
+  end
+  return out
+end
+
 -- Every frame: tiles of other anchors and dropped ones emptied, the others filled / thinned to their
 -- distance's rank, M.PER_FRAME items at most.
 -- Tree work every EVERY_N-th frame, N times the items: a frame with any Forest change costs the engine's tick a few
 -- ms whatever the count (2026-10-15, 100 mph forest drive: tick 3.5 -> 1.65 ms a frame on average, 50 -> 54 fps)
 M.EVERY_N = 3
 local frameN = 0
+-- the order's sort: by class, then pathKey (a module function: one made per call kept LuaJIT from compiling update)
+local function byClassThenPath(a, b)
+  if a[6] ~= b[6] then return a[6] < b[6] end
+  return a[7] < b[7]
+end
 -- view: the camera's {x, y} when it is away from the car (core: VIEW_AWAY_M), else nil: what is shown follows what the
 -- player looks at, the colliding items stay round the car (the user, 2026-10-20: "the LODs still all follow the car").
 function M.update(anchorId, player, view)
@@ -931,10 +967,7 @@ function M.update(anchorId, player, view)
     order[#order + 1] = { key, dShow, dCar, all, mask, class, pathKey(t, dShow) }
     ::continue::
   end
-  table.sort(order, function(a, b)
-    if a[6] ~= b[6] then return a[6] < b[6] end
-    return a[7] < b[7]
-  end)
+  table.sort(order, byClassThenPath)
   local nearMade, urgentMade = false, false
   local urgentR2 = math.max(M.URGENT_MIN_M, sp * M.URGENT_S) ^ 2
   local rowsScanned = 0
@@ -947,16 +980,18 @@ function M.update(anchorId, player, view)
   for _, o in ipairs(order) do
     local t = tiles[o[1]]
     local fd = nil                          -- the tile's Forest data, made when it first needs an item
-    local function data() fd = fd or forest(t):getData(); return fd end
     local want = tileThreshold(o[2], t)
     local band = groupBand(t, o[2])
     local all, mask = o[4], o[5]
     local near = all or mask ~= ''
     if want ~= t.shown or band ~= t.band or all ~= t.all or mask ~= (t.mask or '') or t.pending then
       -- only solid cells changed: those cells' rows and the ones left over (t.pendingRows), else every row
-      local idxs = nil
+      local idxs, more = nil, nil
       if want == t.shown and band == t.band and all == t.all and (not t.pending or t.pendingRows) then
         idxs = M.changedRows(t, t.mask or '', mask, t.pending and t.pendingRows or nil, car)
+        more = unwait(t)
+      else
+        t.wait, t.waiting = nil, nil        -- (every row is looked at)
       end
       if rowsScanned > M.ROWS_PER_FRAME then finish(); return end
       -- (the tile's state is what it shows once its rows are done: the rows not done yet are its pendingRows)
@@ -964,15 +999,18 @@ function M.update(anchorId, player, view)
       t.all, t.mask, t.shown, t.band, t.near = all, mask, want, band, near
       local left = {}
       local cells = mask ~= '' and not all and M.cellsOf(t) or nil
-      local nrows = idxs and #idxs or t.n
+      local n1 = idxs and #idxs or t.n
+      local nrows = n1 + (more and #more or 0)
       local f = t.flat
+      local waiting = t.waiting
       rowsScanned = rowsScanned + nrows
       for k = 1, nrows do
-        local i = idxs and idxs[k] or k
+        local i = k > n1 and more[k - n1] or idxs and idxs[k] or k
         if budget <= 0 then          -- (the rest another frame)
-          for k2 = k, nrows do left[#left + 1] = idxs and idxs[k2] or k2 end
+          for k2 = k, nrows do left[#left + 1] = k2 > n1 and more[k2 - n1] or idxs and idxs[k2] or k2 end
           break
         end
+        if k <= n1 and waiting and waiting[i] then goto nextRow end      -- (it waits for its shape: t.wait)
         local j = (i - 1) * ROW_N
         local r = f[j + 8]
         local g = (t.groups or GROUPS)[f[j + 1] + 1]
@@ -994,8 +1032,9 @@ function M.update(anchorId, player, view)
             if coldOk(body) then warmShape(body, player, frameN) end
             left[#left + 1] = i
           elseif allow(sh) then
-            if t.made[i] then removeItem(data(), t.made[i], t.madeShape[i]); budget = budget - 1 end  -- solid <-> not
-            t.made[i] = makeItem(data(), f, j, sh, sc, solid, g, t.variant)
+            fd = fd or forest(t):getData()
+            if t.made[i] then removeItem(fd, t.made[i], t.madeShape[i]); budget = budget - 1 end  -- solid <-> not
+            t.made[i] = makeItem(fd, f, j, sh, sc, solid, g, t.variant)
             t.solid[i] = (t.made[i] and solid) or nil      -- true or nil
             t.madeShape[i] = t.made[i] and sh or nil
             if solid then
@@ -1004,16 +1043,20 @@ function M.update(anchorId, player, view)
               if not urgentMade and dx * dx + dy * dy <= urgentR2 then urgentMade = true end
             end
             budget = budget - 1
-          else left[#left + 1] = i end            -- another frame (this one's shapes are full)
+          else wait(t, i, sh) end                 -- another frame (this one's shapes are full)
         elseif r >= want and t.made[i] then
           if allow(t.madeShape[i] or '') then
-            removeItem(data(), t.made[i], t.madeShape[i])
+            fd = fd or forest(t):getData()
+            removeItem(fd, t.made[i], t.madeShape[i])
             t.made[i], t.solid[i], t.madeShape[i] = nil, nil, nil
             budget = budget - 1
-          else left[#left + 1] = i end
+          else wait(t, i, t.madeShape[i] or '') end
         end
+        ::nextRow::
       end
-      if #left > 0 then t.pending, t.pendingRows, t.pendingClass = true, left, math.min(o[6], t.pendingClass or 2) end
+      if #left > 0 or (t.wait and next(t.wait) ~= nil) then
+        t.pending, t.pendingRows, t.pendingClass = true, left, math.min(o[6], t.pendingClass or 2)
+      end
       if budget <= 0 then finish(); return end
     end
   end

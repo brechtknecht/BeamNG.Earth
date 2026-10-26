@@ -87,9 +87,12 @@ M.created, M.nudges, M.physMade, M.riversMade, M.riverErrors = 0, 0, 0, 0, 0
 M.RIVER_PREFIX = 'bngEarthRiver_'
 M.SUBDIVIDE_MIN, M.SUBDIVIDE_COLUMNS = 6, 8    -- a River's near mesh: at most 8 columns, cells >= 6 m
 
+local found = {}         -- path -> whether it exists (asked once: a block or river asked for 3 of them each)
 local function exists(p)
-  return not FS or FS:fileExists(p)
+  if found[p] == nil then found[p] = not FS or FS:fileExists(p) end
+  return found[p]
 end
+local synced = false     -- every wanted block and river exists, no other: update skips its walks until want changes
 
 local function removePhys()
   if phys then
@@ -109,6 +112,7 @@ local function removeAll()
     if o then o:delete() end
   end
   made, madeRivers, madeAnchor = {}, {}, nil
+  synced = false
   removePhys()
 end
 
@@ -234,6 +238,7 @@ function M.onMessage(msg)
     end
   end
   want = { anchorId = msg.anchorId, tiles = tiles, rivers = rivers }
+  synced = false
 end
 
 -- Every frame: the tiles of the server's set for the current anchor exist, the others are gone.
@@ -244,35 +249,39 @@ function M.update(anchorId, player)
     return
   end
   if madeAnchor ~= anchorId then removeAll(); madeAnchor = anchorId end
-  for key, m in pairs(made) do
-    if not want.tiles[key] then
-      local o = scenetree.findObjectById(m.id)
-      if o then o:delete() end
-      made[key] = nil
-    end
-  end
-  for key, id in pairs(madeRivers) do
-    if not want.rivers[key] then
-      local o = scenetree.findObjectById(id)
-      if o then o:delete() end
-      madeRivers[key] = nil
-    end
-  end
   local n, nudge = 0, false
-  for key, r in pairs(want.rivers) do
-    if not madeRivers[key] then
-      if n >= M.CREATE_PER_FRAME then break end
-      createRiver(key, r)
-      n = n + 1
+  if not synced then
+    for key, m in pairs(made) do
+      if not want.tiles[key] then
+        local o = scenetree.findObjectById(m.id)
+        if o then o:delete() end
+        made[key] = nil
+      end
     end
-  end
-  for key, t in pairs(want.tiles) do
-    if not made[key] then
-      if n >= M.CREATE_PER_FRAME then break end
-      create(key, t)
-      n = n + 1
-      if player and inside(t, player) and player.z < t.z + 1 then nudge = true end
+    for key, id in pairs(madeRivers) do
+      if not want.rivers[key] then
+        local o = scenetree.findObjectById(id)
+        if o then o:delete() end
+        madeRivers[key] = nil
+      end
     end
+    for key, r in pairs(want.rivers) do
+      if not madeRivers[key] then
+        if n >= M.CREATE_PER_FRAME then break end
+        createRiver(key, r)
+        n = n + 1
+      end
+    end
+    for key, t in pairs(want.tiles) do
+      if not made[key] then
+        if n >= M.CREATE_PER_FRAME then break end
+        create(key, t)
+        n = n + 1
+        if player and inside(t, player) and player.z < t.z + 1 then nudge = true end
+      end
+    end
+    synced = n < M.CREATE_PER_FRAME   -- all made (a river that failed waits for the next message instead of
+                                      -- deserializing again every frame); else the walk again next frame
   end
   if player then
     local t = tileAt(player)
@@ -341,6 +350,7 @@ function M.transform(xf, newAnchorId)
     if o then o:delete() end
   end
   madeRivers = {}
+  synced = false
   if phys then
     phys.x, phys.y, phys.z = xf:apply(phys.x, phys.y, phys.z)
     local o = scenetree.findObjectById(phys.id)
@@ -357,7 +367,7 @@ end
 
 -- Level end: the level deletes its objects itself.
 function M.reset()
-  want, made, madeRivers, madeAnchor, phys, physStale = nil, {}, {}, nil, nil, false
+  want, made, madeRivers, madeAnchor, phys, physStale, synced = nil, {}, {}, nil, nil, false, false
 end
 
 function M.status()
