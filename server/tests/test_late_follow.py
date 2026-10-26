@@ -83,6 +83,7 @@ class LateFollowTest(unittest.TestCase):
             time.sleep(0.05)
             return {"ter": "prov.ter"}
         s.make_follow_provisional = provisional
+        s.drop_build = lambda key: built.append(("dropped", key[1], key[2])) or True
 
         async def go():
             w = _Writer()
@@ -126,8 +127,51 @@ class LateFollowTest(unittest.TestCase):
     def test_no_refresh_once_the_mod_moved_on(self):
         def away(c, msgs, a):       # the mod asks for another block before it commits this one
             c.pending_block = c.s.layout.block_at(0.0, c.s.layout.block * 2.0)
-        msgs, built, _ = self.drive(0.6, 440.0, 40.0, away)
+        msgs, built, size = self.drive(0.6, 440.0, 40.0, away)
         self.assertEqual([m["type"] for m in msgs], ["terrain_ready"])
+        self.assertIn(("dropped", size / 2, 0.0), built, "its graded build not wanted: dropped")
+
+
+class DropBuildTest(unittest.TestCase):
+    """Server.drop_build: a graded build nobody waits for is not started (a queue of them held the next blocks up)."""
+
+    def server(self, pool=None):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        s = earthd.Server(tmp.name, os.path.join(tmp.name, "cache"), imagery=None, cells=64, block=512,
+                          block_pools=[(pool,), (pool,)] if pool is not None else ())
+        self.addCleanup(s.hm_pool.shutdown)
+        self.addCleanup(s.tile_pool.shutdown)
+        return s
+
+    def test_queued_job_cancelled(self):
+        import concurrent.futures as cf
+        s = self.server()
+        job = s.hm_proc[(1, 0.0, 0.0)] = cf.Future()
+        self.assertTrue(s.drop_build((1, 0.0, 0.0)))
+        self.assertTrue(job.cancelled())
+        running = s.hm_proc[(1, 1.0, 0.0)] = cf.Future()
+        running.set_running_or_notify_cancel()
+        self.assertFalse(s.drop_build((1, 1.0, 0.0)), "a build the process has taken runs on")
+        self.assertFalse(s.drop_build((1, 2.0, 0.0)), "nothing to drop")
+
+    def test_build_raises_dropped(self):
+        import concurrent.futures as cf
+
+        class Pool:
+            def submit(self, *a, **kw):
+                f = cf.Future()
+                f.cancel()          # (drop_build while it was queued)
+                return f
+        s = self.server(Pool())
+        a = s.new_anchor(40.0, -80.0)
+        with self.assertRaises(earthd.BuildDropped):
+            s.make_heightmap(a, 0.0, 0.0, None)
+        self.assertEqual(s.hm_proc, {})
+        s.hm_dropped.add((a.id, 0.0, 0.0))      # dropped before it got to its block process
+        with self.assertRaises(earthd.BuildDropped):
+            s.make_heightmap(a, 0.0, 0.0, None)
+        self.assertEqual(s.hm_dropped, set())
 
 
 if __name__ == "__main__":

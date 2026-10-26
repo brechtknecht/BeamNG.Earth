@@ -728,6 +728,8 @@ class Server:
         self.hm = OrderedDict()
         self.hm_inflight = {}
         self.hm_stage = {}              # terrain key -> what its build waits on now (the stuck log, prepare_terrain)
+        self.hm_proc = {}               # terrain key -> its block process job (drop_build)
+        self.hm_dropped = set()         # terrain keys nobody waits for any more, not yet in a block process
         self.ter_serial = itertools.count()
         self.base_stale = set()         # blocks whose base photo lacks lazy imagery (NAIP) still to come
         self.pads_rebuild = set()       # blocks built without gas station pads that lie on them (pads_stale)
@@ -1566,10 +1568,16 @@ class Server:
         try:
             if pool is not None:
                 self.hm_stage[key] = "the block process"
-                info = pool.submit(
+                if key in self.hm_dropped:
+                    raise BuildDropped(f"{key}: nobody waits for it")
+                job = self.hm_proc[key] = pool.submit(
                     blockworker.build, anchor.id, anchor.lat, anchor.lon, anchor.hm_zoom, q, cx, cy,
                     self.layout.block, self.out_dir, self.hm_name(key), self.ter_name(key),
-                    fuel_pads=self.block_fuel_pads(anchor, cx, cy, self.layout.block)).result()
+                    fuel_pads=self.block_fuel_pads(anchor, cx, cy, self.layout.block))
+                try:
+                    info = job.result()
+                except concurrent.futures.CancelledError:
+                    raise BuildDropped(f"{key}: nobody waits for it") from None
                 self.hm_stage[key] = "its base photo"
                 return self._finish_heightmap(anchor, cx, cy, info, t0, base)
             self.hm_stage[key] = "the build in the server's process"
@@ -1580,6 +1588,23 @@ class Server:
         finally:
             self.hm_stage.pop(key, None)
             self.base_futs.pop(key, None)
+            self.hm_proc.pop(key, None)
+            self.hm_dropped.discard(key)
+
+    def drop_build(self, key):
+        """The graded build of a block the mod has driven past on its provisional one (Connection.refine_follow): not
+        started when its block process has not taken it yet (a queue of them held up the next blocks' builds by ~50 s
+        at 200 km/h in the cloud, 2026-10-26), nor its photo. True when dropped."""
+        base = self.base_futs.get(key)
+        if base is not None:
+            base.cancel()
+        job = self.hm_proc.get(key)
+        if job is not None:
+            return job.cancel()
+        if key in self.hm_inflight:     # (still waiting for a heightmap worker)
+            self.hm_dropped.add(key)
+            return True
+        return False
 
     def make_follow_provisional(self, anchor, cx, cy):
         """Worker thread (prov_pool): a follow block the car would reach the stop line before (Connection.late_provisional),
@@ -2011,6 +2036,7 @@ class Server:
             return self.hm[key]
         fut = self.hm_inflight.get(key)
         if fut is None:
+            self.hm_dropped.discard(key)
             loop = asyncio.get_running_loop()
             fut = self.hm_inflight[key] = loop.run_in_executor(
                 self.hm_pool, self.make_heightmap, anchor, cx, cy, progress, lane, time.perf_counter())
@@ -2808,6 +2834,12 @@ FOLLOW_PROV_MIN_V = 2.0     # m/s: slower, a block is late only for a car standi
 FOLLOW_PROV_HELD_M = 40.0   # ... this close to a stop line (the edge guard holds it there)
 FOLLOW_PROV_CHECK_S = 0.25  # a waiting follow request looks at the clock this often
 FOLLOW_REFRESH_WAIT_S = 120.0   # the graded follow block waits this long at most for the mod to take the provisional
+
+
+class BuildDropped(Exception):
+    """A block's build not started: nobody waits for it any more (Server.drop_build)."""
+
+
 PADS_REFRESH_MS = 5.0       # the block in use built again with its gas station pads only below this speed (m/s) ...
 PADS_SETTLE_S = 3.0         # ... and this long after the last new pad (Connection.pads_refresh)
 NAV_WAIT_S = 30.0           # s an anchor's first AI graph waits at most for the road tiles round the car (nav_may_start)
@@ -4032,6 +4064,15 @@ class Connection:
         info = None
         self.refining.add(key)              # (the loading line's ground: send_progress)
         try:
+            while not job.done():
+                if self.pending_block != blk and self.block != blk:
+                    # (driven past on the provisional one: the graded one is not wanted, and it would hold up the
+                    # next blocks' builds)
+                    log.info("graded follow block %s %s: the game moved on", key,
+                             "dropped" if self.s.drop_build(key) else "not sent")
+                    job.add_done_callback(lambda f: f.cancelled() or f.exception())     # (no "never retrieved")
+                    return
+                await asyncio.wait([job], timeout=FOLLOW_PROV_CHECK_S)
             try:
                 info = await job
             except Exception:
