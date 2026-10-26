@@ -608,6 +608,37 @@ end
 -- camera stay where they are; far tiles only sink / hide / come back (no imports in this frame).
 local COMMIT_LOG = 20
 local COMMIT_SLOW_MS = 300     -- a commit frame this slow is logged with its materials
+-- A commit whose frame or one of the two after it is this slow is logged with what it did and the engine's breakdown of
+-- each frame (Felix's 203 mph drive, 2026-10-26: 9 hitches of 100-270 ms right after a swap, engine Render 45-200 ms
+-- with the mod's part ~15 ms; which frame, and whether the photo or the far cover changed, was not in the log)
+local COMMIT_HITCH_MS = 80
+
+-- The log line of a commit (commitTerrain's record, its three frames done) with a frame of COMMIT_HITCH_MS or more:
+-- each frame's ms, the worst one's engine breakdown, the commit's own parts and what changed. Returns the line or nil.
+local function commitHitchLine(cf)
+  local worst, wi = 0, nil
+  for i, ms in ipairs(cf.f) do if ms > worst then worst, wi = ms, i end end
+  if not wi or worst < COMMIT_HITCH_MS then return nil end
+  local e, parts = {}, {}
+  for k, v in pairs(cf.e and cf.e[wi] or {}) do e[#e + 1] = { k, v } end
+  table.sort(e, function(a, b) return a[2] > b[2] end)
+  for _, kv in ipairs(e) do parts[#parts + 1] = kv[1] .. ' ' .. tostring(kv[2]) end
+  local frames = {}
+  for i, ms in ipairs(cf.f) do frames[i] = string.format('%.0f', ms) end
+  return string.format('terrain commit hitch at %s,%s: frames %s ms (worst #%d: %s) | commit: load %.1f (.ter %s), '
+    .. 'collision %.1f, far cover %.1f ms (%s tiles) | %s, photo %s, %s materials, new: %s',
+    tostring(cf.at and cf.at[1]), tostring(cf.at and cf.at[2]), table.concat(frames, '/'), wi,
+    #parts > 0 and table.concat(parts, ', ') or 'no engine metrics', cf.load or 0,
+    cf.ter and string.format('%.1f', cf.ter) or '-', cf.coll or 0, cf.cover or 0, tostring(cf.coverN or '?'),
+    cf.swap and 'swap' or 'import', cf.photo and 'new' or 'none', tostring(cf.mats or '?'),
+    cf.fresh and table.concat(cf.fresh, ' ') or 'none')
+end
+M.commitHitchLine = commitHitchLine
+
+local function logCommitHitch(cf)
+  local line = commitHitchLine(cf)
+  if line then log('I', 'beamngEarth', line) end
+end
 local frameTimer = hptimer and hptimer() or nil
 
 local function commitTerrain(msg)
@@ -624,9 +655,10 @@ local function commitTerrain(msg)
     roads.collisionRebuilt()      -- the sidewalks made so far collide now too
   end
   local tColl = sw()
-  farfield.onBlockCommit(msg.cx, msg.cy)
+  local coverN = farfield.onBlockCommit(msg.cx, msg.cy)     -- (far tiles whose cover changed)
   local ls = swapped and terrain.lastSwap or nil
-  local c = { load = tLoad, coll = tColl - tLoad, cover = sw() - tColl, f = {}, swap = swapped or nil,
+  local c = { load = tLoad, coll = tColl - tLoad, cover = sw() - tColl, f = {}, e = {}, swap = swapped or nil,
+    coverN = tonumber(coverN), photo = type(msg.base) == 'string',
     ter = ls and ls.apply or nil,   -- the .ter load alone (ms)
     mats = ls and ls.mats or nil, fresh = ls and ls.fresh or nil, at = { msg.cx, msg.cy } }
   table.insert(st.commits, c)
@@ -778,6 +810,8 @@ local function onMessage(msg)
     -- protocol 4: who draws the near ground (a protocol-3 server sends nothing: the terrain does),
     -- and the credit line for the imagery / elevation sources the server actually uses
     M.setNearVisual(msg.nearVisual)
+    -- (A/B, server BNGE_TERRAIN_BASE_TEX) the block's baked base colour's size; none: the mod's own
+    terrain.setBaseTexSize(tonumber(msg.terrainBaseTex))
     -- M1h: horizon mode (a server without hello.horizon: the level's sky and 100 km view distance)
     M.setHorizon(msg.horizon == true)
     serverAttribution = (type(msg.attribution) == 'string' and msg.attribution ~= '') and msg.attribution or nil
@@ -1772,8 +1806,8 @@ local function onUpdate(dtReal, dtSim)
   local cf = st.commitFrames
   if cf then                    -- the commit frame and the two after it (wall ms between updates)
     cf.f[#cf.f + 1] = frameMs
-    if #cf.f == 1 and Engine and Engine.Debug and Engine.Debug.getLastPerformanceMetrics then
-      -- the engine's per-subsystem breakdown of the commit frame (the frame that just ended): its 8 largest
+    if Engine and Engine.Debug and Engine.Debug.getLastPerformanceMetrics then
+      -- the engine's per-subsystem breakdown of each of these frames (the frame that just ended): its 8 largest
       local m = {}
       if pcall(Engine.Debug.getLastPerformanceMetrics, m) then
         local arr = {}
@@ -1781,12 +1815,15 @@ local function onUpdate(dtReal, dtSim)
           if type(v) == 'number' and not k:find('^phys') and not k:find('^virt') then arr[#arr + 1] = { k, v } end
         end
         table.sort(arr, function(a, b) return a[2] > b[2] end)
-        cf.engine = {}
-        for i = 1, math.min(8, #arr) do cf.engine[arr[i][1]] = math.floor(arr[i][2] * 10 + 0.5) / 10 end
+        local e = {}
+        for i = 1, math.min(8, #arr) do e[arr[i][1]] = math.floor(arr[i][2] * 10 + 0.5) / 10 end
+        cf.e[#cf.f] = e
+        if #cf.f == 1 then cf.engine = e end
       end
     end
     if #cf.f >= 3 then
       st.commitFrames = nil
+      pcall(logCommitHitch, cf)
       if cf.f[1] and cf.f[1] > COMMIT_SLOW_MS then
         -- a terrain commit's slow first frame (the user's freezes driving through towns, 2026-10-21: 2.7 s of
         -- RenderShadows in one): what it listed, for the log

@@ -837,4 +837,13 @@ do -- a rebase's anchor on its grid, the terrain hint shifted by the player's sp
   local ex, ey = require('beamngEarth/follow').target(dx + 290, dy, 30, 0)     -- (290 m to the 10 km rebase distance)
   T.check(cx == ex and cy == ey, string.format('rebase hint in the snapped frame: (%d, %d), want (%d, %d)', cx, cy, ex, ey))
 end
+do -- a commit with a slow frame: logged with each frame, the worst one's engine breakdown and what changed
+  local cf = { f = { 18, 152, 31 }, e = { { Render = 9 }, { Render = 120.5, RenderShadows = 22 } }, load = 14.2,
+    ter = 11.0, coll = 0, cover = 0.4, coverN = 3, swap = true, photo = true, mats = 7, at = { -1792, 2816 } }
+  local line = core.commitHitchLine(cf)
+  T.check(line and line:find('frames 18/152/31 ms %(worst #2: Render 120.5, RenderShadows 22%)') ~= nil, line)
+  T.check(line:find('far cover 0.4 ms %(3 tiles%)') and line:find('swap, photo new, 7 materials, new: none'), line)
+  cf.f = { 18, 60, 31 }
+  T.check(core.commitHitchLine(cf) == nil, 'no frame of 80 ms: not logged')
+end
 T.done('test_core_stubbed')

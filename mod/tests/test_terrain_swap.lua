@@ -110,4 +110,8 @@ T.check(terrain.swap('/t/g.ter', 2, 512, 256, 0, 0, { materials = otherMats }, '
   and calls.updateMaterial == before + #otherMats, 'one updateMaterial per slot after the swap: '
   .. tostring((calls.updateMaterial or 0) - before))
 terrain.REBIND_AFTER_SWAP = false
+-- the baked base colour's size (A/B, the server's hello): a power of two from 128 to 2048, set on the block too
+T.check(terrain.setBaseTexSize(256) == 256 and terrain.BASE_TEX_SIZE == 256, '256 taken')
+T.check(terrain.get():getField('baseTexSize', 0) == '256', 'and set on the block')
+T.check(terrain.setBaseTexSize(300) == 1024 and terrain.setBaseTexSize(nil) == 1024, 'anything else: the default')
 T.done('test_terrain_swap')
