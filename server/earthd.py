@@ -3084,6 +3084,12 @@ STAND_IN_TIMEOUT_S = 60.0
 # long per busy thread to get it back - a numpy loop of 25 ms took 5.8 s next to six busy threads at 5 ms, 1.2 s at 1
 # (2026-10-26). 0: Python's own.
 SWITCH_MS = float(os.environ.get("BNGE_SWITCH_MS", "0") or 0)
+# Once a follow block was stood in for (its graded one came after the car), the next one's stand-in starts at the
+# usual time without asking whether its graded one would be in time: quality.build_s is measured on the graded blocks
+# in time only, and stayed at ~3 s while the graded ones took 10-21 s behind each other at 300 km/h on 2 cores: three
+# stand-ins started 1-2 s before the stop line and the car stopped 1.6-5.7 s (2026-10-26). BNGE_PROVISIONAL_STREAK=0:
+# asked every time.
+FOLLOW_PROV_STREAK = os.environ.get("BNGE_PROVISIONAL_STREAK", "1") != "0"
 FOLLOW_PROV_MIN_V = 2.0     # m/s: slower, a block is late only for a car standing ...
 FOLLOW_PROV_HELD_M = 40.0   # ... this close to a stop line (the edge guard holds it there)
 FOLLOW_PROV_CHECK_S = 0.25  # a waiting follow request looks at the clock this often
@@ -3150,6 +3156,7 @@ class Connection:
         self.active = None              # committed anchor id
         self.block = None               # farfield.Block of the committed terrain
         self.pending_block = None       # the last prepare_terrain of the active anchor
+        self.prov_streak = 0            # follow blocks stood in for since the last graded one in time (late_provisional)
         self.terrain_wait = 0           # prepare_terrain requests being built (roads.Tracker: the ground first)
         self.predicted_block = None     # the terrain the prefetch expects next
         self.ahead_blocks = []          # ... and the ones after it (follow blocks behind: Governor.block_ahead_s)
@@ -3949,6 +3956,7 @@ class Connection:
             prov = (await self.late_provisional(job, anchor, cx, cy, t0)
                     if PROVISIONAL_FOLLOW and self.s.grading and aid == self.active else None)
             if prov is not None:
+                self.prov_streak += 1
                 self.terrain_wait -= 1
                 key = (aid, cx, cy)
                 self.s.hm_sent.append(key)
@@ -3984,6 +3992,7 @@ class Connection:
                  "" if budget is None else f" (budget {budget:.1f} s)")
         perftrace.request("terrain request", "req", t0, key=[cx, cy], budget=budget, provisional=False)
         if budget is not None:
+            self.prov_streak = 0
             self.s.quality_changed(self.s.quality.record(used, budget, info.get("stages", {}).get("grading", 0.0)))
         self.send({"type": "terrain_ready", "requestId": req, "anchorId": aid, **self.terrain_msg(key, info)})
 
@@ -4325,6 +4334,8 @@ class Connection:
                 # graded ones done in time, 2026-10-26)
                 build = self.s.quality.build_s
                 if t0 is None or build is None or build - (time.perf_counter() - t0) > self.s.prov_est:
+                    break
+                if self.prov_streak and FOLLOW_PROV_STREAK:     # (build_s: of the graded ones in time, stale)
                     break
                 if left <= BASE_MARGIN_S:   # (the graded one late after all)
                     break

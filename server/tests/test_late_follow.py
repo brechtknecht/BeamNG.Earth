@@ -65,7 +65,7 @@ class LateFollowTest(unittest.TestCase):
         s.anchors[a.id] = a
         return s, a
 
-    def drive(self, graded_s, x, vx, then=None):
+    def drive(self, graded_s, x, vx, then=None, setup=None):
         """A follow request for the block east of (0, 0) with the car at x, vx; the graded build takes graded_s.
         then(c, msgs): after the first answer (the mod's moves). Returns the messages and the builds."""
         s, a = self.server()
@@ -92,6 +92,8 @@ class LateFollowTest(unittest.TestCase):
             c.active = a.id
             c._set_block(a.id, 0.0, 0.0)
             c.focus, c.vel = (x, 0.0), (vx, 0.0)
+            if setup is not None:
+                setup(c)
             c.dispatch({"type": "prepare_terrain", "requestId": 7, "anchorId": a.id, "cx": size / 2, "cy": 0.0})
             for _ in range(100):
                 await asyncio.sleep(0.02)
@@ -118,6 +120,15 @@ class LateFollowTest(unittest.TestCase):
         self.assertEqual([m["type"] for m in msgs], ["terrain_ready"])
         self.assertNotIn("provisional", msgs[0])
         self.assertEqual([b[0] for b in built], ["graded"])
+
+    def test_after_a_stand_in_the_next_one_starts_on_time(self):
+        # 2 s to the stop line, a stand-in takes 1 s, the graded one 0.8 s but build_s says 0.1 s
+        def setup(c, streak):
+            c.s.prov_est, c.s.quality.build_s, c.prov_streak = 1.0, 0.1, streak
+        msgs, built, _ = self.drive(0.8, 396.0, 40.0, setup=lambda c: setup(c, 0))
+        self.assertNotIn("provisional", msgs[0], "build_s trusted: the graded one waited for")
+        msgs, built, _ = self.drive(0.8, 396.0, 40.0, setup=lambda c: setup(c, 1))
+        self.assertTrue(msgs[0].get("provisional"), "the last block stood in for: build_s not trusted")
 
     def test_standing_at_the_edge(self):
         # the edge guard holds the car (no speed): the provisional one at once
