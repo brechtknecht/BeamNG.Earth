@@ -73,11 +73,29 @@ M.enabled = true
 M.DENSITY = { low = 0.5, normal = 1.0, high = 2.0 }
 M.density = 1.0
 
+-- Spread the grass rebuild after a block SWAP (follow moves) over this many frames after the swap's (0: the same frame,
+-- as before). Felix's 1-hour Windows drive on 55b89f3 (2026-10-26, no tools/gcpatch there): the swap's frame was
+-- 81-144 ms in 42 of 374 swaps, the worst always the swap's own frame with the engine's Render at 40-94 ms next to
+-- the mod's 13 ms .ter load, whatever the photo, the far cover or the materials did; this flush regenerates every
+-- grass cell on the block in that frame's render (ARCHITECTURE.md "Ground surfaces": +25-43 ms in 2026-10-11's
+-- Serengeti tests). Spread, the swap's frame regenerates only the engine's own per-frame budget of cells; frame k
+-- after it flushes group k: the GroundCovers split into SPREAD groups of about equal element count, the later
+-- groups hidden until their frame (a hidden one draws and generates nothing). Price: each group's grass is missing
+-- for its 1..SPREAD frames. The governor keeps QUIET_AFTER (2) frames after the heavy swap free of streaming, so 2
+-- puts the grass into exactly those. Imports, teleports and rebases still rebuild in their own frame. The server's
+-- BNGE_GRASS_SPREAD (hello grassSpread) sets it; console: beamngEarth_groundcover.setSpread(n).
+M.SPREAD = 2
+M.SPREAD_MAX = 4
+
 local created = {}        -- object names we made
 local layered = false     -- a block with surface layers was loaded this level (objects can exist)
 local defsCache = {}      -- source -> stock definitions by name (read once per level)
 local loadedMaterials = {} -- source -> true
 local lastError = nil
+
+local weights = {}        -- object name -> its element count (the spread's groups)
+local spread = nil        -- the rebuild in progress: { frame = the swap's, groups = { {names}, ... } }
+local frameNo = 0
 
 local SKIP = { name = true, class = true, persistentId = true, __parent = true, position = true, Types = true,
   internalName = true, canSave = true }
@@ -133,12 +151,54 @@ function M.fieldsFor(def, layer, share)
   return calls
 end
 
+local function setHidden(names, hidden)
+  for _, name in ipairs(names) do
+    local o = scenetree.findObject(name)
+    if o then pcall(function() o:setHidden(hidden) end) end
+  end
+end
+
+-- Show every group a spread rebuild still hides (its cells come with the next flush).
+local function endSpread()
+  if not spread then return end
+  for g = 2, #spread.groups do setHidden(spread.groups[g], false) end
+  spread = nil
+end
+
 local function removeAll()
+  spread = nil
   for _, name in ipairs(created) do
     local o = scenetree.findObject(name)
     if o then pcall(function() o:delete() end) end
   end
   created = {}
+  weights = {}
+end
+
+-- Pure: names split into n groups of about equal weight (heaviest first into the lightest group), each group in
+-- the order of names. Groups that would be empty are left out.
+function M.groupsOf(names, weightOf, n)
+  local order = {}
+  for i, name in ipairs(names) do order[i] = { name, tonumber(weightOf[name]) or 1, i } end
+  table.sort(order, function(a, b) if a[2] ~= b[2] then return a[2] > b[2] end return a[3] < b[3] end)
+  local bins = {}
+  for g = 1, math.max(1, n) do bins[g] = { w = 0, items = {} } end
+  for _, it in ipairs(order) do
+    local best = bins[1]
+    for _, b in ipairs(bins) do if b.w < best.w then best = b end end
+    best.w = best.w + it[2]
+    best.items[#best.items + 1] = it
+  end
+  local out = {}
+  for _, b in ipairs(bins) do
+    if #b.items > 0 then
+      table.sort(b.items, function(x, y) return x[3] < y[3] end)
+      local g = {}
+      for i, it in ipairs(b.items) do g[i] = it[1] end
+      out[#out + 1] = g
+    end
+  end
+  return out
 end
 
 -- Create the GroundCovers (once per level; the surface layers exist). Returns true if made.
@@ -167,7 +227,10 @@ function M.ensure()
         if old then old:delete() end
         do
           local gc = createObject('GroundCover')
-          for _, c in ipairs(M.fieldsFor(def, d.layer, d.share * M.density)) do gc:setField(c[1], c[2], c[3]) end
+          for _, c in ipairs(M.fieldsFor(def, d.layer, d.share * M.density)) do
+            gc:setField(c[1], c[2], c[3])
+            if c[1] == 'maxElements' then weights[name] = tonumber(c[3]) end
+          end
           for k, v in pairs(d.fields or {}) do gc:setField(k, 0, tostring(v)) end
           for _, f in ipairs(M.PLACEMENT) do gc:setField(f[1], 0, f[2]) end
           gc.canSave = false
@@ -192,10 +255,49 @@ end
 -- The physics block was just imported or moved (core, same tick): regenerate all the grass before
 -- this frame is drawn. Returns true if it asked for that.
 function M.afterBlockChange()
+  endSpread()
   if #created == 0 or not flushGroundCoverGrids then return false end
   flushGroundCoverGrids()
   return true
 end
+
+-- The block was just swapped (a follow move; core, same tick): the rebuild spread over the next M.SPREAD frames
+-- (M.frame), or now with SPREAD 0. Returns true if a rebuild was asked for.
+function M.afterSwap()
+  if M.SPREAD <= 0 or #created == 0 or not flushGroundCoverGrids then return M.afterBlockChange() end
+  endSpread()
+  spread = { frame = frameNo, groups = M.groupsOf(created, weights, M.SPREAD) }
+  for g = 2, #spread.groups do setHidden(spread.groups[g], true) end
+  return true
+end
+
+-- Every frame, before anything of it can swap the block (core's onUpdate): the spread's group k is shown and
+-- generated in the k-th frame after the swap's.
+function M.frame()
+  frameNo = frameNo + 1
+  if not spread then return end
+  local k = frameNo - spread.frame
+  if k < 1 then return end
+  local g = spread.groups[k]
+  if g and k > 1 then setHidden(g, false) end
+  if g and flushGroundCoverGrids then flushGroundCoverGrids() end
+  if k >= #spread.groups then spread = nil end
+end
+
+-- Frames to spread a swap's grass rebuild over (0: the swap's own frame). Returns the value in use.
+function M.setSpread(n)
+  n = math.floor(tonumber(n) or M.SPREAD)
+  if n < 0 then n = 0 elseif n > M.SPREAD_MAX then n = M.SPREAD_MAX end
+  if n ~= M.SPREAD then
+    endSpread()
+    M.SPREAD = n
+    log('I', 'beamngEarth', 'grass rebuild after a block swap spread over ' .. n .. ' frames')
+  end
+  return n
+end
+
+-- A spread rebuild is in progress (the commit log).
+function M.spreading() return spread ~= nil end
 
 -- On / off (the settings page): off removes the objects; on makes them at once when the block has
 -- surface layers (else with the next layered import).
@@ -224,6 +326,8 @@ end
 -- the same game session found no m_grass_* / wca_groundcover and drew no grass, 2026-10-19).
 function M.reset()
   created = {}
+  weights = {}
+  spread = nil
   defsCache = {}
   loadedMaterials = {}
   layered = false
@@ -239,7 +343,8 @@ function M.rebuild()
 end
 
 function M.status()
-  return { enabled = M.enabled, density = M.density, objects = #created, materialsLoaded = next(loadedMaterials) ~= nil, error = lastError }
+  return { enabled = M.enabled, density = M.density, objects = #created, materialsLoaded = next(loadedMaterials) ~= nil, error = lastError,
+    spread = M.SPREAD }
 end
 
 return M
