@@ -123,6 +123,23 @@ do
   roads.SWAP_QUIET_MS = quietMs
   S.calls.reloadCollision = 1
 end
+-- trees.lua's solid items near the car ask for an urgent rebuild: URGENT_GAP_S after the last one, not RELOAD_EVERY_S
+do
+  local every, gap = roads.RELOAD_EVERY_S, roads.URGENT_GAP_S
+  roads.RELOAD_EVERY_S, roads.URGENT_GAP_S = 1e9, -1
+  roads.requestCollision()
+  roads.update(gov, 2)
+  T.check(S.calls.reloadCollision == 1, 'a plain request waits for RELOAD_EVERY_S')
+  roads.requestCollision(true)
+  roads.update(gov, 2)
+  T.check(S.calls.reloadCollision == 2, 'an urgent one runs after URGENT_GAP_S')
+  roads.requestCollision()
+  roads.update(gov, 2)
+  T.check(S.calls.reloadCollision == 2, 'the urgency went with that rebuild')
+  roads.RELOAD_EVERY_S, roads.URGENT_GAP_S = every, gap
+  roads.update(gov, 2)
+  S.calls.reloadCollision = 1
+end
 roads.onDrop({ anchorId = 2, key = '5_5' })
 roads.update(gov, 2)
 T.check(#statics() == 0 and decalRoads() == 0 and S.calls.reloadCollision == 2, 'dropped tile: mesh deleted, collision reloaded')
