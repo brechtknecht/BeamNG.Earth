@@ -959,6 +959,128 @@ class CacheTest(Sources, SmallBlocks, unittest.TestCase):
 
 
 @needs_duckdb
+class ShardTest(Sources, SmallBlocks, unittest.TestCase):
+    """overture.SHARDS: a row group a cell needs decoded once into a local shard, read by every later cell and process;
+    the same content as reading the sources."""
+
+    def digests(self, md, keys, layers=mapdata.LAYERS):
+        return {(str(k), layer): md.cell(k, (layer,)).digest() for k in keys for layer in layers}
+
+    def test_same_content_as_the_source_reads(self):
+        keys = [mf.CELL, mapcells.CellKey(14, 4707, 6244)]
+        md, _ = self.mapdata(cache=os.path.join(self.tmp, "a"))
+        md2, _ = self.mapdata(cache=os.path.join(self.tmp, "b"))
+        md2.overture.shards_ok = False
+        self.assertEqual(self.digests(md, keys), self.digests(md2, keys))
+        raw = Path(md.raw_dir)
+        self.assertTrue(list(raw.rglob("rg*.parquet")))
+        self.assertTrue(list(raw.rglob("rg*.bbox.npy")))
+        self.assertTrue(list(raw.rglob("rgmeta.json")))
+        self.assertFalse(list(Path(md2.raw_dir).rglob("rg*.parquet")))
+
+    def test_another_process_reads_the_shards(self):
+        """A second MapData on the same cache (another of the server's processes) builds the cell from the shards,
+        boxes and parsed footers on disk: no request to the release's files."""
+        cache = os.path.join(self.tmp, "cache")
+        md, _ = self.mapdata(cache=cache)
+        want = md.cell(mf.CELL, ("roads", "buildings")).digest()
+        shutil.rmtree(os.path.join(cache, "mapdata", f"v{mapdata.VERSION}"))       # the layer files: built again
+        shutil.rmtree(os.path.join(cache, "mapdata-mirror"), ignore_errors=True)
+        md2, t2 = self.mapdata(cache=cache)
+        self.assertEqual(md2.cell(mf.CELL, ("roads", "buildings")).digest(), want)
+        self.assertEqual(t2.count("/release/"), 0)
+
+    def test_damaged_shard_is_written_again(self):
+        cache = os.path.join(self.tmp, "cache")
+        md, _ = self.mapdata(cache=cache)
+        want = md.cell(mf.CELL, ("roads",)).digest()
+        shards = list(Path(md.raw_dir).rglob("rg*.parquet"))
+        for p in shards:
+            p.write_bytes(b"PAR1 not a parquet file")
+        shutil.rmtree(os.path.join(cache, "mapdata", f"v{mapdata.VERSION}"))
+        shutil.rmtree(os.path.join(cache, "mapdata-mirror"), ignore_errors=True)
+        md2, _ = self.mapdata(cache=cache)
+        with self.assertLogs("earthd.mapdata", "WARNING"):
+            self.assertEqual(md2.cell(mf.CELL, ("roads",)).digest(), want)          # (from the sources)
+        self.assertTrue(md2.overture.shards_ok)
+        self.assertFalse(any(p.exists() for p in shards))
+        md3, _ = self.mapdata(cache=cache)
+        md3.cell(mapcells.CellKey(14, 4707, 6244), ("roads",))
+        self.assertTrue(list(Path(md.raw_dir).rglob("rg*.parquet")))                # written again
+
+    def test_box_test_never_misses(self):
+        b = np.array([[1.0, 1.0, 2.0, 2.0]], np.float32)
+        self.assertTrue(overture.box_hit(b, (2.0, 2.0, 3.0, 3.0)))                  # edges touch
+        self.assertTrue(overture.box_hit(b, (2.0000004, 0.0, 3.0, 3.0)))            # within float32 rounding
+        self.assertFalse(overture.box_hit(b, (2.001, 0.0, 3.0, 3.0)))
+        self.assertTrue(overture.box_hit(None, (0.0, 0.0, 1.0, 1.0)))               # unknown: read it
+
+
+@needs_duckdb
+class OsmTagsShardTest(SmallBlocks, unittest.TestCase):
+    """osmtags.OsmTags.cell from a small Layercake-like file: the same tags and raceways with and without shards."""
+    URL = "https://data.openstreetmap.us/layercake/highways.parquet"
+
+    def setUp(self):
+        super().setUp()
+        import duckdb
+        lon0, lat0, lon1, lat1 = mf.CELL.bounds()
+        path = os.path.join(self.tmp, "highways.parquet")
+        con = duckdb.connect()
+        rows = []
+        for i in range(3000):           # far away first (their own row groups), then the cell's ways
+            x, y = lon0 - 2.0 - 0.0001 * i, lat0
+            rows.append((10_000 + i, "residential", x, y, "2") + (None,) * 9)
+        cell = [(1, "primary", "2;3", "7 m", "30 mph", "both", "yes", None, "asphalt", "yes", "1", "Main St"),
+                (2, "residential", None, None, None, None, None, None, None, None, None, None),     # no tag: left out
+                (3, "raceway", None, "12", None, None, None, None, "asphalt", None, None, "Oval"),
+                (4, "service", None, "23'", None, None, None, "bad", None, "-1", None, None)]
+        for k, (i, hw, lanes, width, ms, sw, lit, sm, sf, ow, layer, name) in enumerate(cell):
+            x, y = mf._cell_xy(0.2 + 0.1 * k, 0.5)
+            rows.append((i, hw, x, y, lanes, width, ms, sw, lit, sm, sf, ow, layer, name))
+        con.execute("""CREATE TABLE h (id BIGINT, highway VARCHAR, x DOUBLE, y DOUBLE, lanes VARCHAR, width VARCHAR,
+            maxspeed VARCHAR, sidewalk VARCHAR, lit VARCHAR, smoothness VARCHAR, surface VARCHAR, oneway VARCHAR,
+            layer VARCHAR, name VARCHAR)""")
+        con.executemany("INSERT INTO h VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
+        con.execute(f"""COPY (SELECT id, highway, {{'xmin': x, 'ymin': y, 'xmax': x + 0.001, 'ymax': y + 0.0001}} AS bbox,
+            lanes, width, maxspeed, sidewalk, lit, smoothness, surface, oneway, layer, name,
+            NULL::VARCHAR AS bridge, NULL::VARCHAR AS tunnel, ST_AsWKB(('LINESTRING(' || x || ' ' || y || ', ' || (x + 0.001) || ' ' || (y + 0.0001) || ')')::GEOMETRY)
+              AS geometry FROM h) TO '{path}' (FORMAT parquet, ROW_GROUP_SIZE 1024)""")
+        con.close()
+        with open(path, "rb") as fh:
+            self.data = fh.read()
+
+    def osm(self, cache):
+        import osmtags
+
+        class T(mf.Transport):
+            def request(t, url, headers, timeout):
+                status, hd, body = super().request(url, headers, timeout)
+                return status, dict(hd, ETag='"v1"'), body
+        t = T({self.URL: self.data})
+        o = osmtags.OsmTags(os.path.join(self.tmp, cache), mf.fetcher(t))
+        self.addCleanup(o._reader.close)
+        return o, t
+
+    def test_same_tags_with_and_without_shards(self):
+        a, _ = self.osm("a")
+        b, _ = self.osm("b")
+        b._reader.shards_ok = False
+        tags, ways = a.cell(mf.CELL.bounds())
+        tags_b, ways_b = b.cell(mf.CELL.bounds())
+        self.assertEqual((tags, [w["id"] for w in ways]), (tags_b, [w["id"] for w in ways_b]))
+        self.assertEqual(sorted(tags), [1, 3, 4])
+        self.assertEqual((tags[1]["lanes"], tags[1]["width"], round(tags[1]["maxspeed"], 3)), (2, 7.0, 48.28))
+        self.assertAlmostEqual(tags[4]["width"], 23 * 0.3048)
+        self.assertEqual([w["id"] for w in ways], [3])
+        self.assertEqual(len(ways[0]["coords"]), 2)
+        self.assertTrue(list(Path(self.tmp, "a").rglob("rg*.parquet")))
+        a2, t2 = self.osm("a")                  # another process: the pinned version, footer, boxes and shard on disk
+        self.assertEqual(a2.cell(mf.CELL.bounds())[0], tags)
+        self.assertEqual(t2.count(), 0)
+
+
+@needs_duckdb
 class KindsTest(Sources, SmallBlocks, unittest.TestCase):
     def test_prefetch_refused_then_demand(self):
         hosts = ["overturemaps-us-west-2.s3.us-west-2.amazonaws.com", "overturemapswestus2.blob.core.windows.net",
