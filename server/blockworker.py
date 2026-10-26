@@ -285,7 +285,7 @@ def build(aid, lat, lon, hm_zoom, q, cx, cy, size, out_dir, name, ter_name=None,
             _regions_state()[rid] = [aid, reg, None]
     if reg is not None or tags:
         chunks = _TaggedChunks(chunks, tags, rid, _s.lock)
-    _s.building = reg           # (the tunnels' ends graded from it too: _region_over)
+    _s.building, _s.building_more = reg, []    # (the tunnels' ends graded from it too: _region_over)
     t_heights = time.perf_counter()
 
     def elev(la, lo):
@@ -314,10 +314,6 @@ def build(aid, lat, lon, hm_zoom, q, cx, cy, size, out_dir, name, ter_name=None,
     deps = set(chunks.used) if isinstance(chunks, _TaggedChunks) else set()
     if rid is not None:
         deps.add(rid)
-    if deps:                    # graded from region plans (its own or its reused chunks'): told apart later (region_poll)
-        with _s.lock:
-            _regions_state()[("block", aid, cx, cy)] = deps
-        info["gradePending"] = True
     idx = None
     if _s.surface is not None:
         t1 = time.perf_counter()
@@ -347,9 +343,19 @@ def build(aid, lat, lon, hm_zoom, q, cx, cy, size, out_dir, name, ter_name=None,
             info["mats"] = mats
         stages["ter"] = time.perf_counter() - t1
     info["stages"] = stages
-    _s.building = None
-    if reg is not None:         # (after the block: its cells' whole plans wait for the cells around)
-        threading.Thread(target=_plan_whole, args=(g, rid, reg), daemon=True, name="region-whole").start()
+    whole = [(rid, reg)] if reg is not None else []
+    with _s.lock:
+        for more in _s.building_more:       # (the regions its tunnels' portals were graded from)
+            whole.append((next(_REGION_IDS), more))
+            _regions_state()[whole[-1][0]] = [aid, more, None]
+            _regions_state()[("parent", whole[-1][0])] = rid     # (its heights in rid's chunks)
+            deps.add(whole[-1][0])
+        if deps:                # graded from region plans (its own or its reused chunks'): told apart later (region_poll)
+            _regions_state()[("block", aid, cx, cy)] = deps
+            info["gradePending"] = True
+    _s.building, _s.building_more = None, []
+    for r_id, r in whole:       # (after the block: its cells' whole plans wait for the cells around)
+        threading.Thread(target=_plan_whole, args=(g, r_id, r), daemon=True, name="region-whole").start()
     return info
 
 
@@ -361,7 +367,8 @@ def _regions_state():
     """The blocks graded from region plans in this process (under _s.lock): region id -> [anchor id, grading.Region,
     None while unresolved / True: as the cells' whole plans / False: not, + "applied" once _resolve_regions has];
     ("tags", anchor id) -> {height chunk key: the region id it was graded from}; ("block", anchor id, cx, cy) -> {the
-    region ids its heights came from}; "done" -> [(block key, same)] resolved since the last region_poll."""
+    region ids its heights came from}; ("parent", region id) -> the block region whose chunks a tunnel portal's region
+    (_region_over) went into; "done" -> [(block key, same)] resolved since the last region_poll."""
     st = getattr(_s, "regions", None)
     if st is None:
         st = _s.regions = {"done": []}
@@ -394,14 +401,23 @@ class _TaggedChunks:
 
 
 def _region_over(g, la, lo):
-    """The region of the block being built here (build: _s.building) when it holds the points, else None."""
+    """While a block is built from a region (build: _s.building): the region that grades the points, its own when it
+    holds them, else one made for them (a tunnel's portal beyond the block: its cells planned whole waited for the
+    cells around too; kept in _s.building_more, the block's too); None otherwise."""
     reg = getattr(_s, "building", None)
     if reg is None or not np.size(la):
         return None
     e, n, _ = g.frame.geodetic_to_enu(np.asarray(la, np.float64).ravel(), np.asarray(lo, np.float64).ravel(), 0.0)
     e, n = np.asarray(e), np.asarray(n)
-    x0, y0, x1, y1 = reg.box
-    return reg if e.min() >= x0 and e.max() <= x1 and n.min() >= y0 and n.max() <= y1 else None
+    for r in [reg] + _s.building_more:
+        x0, y0, x1, y1 = r.box
+        if e.min() >= x0 and e.max() <= x1 and n.min() >= y0 and n.max() <= y1:
+            return r
+    m = REGION_PAD_M
+    more = g.region((float(e.min()) - m, float(n.min()) - m, float(e.max()) + m, float(n.max()) + m))
+    if more is not None:
+        _s.building_more.append(more)
+    return more
 
 
 def _plan_whole(g, rid, reg):
@@ -433,14 +449,21 @@ def _resolve_regions():
     with _s.lock:
         st = _regions_state()
         todo = [(rid, v) for rid, v in st.items() if isinstance(rid, int) and v[2] is not None and len(v) == 3]
+        todo.sort(key=lambda rv: bool(rv[1][2]))        # (the different ones first: their parents' chunks go too)
+        waiting = {p for k, p in st.items()
+                   if isinstance(k, tuple) and k[0] == "parent" and st.get(k[1], [0, 0, None])[2] is None}
     for rid, v in todo:
+        if v[2] and rid in waiting:     # (a portal's region of its block still unresolved: its chunks kept tagged)
+            continue
         aid, reg, same = v
         v.append("applied")
         if not same and getattr(_s, "tunnels", None) is not None:
             _s.tunnels.pop(aid, None)
         with _s.lock:
             tags = st.get(("tags", aid), {})
-            gone = [k for k, r in tags.items() if r == rid]
+            parent = st.pop(("parent", rid), None)
+            ids = {rid} if same else {rid, parent}
+            gone = [k for k, r in tags.items() if r in ids]
             for k in gone:
                 del tags[k]
         if not same and gone and aid in _s.chunks:

@@ -236,5 +236,53 @@ class BaseRoutingTest(unittest.TestCase):
         self.assertEqual((name, photo, calls), ("there.png", ["there"], [(1, 2)]))
 
 
+class RegionBookkeepingTest(unittest.TestCase):
+    """Blocks graded from region plans (grading.Grader.region): a region that came out unlike its cells' whole plans has
+    its height chunks dropped (with those of the block region a tunnel portal's region went into) and its blocks
+    reported to be built again; one that came out the same keeps them."""
+
+    def setUp(self):
+        import heightmap
+        self.cache = heightmap.ChunkCache()
+        blockworker._s = SimpleNamespace(lock=threading.Lock(), graders={1: object()}, chunks={1: self.cache},
+                                         tunnels={1: "profiles"})
+
+    def build(self, rid, chunk_keys, deps, block):
+        st = blockworker._regions_state()
+        tags = st.setdefault(("tags", 1), {})
+        tc = blockworker._TaggedChunks(self.cache, tags, rid, blockworker._s.lock)
+        for k in chunk_keys:
+            if tc.get(k) is None:
+                tc.put(k, np.zeros((2, 2)))
+        st[("block", 1, *block)] = set(deps) | tc.used
+        return tc
+
+    def test_a_different_region_drops_its_chunks(self):
+        st = blockworker._regions_state()
+        st[1] = [1, None, None]
+        st[2] = [1, None, None]
+        st[("parent", 2)] = 1               # (a portal's region: its heights in region 1's chunks)
+        self.build(1, [(0, 0), (0, 1)], {1, 2}, (0.0, 0.0))
+        tc = self.build(None, [(0, 1), (0, 2)], set(), (384.0, 0.0))
+        self.assertEqual(tc.used, {1}, "a chunk of region 1 reused: that block depends on it")
+        self.assertEqual(blockworker.region_poll(), [], "unresolved")
+        st[1][2], st[2][2] = True, False
+        done = dict(blockworker.region_poll())
+        self.assertEqual(done, {(1, 0.0, 0.0): False, (1, 384.0, 0.0): True})
+        self.assertIsNone(self.cache.get((0, 0)), "region 1's chunks dropped with its portal's region")
+        self.assertIsNotNone(self.cache.get((0, 2)), "a chunk of the whole plans kept")
+        self.assertNotIn(1, blockworker._s.tunnels, "the tunnels' ends graded from it made again")
+        self.assertEqual([k for k in st if k != "done" and k != ("tags", 1)], [], "nothing left")
+
+    def test_a_same_region_keeps_them(self):
+        st = blockworker._regions_state()
+        st[1] = [1, None, None]
+        self.build(1, [(0, 0)], {1}, (0.0, 0.0))
+        st[1][2] = True
+        self.assertEqual(blockworker.region_poll(), [((1, 0.0, 0.0), True)])
+        self.assertIsNotNone(self.cache.get((0, 0)))
+        self.assertEqual(st[("tags", 1)], {}, "untagged: as the whole plans make them")
+
+
 if __name__ == "__main__":
     unittest.main()
