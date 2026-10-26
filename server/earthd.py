@@ -213,6 +213,13 @@ GROUND_RESEND_M, GROUND_RESEND_S = 1.0, 1.5   # ground_ahead: sent on a change, 
                                                # follow.GROUND_STALE_S is 3 s)
 DETAIL_RING_M = 128.0           # detail mode: L-1 tiles this far beyond the block (forced())
 IMG_WARM_MARGIN = 200.0         # m beyond the block's half width that warm_imagery fetches ahead
+# photo_ahead: the base photos' tiles of the blocks along the way ahead (2026-10-26). A block's photo fetched and
+# decoded its imagery while the block was built (1.3-3.9 s of 3-7.5 s photos at 110-130 mph, 2026-10-25).
+PHOTO_AHEAD_S = 30.0            # s of driving ahead (aheadpath.points) ...
+PHOTO_AHEAD_MIN_M = 800.0       # ... at least this far
+PHOTO_AHEAD_MOVE_M = 100.0      # m the player moves before the next round
+PHOTO_AHEAD_AGAIN_S = 20.0      # s before a block's tiles are asked for again
+PHOTO_AHEAD_BLOCKS = 4          # blocks asked for a round at most (nearest first: the fetch pool and the tile LRU)
 # download_ahead: the raw data of the terrain blocks and road tiles ahead of a driving player, fetched into the
 # disk caches before anything there is built (a block in a new area waited ~0.5-2 s on its elevation tiles,
 # 2026-10-15). Points AHEAD_S s ahead on the straight path (at most AHEAD_MAX_M), at netfetch "prefetch"
@@ -686,6 +693,8 @@ class Server:
         self.ahead_pool = ThreadPoolExecutor(1, thread_name_prefix="download-ahead")   # download_ahead
         self.ahead_busy = False
         self.ahead_last = None          # (anchor id, x, y) of the last round
+        self.photo_last = None          # photo_ahead: (anchor id, x, y) of the last round
+        self.photo_asked = {}           # photo_ahead: (anchor id, cx, cy) -> when its tiles were asked for
         self.ahead_stats = {"dem": 0, "cells": 0, "deferred": 0}
         self.horizon_grids = {}             # anchorId -> farfield.HorizonGrid
         self.horizon_inflight = {}          # anchorId -> (future, half-size)
@@ -1341,6 +1350,38 @@ class Server:
         reach = self.layout.block * heightmap.SQUARE / 2 + IMG_WARM_MARGIN
         pts = [(x + vx * t, y + vy * t) for t in WARM_STEPS_S]
         self.imagery.warm(anchor.frame, pts, reach, self.layout.block * heightmap.SQUARE / BASE_PX)
+
+    def photo_ahead(self, anchor, x, y, vx, vy, turn=0.0):
+        """Prefetch the base photos' imagery tiles (imagery.prefetch: the sources render reads on demand; warm_imagery
+        has the lazy ones) of the blocks along the way ahead (aheadpath.points, PHOTO_AHEAD_S of driving), nearest
+        first, so a block's photo finds them in the caches when it is built."""
+        if self.near_visual != "detail" or self.imagery is None:
+            return
+        last = self.photo_last
+        if last is not None and last[0] == anchor.id and math.hypot(x - last[1], y - last[2]) < PHOTO_AHEAD_MOVE_M:
+            return
+        v = math.hypot(vx, vy)
+        path = aheadpath.points(x, y, vx, vy, turn, lead_s=PHOTO_AHEAD_S, min_m=PHOTO_AHEAD_MIN_M,
+                                max_m=max(PHOTO_AHEAD_MIN_M, v * PHOTO_AHEAD_S))
+        if not path:
+            return
+        self.photo_last = (anchor.id, x, y)
+        grid, size, now = self.layout.grid, self.layout.block * heightmap.SQUARE, time.monotonic()
+        self.photo_asked = {k: t for k, t in self.photo_asked.items() if now - t < PHOTO_AHEAD_AGAIN_S}
+        n = 0
+        for _t, px, py, _sp in path[1:]:
+            cx, cy = round(px / grid) * grid, round(py / grid) * grid
+            key = (anchor.id, cx, cy)
+            if key in self.photo_asked or (anchor.id, cx, cy) in self.hm:
+                continue
+            self.photo_asked[key] = now
+            try:
+                self.imagery.prefetch(anchor.frame, cx - size / 2, cy - size / 2, size, BASE_PX)
+            except Exception as e:      # only costs the lookahead
+                log.debug("photo ahead %s: %s", key, e)
+            n += 1
+            if n >= PHOTO_AHEAD_BLOCKS:
+                break
 
     def _warm_loop(self):
         while True:
@@ -3424,6 +3465,7 @@ class Connection:
         if aid == self.active and self.following:
             self.s.warm_roads(self.s.anchors[aid], *self.focus, *self.vel, self.track.turn())
             self.s.warm_imagery(self.s.anchors[aid], *self.focus, *self.vel)
+            self.s.photo_ahead(self.s.anchors[aid], *self.focus, *self.vel, self.track.turn())
             self.s.download_ahead(self.s.anchors[aid], *self.focus, *self.vel)
             self.base_refresh(aid)
         if self.s.mapdata is not None and aid == self.active:

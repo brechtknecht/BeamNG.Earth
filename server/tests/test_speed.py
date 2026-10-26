@@ -1,5 +1,6 @@
 """Driving fast (2026-10-25): a block's photo waits only as long as the drive to the block's edge allows
-(Server._base_wait_s, Connection.edge_at), and the server borrows some of the game's cores (Server.speed_boost)."""
+(Server._base_wait_s, Connection.edge_at), the server borrows some of the game's cores (Server.speed_boost), and the
+photos' tiles of the blocks ahead are fetched early (Server.photo_ahead)."""
 import sys
 import time
 import unittest
@@ -82,6 +83,40 @@ class SpeedBoostTest(unittest.TestCase):
         self.s.speed_boost(True, "test")
         self.assertEqual(self.pinned, [])
         self.assertFalse(self.s.speed_on)
+
+
+
+class PhotoAheadTest(unittest.TestCase):
+    def server(self):
+        s = earthd.Server.__new__(earthd.Server)
+        s.near_visual = "detail"
+        s.layout = farfield.Layout(64, 512, True)
+        s.photo_last, s.photo_asked, s.hm = None, {}, {}
+        s.asked = []
+        s.imagery = SimpleNamespace(prefetch=lambda frame, x0, y0, size, px: s.asked.append((x0 + size / 2, y0 + size / 2)))
+        return s
+
+    def test_blocks_ahead_nearest_first(self):
+        s = self.server()
+        anchor = SimpleNamespace(id=1, frame=None)
+        s.photo_ahead(anchor, 0.0, 0.0, 50.0, 0.0)
+        self.assertEqual(len(s.asked), earthd.PHOTO_AHEAD_BLOCKS)
+        xs = [x for x, _ in s.asked]
+        self.assertEqual(xs, sorted(xs))
+        self.assertTrue(all(x > 0 and x % s.layout.grid == 0 and y == 0 for x, y in s.asked))
+        s.photo_ahead(anchor, 50.0, 0.0, 50.0, 0.0)          # moved too little: no new round
+        self.assertEqual(len(s.asked), earthd.PHOTO_AHEAD_BLOCKS)
+        s.photo_ahead(anchor, 400.0, 0.0, 50.0, 0.0)         # on: only blocks not asked for yet
+        self.assertEqual(len(set(s.asked)), len(s.asked))
+
+    def test_standing_or_built_blocks(self):
+        s = self.server()
+        anchor = SimpleNamespace(id=1, frame=None)
+        s.photo_ahead(anchor, 0.0, 0.0, 0.5, 0.0)
+        self.assertEqual(s.asked, [])
+        s.hm = {(1, float(c), 0.0): {} for c in range(0, 3000, 128)}
+        s.photo_ahead(anchor, 0.0, 0.0, 50.0, 0.0)
+        self.assertEqual(s.asked, [])
 
 
 if __name__ == "__main__":
