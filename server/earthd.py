@@ -3100,6 +3100,11 @@ STAND_IN_TIMEOUT_S = 60.0
 # The interpreter lock's switch interval in ms (Python's: 5): a thread that gave it up (numpy, a file) waits up to this
 # long per busy thread to get it back - a numpy loop of 25 ms took 5.8 s next to six busy threads at 5 ms, 1.2 s at 1
 # (2026-10-26). 0: Python's own.
+# A/B of the ground block swap's hitch (Felix's drives, 2026-10-26: the engine's first render of the swapped block,
+# Render 40-83 ms, not the mod's 13 ms .ter load, its photo or the far cover): the resolution the engine bakes the
+# block's base colour at, sent to the mod in hello (its TerrainBlock baseTexSize; the mod's default 1024, used when 0).
+# Try BNGE_TERRAIN_BASE_TEX=256: the block's far part may look softer.
+TERRAIN_BASE_TEX = int(os.environ.get("BNGE_TERRAIN_BASE_TEX", "0") or 0)
 SWITCH_MS = float(os.environ.get("BNGE_SWITCH_MS", "0") or 0)
 # Once a follow block was stood in for (its graded one came after the car), the next one's stand-in starts at the
 # usual time without asking whether its graded one would be in time: quality.build_s is measured on the graded blocks
@@ -3627,6 +3632,8 @@ class Connection:
                  "appVersion": updatesmod.local_version() or "",     # the release (VERSION): the players' reports
                  "sessionId": self.s.sid, "farFormat": self.s.far_format, "material": farfield.MATERIAL,
                  "nearVisual": self.s.near_visual, "attribution": self.s.attribution()}
+            if TERRAIN_BASE_TEX:        # (A/B) the block's baked base colour's size (mod terrain.setBaseTexSize)
+                m["terrainBaseTex"] = TERRAIN_BASE_TEX
             if self.s.imagery is not None:      # the world map credits the sources its view shows
                 m["imageryCredits"] = self.s.imagery.credits_by_area()
                 m["otherCredits"] = self.s.attribution_rest()
