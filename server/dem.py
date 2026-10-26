@@ -70,6 +70,7 @@ MAX_TILES_PER_SAMPLE = 1024
 SPARSE_MIN_TILES = 16       # a sample's box of more tiles than this with points in fewer than 1 / SPARSE_RATIO of them
 SPARSE_RATIO = 4            # is sampled in groups of SPARSE_GROUP x SPARSE_GROUP tiles (only the tiles near points)
 SPARSE_GROUP = 2
+MOSAIC_FREE = os.environ.get("BNGE_DEM_MOSAIC", "0") != "1"   # 1: the tiles copied into one mosaic per sample, as before
 
 MAPTERHORN = dict(name="mapterhorn", ext="webp", size=512,
                   url="https://tiles.mapterhorn.com/{z}/{x}/{y}.webp")
@@ -778,12 +779,19 @@ class Dem:
             return out.reshape(shape)
         keys = {(tx, ty): (zoom, tx % n, ty) for ty in range(ty0, ty1 + 1) for tx in range(tx0, tx1 + 1)}
         got = self.tiles(keys.values(), progress)
+        fx -= tx0 * TILE
+        fy -= ty0 * TILE
+        if MOSAIC_FREE:
+            fast.require(77, "bilinear_tiles")
+            # (the tiles as they are, row by row: copying them into one mosaic was most of a small call's time,
+            # 3 ms for a road profile's 500 points over 1.5 km, 2026-10-26; the same pixels and sums)
+            out[valid] = fast._ef.bilinear_tiles([got[keys[(tx, ty)]] for ty in range(ty0, ty1 + 1)
+                                                  for tx in range(tx0, tx1 + 1)], nx, ny, fx, fy)
+            return out.reshape(shape)
         mosaic = np.empty((ny * TILE, nx * TILE), np.float32)
         for (tx, ty), k in keys.items():
             c, r = (tx - tx0) * TILE, (ty - ty0) * TILE
             mosaic[r:r + TILE, c:c + TILE] = got[k]
-        fx -= tx0 * TILE
-        fy -= ty0 * TILE
         fast.require(55, "bilinear_grid")
         out[valid] = fast._ef.bilinear_grid(mosaic, fx, fy)
         return out.reshape(shape)

@@ -2633,6 +2633,53 @@ fn bilinear_grid<'py>(
     Ok(out.into_pyarray(py))
 }
 
+/// bilinear_grid over a mosaic of equal tiles (each tile x tile float32) without building it: tiles in row-major order,
+/// nx per row, ny rows; the same pixels, clamps and float64 arithmetic as bilinear_grid on the copied mosaic (dem.sample
+/// copied every tile of the points' box into one array per call: 3 ms for a road profile's 500 points over 1.5 km,
+/// 2026-10-26).
+#[pyfunction]
+fn bilinear_tiles<'py>(
+    py: Python<'py>,
+    tiles: Vec<PyReadonlyArray2<'py, f32>>,
+    nx: usize,
+    ny: usize,
+    fx: PyReadonlyArray1<'py, f64>,
+    fy: PyReadonlyArray1<'py, f64>,
+) -> PyResult<Bound<'py, PyArray1<f64>>> {
+    if nx == 0 || ny == 0 || tiles.len() != nx * ny {
+        return Err(pyo3::exceptions::PyValueError::new_err("bilinear_tiles: nx * ny tiles needed"));
+    }
+    let views: Vec<numpy::ndarray::ArrayView2<f32>> = tiles.iter().map(|t| t.as_array()).collect();
+    let t = views[0].shape()[0];
+    if t < 2 || views.iter().any(|v| v.shape()[0] != t || v.shape()[1] != t) {
+        return Err(pyo3::exceptions::PyValueError::new_err("bilinear_tiles: square tiles of one size needed"));
+    }
+    let (xs, ys) = (fx.as_array(), fy.as_array());
+    if xs.len() != ys.len() {
+        return Err(pyo3::exceptions::PyValueError::new_err("bilinear_tiles: fx and fy differ in length"));
+    }
+    let (h, w) = (ny * t, nx * t);
+    let out = release(py, xs.len() * 8, || {
+        let (pow2, sh, mask) = (t.is_power_of_two(), t.trailing_zeros(), t - 1);     // (dem.TILE 512: shifts)
+        let at = |r: usize, c: usize| if pow2 {
+            unsafe { *views.get_unchecked(((r >> sh) * nx) + (c >> sh)).uget([r & mask, c & mask]) as f64 }
+        } else {
+            views[(r / t) * nx + c / t][[r % t, c % t]] as f64
+        };
+        numpy::ndarray::Array1::from_shape_fn(xs.len(), |i| {
+            let (x, y) = (xs[i], ys[i]);
+            let ix = (x.floor() as i64).clamp(0, w as i64 - 2) as usize;
+            let iy = (y.floor() as i64).clamp(0, h as i64 - 2) as usize;
+            let wx = (x - ix as f64).clamp(0.0, 1.0);
+            let wy = (y - iy as f64).clamp(0.0, 1.0);
+            let (v00, v10) = (at(iy, ix), at(iy, ix + 1));
+            let (v01, v11) = (at(iy + 1, ix), at(iy + 1, ix + 1));
+            (v00 * (1.0 - wx) + v10 * wx) * (1.0 - wy) + (v01 * (1.0 - wx) + v11 * wx) * wy
+        })
+    });
+    Ok(out.into_pyarray(py))
+}
+
 /// dem.decode_terrarium's arithmetic on the decoded image (h, w, 3|4 uint8): R * 256 + G + B / 256 - 32768 in float32,
 /// in numpy's order, without the RGB conversion and float temporaries.
 #[pyfunction]
@@ -4472,6 +4519,7 @@ fn earthfast(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(season_noise, m)?)?;
     m.add_function(wrap_pyfunction!(terrarium_heights, m)?)?;
     m.add_function(wrap_pyfunction!(bilinear_grid, m)?)?;
+    m.add_function(wrap_pyfunction!(bilinear_tiles, m)?)?;
     m.add_function(wrap_pyfunction!(float_predictor_f32, m)?)?;
     m.add_function(wrap_pyfunction!(segment_crossings, m)?)?;
     m.add_function(wrap_pyfunction!(seg_hits, m)?)?;
@@ -4513,6 +4561,6 @@ fn earthfast(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(paint_lines, m)?)?;
     m.add_function(wrap_pyfunction!(photofill::fill_photo, m)?)?;
     m.add_function(wrap_pyfunction!(rtin_mesh, m)?)?;
-    m.add("VERSION", 76)?;
+    m.add("VERSION", 77)?;
     Ok(())
 }
