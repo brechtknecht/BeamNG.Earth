@@ -1254,9 +1254,11 @@ class Server:
                        key=lambda kl: (self.WARM_ORDER.get(kl[1], 9), where(kl[0]), str(kl[0]), kl[1]))
         return self.mapdata.warm(order)
 
-    def build_roads_tile(self, aid, tx, ty):
+    def build_roads_tile(self, aid, tx, ty, verify=False):
         """roads.py: one road tile of anchor aid, written to the session folder. Returns (vfs path,
-        chunks) or None if the anchor is gone. Worker threads (fetches the map cells it lacks)."""
+        chunks[, True: graded from region plans]) or None if the anchor is gone; verify: roads.UNCHANGED when a tile
+        graded from region plans comes out the same from its cells' whole plans (roads.Tracker). Worker threads
+        (fetches the map cells it lacks)."""
         anchor = self.anchors.get(aid)
         if anchor is None or self.mapdata is None:
             return None
@@ -1266,10 +1268,15 @@ class Server:
                 blockworker.roads_tile, aid, anchor.lat, anchor.lon, anchor.zooms[0], tx, ty, self.out_dir,
                 self.vfs_dir, self.sidewalks, DETAIL_ROAD_LIFT if self.near_visual == "detail" else 0.0,
                 self.buildings, self.left_hand(anchor), self.mph(anchor), self.anchor_q(anchor),
-                self.gas_stations).result()
-            log.debug("road tile %d_%d: %.2f s (queue + build)", tx, ty, time.perf_counter() - t0)
+                self.gas_stations, verify).result()
+            log.debug("road tile %d_%d: %.2f s (queue + build%s)", tx, ty, time.perf_counter() - t0,
+                      ", check" if verify else "")
+            if isinstance(res, str):        # (roads.UNCHANGED)
+                return res
             self.keep_fuel_pads(res[2])
-            return res[:2]
+            return res[:2] + ((True,) if len(res) > 3 and res[3] else ())
+        if verify:                  # (graded here from the whole plans only: never from region plans)
+            return roadsmod.UNCHANGED
         self.mapdata.warm(roadsmod.tile_needs(anchor.frame, tx, ty, self.buildings, self.road_widths is not None,
                                               1 + seacarvemod.LINE_CELLS if self.sea is not None else 0))
         cells = [self.mapdata.cell(k, layers=("roads",), kind="demand").layers.get("roads")
@@ -4061,7 +4068,7 @@ class Connection:
             self.bldfar.on_pose(self, aid, *self.focus, asyncio.get_running_loop(), self.s.build_far_bld_tile,
                                 view=self.view_at)
         if self.s.traffic and aid == self.active and self.nav_may_start(aid):
-            self.nav.on_pose(self, aid, *self.focus, asyncio.get_running_loop(), self.s.build_navgraph)
+            self.nav.on_pose(self, aid, *self.focus, asyncio.get_running_loop(), self.s.build_navgraph, vel=self.vel)
         if aid == self.active:
             self.send_progress(aid)
         self.refresh_status()

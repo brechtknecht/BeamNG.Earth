@@ -85,31 +85,17 @@ class PlanCache:
 
     def load(self, key):
         """(plans, keeps, covers, opens) of cell key from the cache, or None."""
-        from grading import Plan
-        from roads import Spec
-        try:
-            src = self._path(key)
-            if not os.path.exists(src):
-                src = self._kept(key)
-                if src is None:
-                    return None
-            with np.load(src, allow_pickle=False) as f:
-                meta = json.loads(bytes(f["meta"]).decode("utf-8"))
-                lists = {g: _split(f, g) for g in ("p", "z", "c", "k", "v", "o")}
-        except (OSError, ValueError, KeyError, TypeError):
+        src = self._path(key)
+        if not os.path.exists(src):
+            src = self._kept(key)
+            if src is None:
+                return None
+        got = _read(src)
+        if got is None:
             return None
-        plans, cuts = [], iter(lists["c"])
-        for m, xy, z in zip(meta["plans"], lists["p"], lists["z"]):
-            pl = Plan(xy, z, m["half"], tuple(m["abut"]), next(cuts) if m["cut"] else None, m["road_half"])
-            pl.rid, pl.max_wall = m["rid"], m["max_wall"]
-            plans.append((m["fid"], pl))
-        keeps = list(zip(lists["k"], meta["keeps"]))
-        covers = list(zip(lists["v"], meta["covers"]))
-        opens = [(xy, Spec(**{**sp, "sides": tuple(sp["sides"]) if sp.get("sides") is not None else None}))
-                 for xy, sp in zip(lists["o"], meta["opens"])]   # (JSON gave sides back as a list)
         with self._lock:
             self.stats["read"] += 1
-        return plans, keeps, covers, opens
+        return got[0]
 
     def _revisit_key(self, key):
         import revisit
@@ -129,35 +115,62 @@ class PlanCache:
     def store(self, key, plans, keeps, covers, opens, persist=False):
         """Write cell key's plans for the run's other processes; persist: also into the revisit cache (complete plans:
         nothing they read failed or was missing, Grader._plan_cell)."""
-        meta = {"plans": [{"fid": fid, "half": p.half, "abut": list(p.abut), "road_half": p.road_half,
-                           "rid": int(p.rid), "max_wall": float(p.max_wall), "cut": p.cut is not None}
-                          for fid, p in plans],
-                "keeps": [float(hw) for _xy, hw in keeps], "covers": [float(w) for _xy, w in covers],
-                "opens": [{k: (v.item() if hasattr(v, "item") else v) for k, v in sp._asdict().items()}
-                          for _xy, sp in opens]}
-        arrays = {"meta": np.frombuffer(json.dumps(meta).encode("utf-8"), np.uint8)}
-        try:
-            _pack(arrays, "p", [p.xy for _f, p in plans])
-            _pack(arrays, "z", [p.z for _f, p in plans])
-            _pack(arrays, "c", [p.cut for _f, p in plans if p.cut is not None])
-            _pack(arrays, "k", [xy for xy, _hw in keeps])
-            _pack(arrays, "v", [xy for xy, _w in covers])
-            _pack(arrays, "o", [xy for xy, _sp in opens])
-            p = self._path(key)
-            os.makedirs(self.dir, exist_ok=True)
-            tmp = f"{p}.{os.getpid()}.{threading.get_ident()}.tmp"
-            with open(tmp, "wb") as fh:
-                np.savez(fh, **arrays)
-            os.replace(tmp, p)
-            if persist and self.persist is not None:
-                import revisit
+        p = self._path(key)
+        if not _write(self.dir, p, plans, keeps, covers, opens):
+            return False
+        if persist and self.persist is not None:
+            import revisit
+            try:
                 with open(p, "rb") as fh:
                     revisit.store(self.persist[0], "plans", self._revisit_key(key), {"plans.npz": fh.read()})
-        except (OSError, ValueError, TypeError):
-            return False
+            except OSError:
+                return False
         with self._lock:
             self.stats["written"] += 1
         return True
+
+    # A block's region plans of a cell (grading.Grader.region: only the roads near its box, from the cell's own map
+    # data) kept for the run's other processes too: the road tiles over the block grade from the same plans (its road
+    # mesh on its ground) instead of waiting for the cells' whole plans (100-150 s a cell on 2 cores at 300 km/h, the
+    # road tiles never came, 2026-10-26), and the other block lanes take them instead of planning the cell again.
+    def _region_prefix(self, key):
+        return f"r_{int(key[0])}_{int(key[1])}_{int(key[2])}_"
+
+    def store_region(self, key, box, got, missed):
+        """Write the region plans got (plans, keeps, covers, opens) of cell key over box (x0, y0, x1, y1, m in the
+        frame; missed: the cells they could not read)."""
+        b = [int(np.floor(box[0])), int(np.floor(box[1])), int(np.ceil(box[2])), int(np.ceil(box[3]))]
+        p = os.path.join(self.dir, self._region_prefix(key) + "_".join(map(str, b)) + ".npz")
+        return _write(self.dir, p, *got, extra={"box": list(map(float, box)), "missed": [str(m) for m in missed]})
+
+    def region(self, key, box):
+        """(its box, (plans, keeps, covers, opens), missed) of a region of cell key kept here whose box holds box, the
+        smallest such, or None."""
+        pre = self._region_prefix(key)
+        best = None
+        try:
+            with os.scandir(self.dir) as it:
+                for e in it:
+                    if not (e.name.startswith(pre) and e.name.endswith(".npz")):
+                        continue
+                    try:
+                        b = [float(v) for v in e.name[len(pre):-4].split("_")]
+                    except ValueError:
+                        continue
+                    if len(b) == 4 and b[0] <= box[0] and b[1] <= box[1] and b[2] >= box[2] and b[3] >= box[3]:
+                        area = (b[2] - b[0]) * (b[3] - b[1])
+                        if best is None or area < best[0]:
+                            best = (area, e.path)
+        except OSError:
+            return None
+        if best is None:
+            return None
+        got = _read(best[1])
+        if got is None or "box" not in got[1]:
+            return None
+        with self._lock:
+            self.stats["regions_read"] = self.stats.get("regions_read", 0) + 1
+        return tuple(got[1]["box"]), got[0], list(got[1].get("missed", []))
 
     def claim(self, key):
         """Before planning cell key: (state, False) when it is in the cache (or another process planned it while we
@@ -183,6 +196,54 @@ class PlanCache:
             return time.time() - os.path.getmtime(self._path(key) + ".lock") <= xproc.stale_s()
         except OSError:
             return False
+
+
+def _write(folder, p, plans, keeps, covers, opens, extra=None):
+    """One cell's plans written to p (npz: the arrays, and the rest as JSON in "meta"; extra: more of that)."""
+    meta = {"plans": [{"fid": fid, "half": p_.half, "abut": list(p_.abut), "road_half": p_.road_half,
+                       "rid": int(p_.rid), "max_wall": float(p_.max_wall), "cut": p_.cut is not None}
+                      for fid, p_ in plans],
+            "keeps": [float(hw) for _xy, hw in keeps], "covers": [float(w) for _xy, w in covers],
+            "opens": [{k: (v.item() if hasattr(v, "item") else v) for k, v in sp._asdict().items()}
+                      for _xy, sp in opens], **(extra or {})}
+    arrays = {"meta": np.frombuffer(json.dumps(meta).encode("utf-8"), np.uint8)}
+    try:
+        _pack(arrays, "p", [p_.xy for _f, p_ in plans])
+        _pack(arrays, "z", [p_.z for _f, p_ in plans])
+        _pack(arrays, "c", [p_.cut for _f, p_ in plans if p_.cut is not None])
+        _pack(arrays, "k", [xy for xy, _hw in keeps])
+        _pack(arrays, "v", [xy for xy, _w in covers])
+        _pack(arrays, "o", [xy for xy, _sp in opens])
+        os.makedirs(folder, exist_ok=True)
+        tmp = f"{p}.{os.getpid()}.{threading.get_ident()}.tmp"
+        with open(tmp, "wb") as fh:
+            np.savez(fh, **arrays)
+        os.replace(tmp, p)
+    except (OSError, ValueError, TypeError):
+        return False
+    return True
+
+
+def _read(src):
+    """((plans, keeps, covers, opens), meta) of the plans in src (a path or file-like npz), or None."""
+    from grading import Plan
+    from roads import Spec
+    try:
+        with np.load(src, allow_pickle=False) as f:
+            meta = json.loads(bytes(f["meta"]).decode("utf-8"))
+            lists = {g: _split(f, g) for g in ("p", "z", "c", "k", "v", "o")}
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    plans, cuts = [], iter(lists["c"])
+    for m, xy, z in zip(meta["plans"], lists["p"], lists["z"]):
+        pl = Plan(xy, z, m["half"], tuple(m["abut"]), next(cuts) if m["cut"] else None, m["road_half"])
+        pl.rid, pl.max_wall = m["rid"], m["max_wall"]
+        plans.append((m["fid"], pl))
+    keeps = list(zip(lists["k"], meta["keeps"]))
+    covers = list(zip(lists["v"], meta["covers"]))
+    opens = [(xy, Spec(**{**sp, "sides": tuple(sp["sides"]) if sp.get("sides") is not None else None}))
+             for xy, sp in zip(lists["o"], meta["opens"])]   # (JSON gave sides back as a list)
+    return (plans, keeps, covers, opens), meta
 
 
 def _newest(d, depth=2):

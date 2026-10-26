@@ -515,6 +515,10 @@ def _bridges(aid, frame, elev):
 
 NAV_GRADED_M = 900.0        # m (Chebyshev) round the AI graph's centre where its ground is graded in full: the road tiles'
                             # reach (roads.SEND_M + a tile), whose cells they plan anyway; beyond, only planned cells
+# The road tiles no longer plan their cells whole (TILE_REGION): the AI graph is graded only under the cells planned
+# already, by any process (Grader.adopt), and never plans one itself (it held a road process for 10-24 s a graph at
+# 300 km/h; the next graph, 400 m on, takes the cells planned meanwhile). 0: graded in full within NAV_GRADED_M.
+NAV_NOPLAN = os.environ.get("BNGE_NAV_NOPLAN", "1") != "0"
 
 
 def _nav_bridges(aid, frame, elev):
@@ -556,11 +560,14 @@ def navgraph(aid, lat, lon, zoom, x, y, out_dir, vfs_dir, serial, left_hand, mph
         la_, lo_, z = np.asarray(la_, np.float64), np.asarray(lo_, np.float64), np.asarray(z, np.float64)
         e, n, _ = frame.geodetic_to_enu(la_.ravel(), lo_.ravel(), 0.0)
         near = np.maximum(np.abs(np.asarray(e) - x), np.abs(np.asarray(n) - y)).reshape(la_.shape) <= NAV_GRADED_M
+        if NAV_NOPLAN:
+            near[:] = False
         out = np.array(z, np.float64, copy=True)
         if near.any():
             out[near] = g.apply(la_[near], lo_[near], z[near], gradingmod.ROAD_LIFT)
         if (~near).any():
-            out[~near] = g.apply(la_[~near], lo_[~near], z[~near], gradingmod.ROAD_LIFT, planned_only=True)
+            out[~near] = g.apply(la_[~near], lo_[~near], z[~near], gradingmod.ROAD_LIFT, planned_only=True,
+                                 adopt=NAV_NOPLAN)
         return out
     decks = {}
     try:
@@ -592,13 +599,19 @@ def terrain_patch(aid, lat, lon, zoom, box, path):
 
 
 def roads_tile(aid, lat, lon, zoom, tx, ty, out_dir, vfs_dir, sidewalks, lift, buildings=False, left_hand=False,
-               mph=True, q=None, gas_stations=False):
+               mph=True, q=None, gas_stations=False, verify=False):
     """earthd.Server.build_roads_tile here (road-tile pool): the anchor's road tile (tx, ty) built and
-    written; returns roads.write_tile's (vfs path, chunks) and its stations' pads (gasstations.tile_sites pads: the
-    server keeps them for the ground's painters). In the server's process its Python made up
+    written; returns roads.write_tile's (vfs path, chunks), its stations' pads (gasstations.tile_sites pads: the
+    server keeps them for the ground's painters) and whether it was graded from region plans (its cells not planned
+    whole yet: TILE_REGION). In the server's process its Python made up
     ~80 % of the main process's busy threads (in-game profile 2026-10-13): the block photos and far
-    textures waited for the GIL. A tile built in this anchor's place before comes from the revisit cache."""
+    textures waited for the GIL. A tile built in this anchor's place before comes from the revisit cache.
+    verify: a tile graded from region plans before, built again only when its cells' whole plans grade it otherwise
+    (else roads.UNCHANGED; roads.NotReady while they are not all made)."""
     import revisit
+    import roads as roadsmod
+    if verify and _region_tile_same(aid, lat, lon, tx, ty):
+        return roadsmod.UNCHANGED
     k = revisit.key("roads", round(float(lat), 7), round(float(lon), 7), zoom, tx, ty, bool(sidewalks), float(lift),
                     bool(buildings), bool(left_hand), bool(mph), None if q is None else float(q), bool(gas_stations),
                     _s.md.versions() if _s.md is not None else None)
@@ -609,7 +622,27 @@ def roads_tile(aid, lat, lon, zoom, tx, ty, out_dir, vfs_dir, sidewalks, lift, b
                                                                        for la, lo in rs]] for sid, rs in res[2]]},
                          lambda path, extra: (path, int(extra.get("n", 0)),
                                               [(sid, [(np.asarray(la), np.asarray(lo)) for la, lo in rs])
-                                               for sid, rs in extra.get("pads", [])]))
+                                               for sid, rs in extra.get("pads", [])], False))
+
+
+def _region_tile_same(aid, lat, lon, tx, ty):
+    """Whether road tile (tx, ty), graded from region plans before (_roads_tile), comes out the same from its cells'
+    whole plans (grading.Region.same, the region as plancache keeps it); roads.NotReady while those are not all made
+    (none waits for them here), False when the region is gone."""
+    import roads as roadsmod
+    frame = geodesy.EnuFrame(lat, lon)
+    g, _ = _s.anchor(aid, lat, lon)
+    if g is None:
+        return False
+    keys = _tile_plan_keys(frame, tx, ty)
+    g.adopt(keys)
+    if not g.planned(keys):
+        raise roadsmod.NotReady("its cells' whole plans are not all made yet")
+    reg = g.region(_grow_box(roadsmod.tile_bbox(tx, ty), TILE_PLAN_MARGIN_M), make=False, whole=True)
+    same = reg is not None and bool(reg.same(g))
+    log.log(logging.DEBUG if same else logging.INFO, "road tile (%s, %s) graded from region plans %s its cells' whole "
+            "plans", tx, ty, "as" if same else "differs from")
+    return same
 
 
 def _revisit_tile(kind, k, aid, tx, ty, out_dir, vfs_dir, name, build, extra_of, result_of):
@@ -654,25 +687,50 @@ def _write_bytes(path, data):
 
 def _roads_tile(aid, lat, lon, zoom, tx, ty, out_dir, vfs_dir, sidewalks, lift, buildings, left_hand, mph, q,
                 gas_stations):
-    import parking as parkingmod
-    import rails as railsmod
-    import roadmesh as roadmeshmod
     import roads as roadsmod
     frame = geodesy.EnuFrame(lat, lon)
     # everything the tile will ask for, fetched at once (one after another, a fresh place's first tile took ~1 min)
     _s.md.warm(roadsmod.tile_needs(frame, tx, ty, buildings, _s.widths is not None,
                                    1 + seacarvemod.LINE_CELLS if _s.sea is not None else 0))
     g, _ = _s.anchor(aid, lat, lon)
-    if g is not None and TILE_NOWAIT:       # (another process plans its cells: the other tiles first, roads.NotReady)
-        busy = g.elsewhere(_tile_plan_keys(frame, tx, ty))
-        if busy:
+    reg = None
+    if g is not None and (TILE_NOWAIT or TILE_REGION):
+        keys = _tile_plan_keys(frame, tx, ty)
+        busy = g.elsewhere(keys)            # (and the cells planned already taken: Grader.adopt)
+        if TILE_REGION and not g.planned(keys):
+            # graded from the region plans of the block it lies in (plancache: another process's), else its own when
+            # no process plans its cells; the whole plans are waited for by no one (roads.Tracker checks it later)
+            try:
+                reg = g.region(_grow_box(roadsmod.tile_bbox(tx, ty), TILE_PLAN_MARGIN_M), make=not busy)
+            except Exception:       # (as the whole plans make it then)
+                log.exception("road tile region (%s, %s)", tx, ty)
+            if reg is None and busy:
+                raise roadsmod.NotReady(f"road plans of {', '.join(map(str, busy))} being made by another process")
+        elif busy and TILE_NOWAIT:          # (another process plans its cells: the other tiles first, roads.NotReady)
             raise roadsmod.NotReady(f"road plans of {', '.join(map(str, busy))} being made by another process")
+    if reg is not None:
+        import revisit
+        revisit.fault()                     # (not kept: its whole plans may grade it otherwise)
+    _s.building, _s.building_more = reg, []     # (its points beyond the region's box: _region_over)
+    try:
+        return _roads_tile_graded(aid, lat, lon, zoom, tx, ty, out_dir, vfs_dir, sidewalks, lift, buildings,
+                                  left_hand, mph, q, gas_stations, frame, g) + (reg is not None,)
+    finally:
+        _s.building, _s.building_more = None, []
+
+
+def _roads_tile_graded(aid, lat, lon, zoom, tx, ty, out_dir, vfs_dir, sidewalks, lift, buildings, left_hand, mph, q,
+                       gas_stations, frame, g):
+    import parking as parkingmod
+    import rails as railsmod
+    import roadmesh as roadmeshmod
+    import roads as roadsmod
     cells = [_s.md.cell(k, layers=("roads",), kind="demand").layers.get("roads")
              for k in roadsmod.cells_of_tile(frame, tx, ty)]
 
     def elev(la, lo):           # the physics ground (lifted under roads: grading.ROAD_LIFT)
         z = ground(frame, la, lo, _s.dem.sample(la, lo, zoom))
-        return g.apply(la, lo, z, gradingmod.ROAD_LIFT) if g is not None else z
+        return g.apply(la, lo, z, gradingmod.ROAD_LIFT, region=_region_over(g, la, lo)) if g is not None else z
     bridges = _bridges(aid, frame, elev)
     tunnels = tunnel_profiles(aid, frame, elev, g)
     walks = []
@@ -748,7 +806,15 @@ def _roads_tile(aid, lat, lon, zoom, tx, ty, out_dir, vfs_dir, sidewalks, lift, 
 
 
 TILE_NOWAIT = os.environ.get("BNGE_TILE_NOWAIT", "1") != "0"     # 0: a road tile waits for the plans (as before)
+# A road tile whose cells are not planned whole yet is graded from region plans (grading.Grader.region), as its block is:
+# at 300 km/h on 2 cores a cell's whole plans took 100-150 s and not one road tile on the way came (2026-10-26). 0: it
+# waits for the whole plans (as before).
+TILE_REGION = os.environ.get("BNGE_TILE_REGION", "1") != "0"
 TILE_PLAN_MARGIN_M = 64.0       # m round a road tile whose points' cells' plans it needs at once (_tile_plan_keys)
+
+
+def _grow_box(box, m):
+    return (box[0] - m, box[1] - m, box[2] + m, box[3] + m)
 
 
 def _tile_plan_keys(frame, tx, ty):

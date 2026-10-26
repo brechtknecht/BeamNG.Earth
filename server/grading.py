@@ -71,6 +71,7 @@ REGION_ON = os.environ.get("BNE_GRADE_REGION", "on") != "off"
 # the CPU audit 2026-10-26). 0: each block plans its own (as before).
 REGION_GROW_M = float(os.environ.get("BNE_REGION_GROW_M", "384"))
 REGION_MEMO_MAX = 32        # cells' region plans kept per Grader
+REGION_SHARE = os.environ.get("BNE_REGION_SHARE", "1") != "0"     # 0: a process's region plans its own (plancache)
 REGION_REACH_M = 80.0       # m: the roads whose lines come this near the block are planned (a plan grades its core half
                             # width + T_MAX from its line: ~30 m for the widest motorway)
 T_MIN, T_MAX = 5.0, 12.0    # m, transition back to the natural ground (5: roads close together meet gently)
@@ -1439,11 +1440,13 @@ class Grader:
                 memo[mk] = out
         return out
 
-    def region(self, box):
+    def region(self, box, make=True, whole=False):
         """A Region for the block over box (x0, y0, x1, y1) in the frame: the plans of the roads near it (REGION_REACH_M)
         in the cells its points reach, made now from those cells' map data alone (and any other cell on disk), or None
         when those cells are all planned already (or REGION_ON is off): apply(region=) then grades as their whole plans
-        would, as far as the cells around did not count (Region.same)."""
+        would, as far as the cells around did not count (Region.same). A cell's region plans made by this or another
+        process (shared: plancache) over a box that holds this one are taken. make False: only those (None when a cell
+        has none); whole: also when the cells are planned (a road tile's region told apart from them later)."""
         if not REGION_ON or not hasattr(self.md, "has"):
             return None
         t = np.linspace(0.0, 1.0, 9)
@@ -1453,7 +1456,7 @@ class Grader:
         la, lo, _ = self.frame.enu_to_geodetic(ex, ny, 0.0)
         keys = self._keys(la, lo)
         with self.lock:
-            if all(k in self.cells for k in keys):
+            if not whole and all(k in self.cells for k in keys):
                 return None
         t0 = time.perf_counter()
         view = _Within(self.md, keys)
@@ -1462,14 +1465,16 @@ class Grader:
         sub.wet = self.wet
         dem = getattr(self, "dem", None)
         urgent = dem is not None and hasattr(dem, "urgent")     # (the block waits for it: ahead of the lookahead's tiles)
-        failed = []
+        failed, lacking = [], []
         memo = self.__dict__.setdefault("_region_memo", OrderedDict())
         grown = _grow(box, REGION_GROW_M) if REGION_GROW_M > 0 else box
         reused = []                 # the earlier regions' (missed, widths) whose cells' plans this one takes
+        shared = self.shared if REGION_SHARE else None
+        made = []
 
         def one(k):
             with self.lock:
-                if k in self.cells:         # (planned whole meanwhile: those)
+                if k in self.cells and not whole:       # (planned whole meanwhile: those)
                     memo.pop(k, None)
                     return self.cells[k], self.keeps.get(k, []), self.covers.get(k, []), self.opens.get(k, [])
                 hit = memo.get(k)
@@ -1477,27 +1482,50 @@ class Grader:
                     memo.move_to_end(k)
                     reused.append((hit[2], hit[3]))
                     return hit[1]
+            if shared is not None:          # (made by another process: a block lane, a road tile)
+                kept = shared.region(k, box)
+                if kept is not None and _within(box, kept[0]):
+                    with self.lock:
+                        memo[k] = (kept[0], kept[1], kept[2], None)
+                        while len(memo) > REGION_MEMO_MAX:
+                            memo.popitem(last=False)
+                    reused.append((kept[2], None))
+                    return kept[1]
+            if not make:
+                lacking.append(k)
+                return [], [], [], []
             with dem.urgent() if urgent else _nullctx():
                 got = sub._make_cell(k, grown)
             if got is None:
                 failed.append(k)
                 return [], [], [], []
+            made.append(k)
             if REGION_GROW_M > 0:
                 with self.lock:
                     memo[k] = (grown, got, sorted(view.missed), widths)
                     while len(memo) > REGION_MEMO_MAX:
                         memo.popitem(last=False)
+            if shared is not None:
+                shared.store_region(k, grown, got, sorted(view.missed))
             return got
         with ThreadPoolExecutor(min(len(keys), PLAN_THREADS), thread_name_prefix="region") as ex_:
             cells = list(ex_.map(one, keys))
+        if lacking:
+            return None
         missed = set(view.missed) | {m for ms, _w in reused for m in ms}
         reg = Region(box, keys, cells, sorted(missed) + [str(k) for k in failed])
-        ws = [w for w in [widths] + [w for _m, w in reused] if w is not None]
+        ws = [w for w in [widths if made else None] + [w for _m, w in reused] if w is not None]
         reg.widths = ws[0] if len(ws) == 1 else (_AllWidths(ws) if ws else None)
-        log.info("grading: block region %s planned in %.2f s from %d cells (%d plans; cells not read: %s)",
-                 tuple(round(v) for v in box), time.perf_counter() - t0, len(keys), len(reg.plans),
-                 ", ".join(reg.missed) or "none")
+        log.log(logging.INFO if made else logging.DEBUG,
+                "grading: block region %s planned in %.2f s from %d cells (%d plans, %d cells' made here; cells not "
+                "read: %s)", tuple(round(v) for v in box), time.perf_counter() - t0, len(keys), len(reg.plans),
+                len(made), ", ".join(reg.missed) or "none")
         return reg
+
+    def planned(self, keys):
+        """Whether the cells of keys are all planned whole here."""
+        with self.lock:
+            return all(k in self.cells for k in keys)
 
     def adopt(self, keys):
         """The cells of keys the run's other processes planned already (plancache, on disk) taken as this one's, without
