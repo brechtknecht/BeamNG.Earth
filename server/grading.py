@@ -1476,14 +1476,36 @@ class Grader:
                  ", ".join(reg.missed) or "none")
         return reg
 
-    def apply(self, lat, lon, base, lift=0.0, roads_only=False, planned_only=False, region=None):
+    def adopt(self, keys):
+        """The cells of keys the run's other processes planned already (plancache, on disk) taken as this one's, without
+        planning or waiting for any: a provisional follow block graded under the roads whose plans exist (2026-10-26,
+        300 km/h: ungraded, the DEM's bumps covered the road meshes and the bridges' ramps)."""
+        if self.shared is None:
+            return
+        with self.lock:
+            missing = [k for k in keys if k not in self.cells]
+        for key in missing:
+            if self.shared.busy(key):
+                continue
+            got = self.shared.load(key)
+            if got is None:
+                continue
+            plans, keeps, covers, opens = got
+            with self.lock:
+                self.cells.setdefault(key, plans)
+                self.keeps.setdefault(key, keeps)
+                self.covers.setdefault(key, covers)
+                self.opens.setdefault(key, opens)
+
+    def apply(self, lat, lon, base, lift=0.0, roads_only=False, planned_only=False, region=None, adopt=False):
         """base (the ungraded heights at the points) graded under the roads. Same shape as base.
         lift: m added under the roads (tapering with the grading's weight): the physics block and the
         road mesh use ROAD_LIFT, the visible ground tiles 0, so the road mesh lies exactly on the
         ground the tyres touch while the visible ground stays a little below it (no z-fighting;
         2026-10-11 the user saw the tyres sink into a road mesh lifted above the physics ground).
         planned_only: graded only under the cells planned already (none planned here: the AI graph's wide window, whose
-        planning held a Windows PC's road processes for minutes, 2026-10-25). region: a Region (region()) whose box holds
+        planning held a Windows PC's road processes for minutes, 2026-10-25); adopt: those the other processes
+        planned too (adopt). region: a Region (region()) whose box holds
         the points: graded from its plans."""
         lat = np.asarray(lat, np.float64)
         lon = np.asarray(lon, np.float64)
@@ -1497,6 +1519,8 @@ class Grader:
                 keeps, covers = region.zones("keeps", self.keeps), region.zones("covers", self.covers)
         else:
             keys = self._keys(lat, lon)
+            if adopt:
+                self.adopt(keys)
             if planned_only:
                 with self.lock:
                     keys = [k for k in keys if k in self.cells]

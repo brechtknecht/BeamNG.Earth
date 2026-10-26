@@ -1753,6 +1753,8 @@ class Server:
     def _make_heightmap_here_(self, anchor, cx, cy, progress, t0, q, base=None, provisional=False, ground_at=(0.0, 0.0)):
         keep = {}
         g = None if provisional else self.grader_for(anchor)
+        # a provisional block graded under the roads whose plans are made already (never waiting for any)
+        g_prov = self.grader_for(anchor) if provisional and PROVISIONAL_GRADE else None
         c0 = time.thread_time()
 
         grade_s = [0.0, 0.0]            # wall, this thread's CPU (the rest: waiting for map data, the interpreter)
@@ -1760,7 +1762,14 @@ class Server:
         def elev(la, lo):
             z = self.dem.sample(la, lo, anchor.hm_zoom, progress)
             if provisional:             # the runways only (the sea floor waits on the water cells)
-                return self.airports.apply(la, lo, z) if self.airports is not None else z
+                z = self.airports.apply(la, lo, z) if self.airports is not None else z
+                if g_prov is None:
+                    return z
+                t1, c1 = time.perf_counter(), time.thread_time()
+                z = g_prov.apply(la, lo, z, gradingmod.ROAD_LIFT, planned_only=True, adopt=True)
+                grade_s[0] += time.perf_counter() - t1
+                grade_s[1] += time.thread_time() - c1
+                return z
             z = self.ground(anchor.frame, la, lo, z)
             if g is None:
                 return z
@@ -2932,6 +2941,8 @@ REGION_FORGET_S = 900.0     # s a block's answer is waited for at most
 # (Connection.late_provisional): the edge guard held the car while the road plans of the block ahead were made
 # (2026-10-26, the MSFS lesson "never block on the full version")
 PROVISIONAL_FOLLOW = os.environ.get("BNGE_PROVISIONAL_FOLLOW", "1") != "0"
+# ... graded under the roads whose cells' plans are made already (Grader.adopt: the block processes' plans on disk)
+PROVISIONAL_GRADE = os.environ.get("BNGE_PROVISIONAL_GRADE", "1") != "0"
 FOLLOW_PROV_EST_S = 3.0     # s a provisional follow block takes, until measured (Server.prov_est)
 FOLLOW_PROV_MIN_V = 2.0     # m/s: slower, a block is late only for a car standing ...
 FOLLOW_PROV_HELD_M = 40.0   # ... this close to a stop line (the edge guard holds it there)

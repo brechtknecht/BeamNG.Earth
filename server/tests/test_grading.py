@@ -290,6 +290,31 @@ class GraderTest(unittest.TestCase):
         self.assertEqual(gd.other, 42, "other attributes pass through")
 
 
+    def test_adopt_takes_other_processes_plans_without_planning(self):
+        # a provisional follow block (planned_only + adopt): graded under the plans another process made (plancache),
+        # never planning a cell itself
+        f = features([[(-300, 20), (300, 20)]], ["residential"])
+        planner = grading.Grader(FRAME, FakeMD(f), lambda la, lo: np.full(np.shape(la), 10.0))
+        la, lo, _ = FRAME.enu_to_geodetic(np.array([0.0, 0.0]), np.array([20.0, 200.0]), 0.0)
+        want = planner.apply(la, lo, np.zeros(2))
+        self.assertGreater(float(want[0]), 5.0, "on the road: graded")
+        disk = {k: (planner.cells[k], planner.keeps[k], planner.covers[k], planner.opens[k]) for k in planner.cells}
+
+        class Shared:
+            def busy(self, key):
+                return False
+
+            def load(self, key):
+                return disk.get(key)
+        md = FakeMD(f)
+        g = grading.Grader(FRAME, md, lambda la, lo: np.full(np.shape(la), 10.0))
+        self.assertTrue(np.array_equal(g.apply(la, lo, np.zeros(2), planned_only=True, adopt=True), np.zeros(2)),
+                        "nothing shared: ungraded")
+        g.shared = Shared()
+        got = g.apply(la, lo, np.zeros(2), planned_only=True, adopt=True)
+        self.assertTrue(np.allclose(got, want), "graded as the planner grades")
+        self.assertEqual(md.calls, 0, "no cell planned here")
+
     def test_points_far_apart_plan_only_their_cells(self):
         # two points 27 km apart (a straight salt-flats track's ends): the cells around each, not the ~240 of their
         # bbox (one road tile planned them all: 53 s, 2026-10-20); the same heights, in an order of their own
