@@ -170,6 +170,7 @@ SERVER_TO_MOD = {
               "deshadow": F(str, OPT),          # --deshadow lambert|full only (the settings page shows it)
               "colormatch": F(str, OPT),        # --colormatch s2 only (likewise)
               "season": F(str, OPT),           # --season auto / fall (seasonlook.lua tints the leaves)
+              "terrainBaseTex": F(int, OPT),    # BNGE_TERRAIN_BASE_TEX only (swap-hitch A/B: the block's baked base colour size)
               "mapPort": F(int, OPT),           # the world map's tile endpoint on 127.0.0.1 (maptiles.py)
               "prewarm": F(str, OPT),           # the shape listing our shapes' materials (prewarm.py; with map data)
               # the world map's credits for its view: [[credit, w, s, e, n] or [credit]] per imagery source, and
