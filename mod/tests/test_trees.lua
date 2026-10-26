@@ -200,7 +200,8 @@ trees.clear()
 local function ranked(n, top)
   local rows = {}
   for i = 1, n do rows[i] = { 0, 0, 0, 0, 0, 1, 10, (n - i) / n * top } end    -- (any order)
-  return { rows = rows }
+  local flat, m = trees._pack(rows)
+  return { flat = flat, n = m }
 end
 T.check(trees.tileThreshold(0, ranked(500, 1)) == 1.0, 'a sparse tile near the player: all of it')
 T.check(math.abs(trees.tileThreshold(0, ranked(20000, 1)) - 6000 / 20000) < 1e-12, 'a dense one: its 6000 lowest ranks')
@@ -208,7 +209,7 @@ T.check(math.abs(trees.tileThreshold(0, ranked(8000, 0.3)) - 6000 / 8000 * 0.3) 
   'the server sent the lowest 30 % only: still its 6000 lowest')
 T.check(trees.tileThreshold(1000, ranked(800, 1)) == 0.35, 'under the cap: the ring as before')
 T.check(math.abs(trees.tileThreshold(2000, ranked(10000, 1)) - 400 / 10000) < 1e-12, 'far: 400')
-T.check(trees.tileThreshold(0, { rows = {} }) == 1.0, 'no rows')
+T.check(trees.tileThreshold(0, { flat = {}, n = 0 }) == 1.0, 'no rows')
 
 -- a group the catalog has no shapes for (a newer server's sign, say): left out and logged, never a tree
 trees.clear()
@@ -325,4 +326,10 @@ do
   package.loaded['beamngEarth/roads'] = nil
 end
 trees.clear()
+do -- a tile's rows packed in one flat array (the garbage collector walks one table, not one per row)
+  local flat, n = trees._pack({ { 3, 1.5, 2.5, 3.5, 90, nil, 12, 0.25 }, { 1, 4, 5, 6 } })
+  T.check(n == 2 and #flat == 16, 'two rows, eight numbers each')
+  T.check(flat[1] == 3 and flat[2] == 1.5 and flat[5] == 90 and flat[7] == 12 and flat[8] == 0.25, 'the first row')
+  T.check(flat[9] == 1 and flat[12] == 6 and flat[13] == 0 and flat[15] == 10 and flat[16] == 0, 'defaults filled in')
+end
 T.done('test_trees')

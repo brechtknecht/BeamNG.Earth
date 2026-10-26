@@ -28,6 +28,7 @@ M.SQUARE_SIZE = lattice.SQUARE  -- 2.0 m
 M.MATERIAL = 'beamngEarthDirt'
 M.TEXTURE_SET = 'beamngEarthTerrainMaterialTextureSet'
 M.BASE_TEX_SIZE = 1024   -- = the level texture set's base slot (tools/make_level_assets.py BASE_TEX)
+M.BASE_TEX_DEFAULT = M.BASE_TEX_SIZE
 
 local TERRAIN_DIR = '/levels/beamng_earth/art/terrains/'
 local TERRAIN_DIR_BASE = TERRAIN_DIR .. 'bngEarth_base_b.png'   -- the level's flat base colour
@@ -182,6 +183,22 @@ end
 
 -- The session's block size (1024 or 512, after lattice.configure): the imports' layer map and the
 -- flat start map follow it. Returns the size in use.
+-- The resolution the engine bakes the block's base colour at (an A/B of the swap hitch: the server's hello,
+-- BNGE_TERRAIN_BASE_TEX): a power of two from 128 to 2048, else the default. Set on the block now if it exists (the
+-- engine may only size it when the block is added: a level reload makes sure). Returns the size in use.
+function M.setBaseTexSize(px)
+  px = tonumber(px)
+  local size = M.BASE_TEX_DEFAULT
+  for _, p2 in ipairs({ 128, 256, 512, 1024, 2048 }) do if px == p2 then size = p2 end end
+  if size ~= M.BASE_TEX_SIZE then
+    M.BASE_TEX_SIZE = size
+    log('I', 'beamngEarth', 'terrain base texture size ' .. size)
+    local tb = M.get()
+    if tb then pcall(function() tb:setField('baseTexSize', 0, tostring(size)) end) end
+  end
+  return size
+end
+
 function M.configure(size)
   local n = LAYER_MAPS[size] and size or 1024
   M.SIZE, LAYER_MAP, FLAT_HEIGHTMAP = n, LAYER_MAPS[n], FLAT_HEIGHTMAPS[n]
