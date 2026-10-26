@@ -77,6 +77,12 @@ FILES = ("airports.csv", "runways.csv")
 DEFAULT_CACHE = os.path.expanduser("~/.cache/beamng-earth")
 REFRESH_S = 7 * 86400.0         # a copy older than this is downloaded again
 RETRY_S = 6 * 3600.0            # after a failed refresh, the next attempt waits this long
+# The parsed copy written with a fresh download too, not only by the first load() that parses the CSV files: the
+# server's main process downloads and parses at start (load -> refresh keeps the parsed db in memory, so its
+# load() never wrote the copy), then every worker process (far tiles, roads, blocks: ~11) found no copy and parsed
+# the 86k airports itself, all at once. On 2 cores that held the first far tiles ~60 s at a fresh start and after
+# each weekly refresh (BNGE_AIRPORTS_PARSED=0: the old way)
+PARSED_ON_REFRESH = os.environ.get("BNGE_AIRPORTS_PARSED", "1") != "0"
 MIN_ROWS_SHARE = 0.5            # a new copy with fewer rows than this share of the old one is refused
 FT = 0.3048                     # m per international foot (exact)
 EARTH_R = 6371008.8             # m, mean radius (great-circle prefilter only)
@@ -795,6 +801,8 @@ class Store:
             for n in FILES:
                 with open(os.path.join(tmpdir, n), "wb") as f:
                     f.write(bodies[n])
+            if PARSED_ON_REFRESH:
+                self._keep_parsed(tmpdir, db)
             final = os.path.join(self.root, gen)
             if os.path.exists(final):
                 shutil.rmtree(final)
