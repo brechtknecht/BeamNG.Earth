@@ -200,7 +200,8 @@ trees.clear()
 local function ranked(n, top)
   local rows = {}
   for i = 1, n do rows[i] = { 0, 0, 0, 0, 0, 1, 10, (n - i) / n * top } end    -- (any order)
-  return { rows = rows }
+  local flat, m = trees._pack(rows)
+  return { flat = flat, n = m }
 end
 T.check(trees.tileThreshold(0, ranked(500, 1)) == 1.0, 'a sparse tile near the player: all of it')
 T.check(math.abs(trees.tileThreshold(0, ranked(20000, 1)) - 6000 / 20000) < 1e-12, 'a dense one: its 6000 lowest ranks')
@@ -218,4 +219,10 @@ trees.update(4, { x = 2, y = 10 })
 T.check(count() == 1, 'unknown group: only the bench is made')
 T.check(trees.unknownGroups.nl_unknown_sign == true, 'unknown group: noted')
 trees.clear()
+do -- a tile's rows packed in one flat array (the garbage collector walks one table, not one per row)
+  local flat, n = trees._pack({ { 3, 1.5, 2.5, 3.5, 90, nil, 12, 0.25 }, { 1, 4, 5, 6 } })
+  T.check(n == 2 and #flat == 16, 'two rows, eight numbers each')
+  T.check(flat[1] == 3 and flat[2] == 1.5 and flat[5] == 90 and flat[7] == 12 and flat[8] == 0.25, 'the first row')
+  T.check(flat[9] == 1 and flat[12] == 6 and flat[13] == 0 and flat[15] == 10 and flat[16] == 0, 'defaults filled in')
+end
 T.done('test_trees')
