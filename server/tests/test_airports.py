@@ -280,6 +280,15 @@ class StoreTest(unittest.TestCase):
         self.assertEqual(db2.runways, db.runways)
         self.assertEqual(len(self.tr.calls), 2)
 
+    def test_download_keeps_the_parsed_copy(self):
+        # the worker processes (another Store each) read the parsed copy the download left, no CSV parse
+        db = self.store.load()
+        gen = self.store.pointer()["gen"]
+        self.assertTrue(os.path.exists(os.path.join(self.store.root, gen, f"parsed.v{airports.Store.PARSED_V}.pickle")))
+        with mock.patch.object(airports.AirportDB, "from_csv", side_effect=AssertionError("parsed again")):
+            db2 = airports.Store(self.tmp.name, netfetch.Fetcher(offline=True), wall=self.clock).load()
+        self.assertEqual(db2.runways, db.runways)
+
     def test_weekly_refresh_new_content(self):
         self.store.load()
         old = self.gens()

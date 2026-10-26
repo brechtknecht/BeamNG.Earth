@@ -3096,6 +3096,10 @@ FOLLOW_PROV_DONOR_MAX = 3
 # behind ~20 busy threads (heights: 0.1 s of CPU in 1-4 s at 300 km/h on 2 cores, 2026-10-26; a numpy loop of 25 ms
 # took 5.8 s next to six busy threads here, 16 ms in another process). BNGE_STANDIN_PROCESS=0: in this one.
 STAND_IN_PROCESS = os.environ.get("BNGE_STANDIN_PROCESS", "1") != "0"
+# Every worker process started with the server, not at its pool's first job: a process imports and initialises for
+# ~10 s on 4 cores, and on 2 cores the far-tile processes (niced below the blocks) took 60 s, so the far field had no
+# tile for the first 4 km of a 250 km/h drive (2026-10-26). The game loads meanwhile. BNGE_POOL_PRESTART=0: lazily.
+POOL_PRESTART = os.environ.get("BNGE_POOL_PRESTART", "1") != "0"
 STAND_IN_TIMEOUT_S = 60.0
 # The interpreter lock's switch interval in ms (Python's: 5): a thread that gave it up (numpy, a file) waits up to this
 # long per busy thread to get it back - a numpy loop of 25 ms took 5.8 s next to six busy threads at 5 ms, 1.2 s at 1
@@ -5082,7 +5086,7 @@ async def main_async(args):
     AHEAD_ON = args.download_ahead == "on"
     ROUTE_AHEAD_ON = args.route_prefetch == "on" and args.route_prefetch_km > 0
     ROUTE_AHEAD_MAX_M = args.route_prefetch_km * 1000.0
-    block_pools, far_pool = [], None
+    block_pools, far_pool, far_local = [], None, None
     plancachemod.start_run(args.cache_dir)      # (before the workers: they inherit the run's id)
     if args.block_process == "on":
         ctx = multiprocessing.get_context("spawn")
@@ -5099,7 +5103,7 @@ async def main_async(args):
                           logging.getLogger().level, args.airports == "on", args.sea == "on",
                           -1 if lane == LANE_REQUEST else NICE_PREFETCH,
                           roadsmod.ROADS_IN_GROUND, args.gas_stations == "on" and args.roads == "on")), warm_q))
-        far_pool = poolsmod.RespawningPool(
+        far_pool = far_local = poolsmod.RespawningPool(
             "far tile", args.workers, mp_context=ctx, initializer=blockworker.init,
             initargs=(args.cache_dir, args.offline, args.roads == "on",
                       args.grading == "on" and args.roads == "on",
@@ -5180,6 +5184,10 @@ async def main_async(args):
                       logging.getLogger().level, args.airports == "on", args.sea == "on", -1,
                       roadsmod.ROADS_IN_GROUND, args.gas_stations == "on" and args.roads == "on"))
         server.stand_in_pool.submit(blockworker.ready)      # (started now: not with the first late block)
+    if POOL_PRESTART:
+        for p in [bp for bp, _ in block_pools] + [far_local, road_pool, far_bld_pool, photo_pool]:
+            if p is not None:
+                p.prestart(blockworker.ready)
     server.update_check = args.update_check == "on"
     server.lod_px = args.lod_px
 

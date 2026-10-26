@@ -56,6 +56,13 @@ class RespawningPool:
                 self._pool = ProcessPoolExecutor(*self._args, **self._kwargs)
             return self._pool
 
+    def prestart(self, fn):
+        """Start every process now with a no-op job fn (each submit before the first has started spawns one)."""
+        with self._lock:
+            pool = self._pool
+        for _ in range(getattr(pool, "_max_workers", 1)):
+            pool.submit(fn)
+
     def shutdown(self, *args, **kwargs):
         with self._lock:
             pool = self._pool
