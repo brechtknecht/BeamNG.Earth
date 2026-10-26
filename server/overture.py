@@ -68,6 +68,7 @@ SHARD_VERSION = 1               # bump when a shard's layout changes (its file n
 SHARD_ROWS = 1024               # rows per row group of a shard (its bbox statistics skip the rest)
 SHARD_BAND = 50.0               # rows ordered by band of 1/SHARD_BAND degree of their box centre (y, then x)
 SHARD_WAIT_S = 120.0            # a shard another process is writing is waited for this long (xproc.once)
+SHARD_FAILURES = 3              # shard reads that failed in a process before it reads the sources again (shard_failed)
 BOX_PAD = 1e-6                  # degrees the cell is grown by for the box test (float32 boxes: never a feature missed)
 
 # Overture's attribution (https://docs.overturemaps.org/attribution/, read 2026-10-11): the line its
@@ -385,7 +386,8 @@ class Reader:
         self._boxes_bytes = 0
         self._local = threading.local()     # each thread's DuckDB connection for the shards (local_con)
         self._shard_locks = {}
-        self.shards_ok = SHARDS             # False after a shard could not be read (then the source is read again)
+        self.shards_ok = SHARDS             # False after SHARD_FAILURES shard reads failed (then the sources are read)
+        self._shard_failures = 0
 
     def close(self):
         self.pool.shutdown(wait=False)
@@ -518,11 +520,16 @@ class Reader:
             con.close()
 
     def shard_failed(self, local, e):
-        """A shard query failed in DuckDB (a damaged file, a path DuckDB cannot open): the shards are removed and this
-        process reads the sources itself from now on."""
-        log.warning("mapdata: reading the local row-group shards failed (%s: %s); reading the sources instead",
-                    type(e).__name__, e)
-        self.shards_ok = False
+        """A shard query failed in DuckDB (a damaged file, one the cache cap evicted under it, a path DuckDB cannot
+        open): the shards are removed (written again by the next cell) and this cell reads the sources; after
+        SHARD_FAILURES of them this process reads the sources itself from now on."""
+        with self._lock:
+            self._shard_failures += 1
+            off = self._shard_failures >= SHARD_FAILURES
+            if off:
+                self.shards_ok = False
+        log.warning("mapdata: reading the local row-group shards failed (%s: %s); reading the sources%s",
+                    type(e).__name__, e, " from now on" if off else " for this cell")
         for p in local:
             try:
                 os.remove(p)
