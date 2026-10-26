@@ -108,6 +108,7 @@ local lastReloadAt = -math.huge   -- now() of the last be:reloadCollision (ours 
 local reloads = 0                 -- be:reloadCollision runs so far (ours or another's): M.reloads
 local sinceUrgent = math.huge     -- frames since the last urgent walk import (M.urgentWalk)
 local deletesDirty = false  -- only far colliders deleted since the last rebuild (RELOAD_DELETES_S)
+local urgentAsked = false   -- a requestCollision(true) since the last rebuild
 
 -- Every road object lives in one SimGroup. A Lua reload (Lua:requestReload) rebuilds the VM without
 -- unloading the extensions, so nothing deletes the old objects: 2026-10-11, after a few reloads, 3,558
@@ -767,7 +768,8 @@ function M.update(gov, currentAnchor, player, view)
     swapQuiet.frames = swapQuiet.frames - 1
     if swapQuiet.frames <= 0 and swapQuiet.since() >= M.SWAP_QUIET_MS then swapQuiet = nil end
   end
-  local urgent = collisionDirty and (holdActive or M.urgentColliders()) and sinceReload() > M.URGENT_GAP_S * 1000
+  local urgent = collisionDirty and (holdActive or urgentAsked or M.urgentColliders())
+    and sinceReload() > M.URGENT_GAP_S * 1000
   local due = not swapQuiet and ((collisionDirty and sinceReload() > M.RELOAD_EVERY_S * 1000) or urgent
       or (deletesDirty and sinceReload() > M.RELOAD_DELETES_S * 1000))
   if due and not holdActive and reloadWaits < M.RELOAD_WAIT_FRAMES and gov.roomFor and not gov:roomFor(M.RELOAD_ROOM_MS) then
@@ -780,7 +782,7 @@ function M.update(gov, currentAnchor, player, view)
     noteNewColliders()
     be:reloadCollision()
     lastReloadAt, reloads = now(), reloads + 1
-    collisionDirty, deletesDirty, sinceReload = false, false, stopwatch.new()
+    collisionDirty, deletesDirty, sinceReload, urgentAsked = false, false, stopwatch.new(), false
     local ms = now() - t0
     -- out of the frame's budget, not into the meshes' cost estimate (from PR #41: a ~40 ms rebuild in the roadWalk
     -- EMA held the next sidewalk and building meshes back as if each cost that much more)
@@ -974,7 +976,12 @@ end
 
 -- Something else made colliding objects near the player (trees.lua's Forest items): rebuild collision at the
 -- next throttled slot.
-function M.requestCollision() collisionDirty = true end
+-- urgent: they are near the car (trees.lua: solid items within its URGENT_S): rebuilt URGENT_GAP_S after the last
+-- rebuild, not RELOAD_EVERY_S.
+function M.requestCollision(urgent)
+  collisionDirty = true
+  if urgent then urgentAsked = true end
+end
 
 -- Collision rebuilds so far (be:reloadCollision, ours or the terrain commit's): what was made before one collides from
 -- the frame after it (terrainpatch.groundReady).
@@ -988,7 +995,7 @@ function M.collisionRebuilt()
   -- that rebuild already made them solid: one held now leaves the physics at the next one
   local removed = noteNewColliders()
   lastReloadAt, reloads = now(), reloads + 1
-  collisionDirty, deletesDirty, sinceReload = removed > 0, false, stopwatch.new()
+  collisionDirty, deletesDirty, sinceReload, urgentAsked = removed > 0, false, stopwatch.new(), false
 end
 
 -- Every road removed now (setting off, mod unload).
@@ -1051,7 +1058,7 @@ function M.reset()
   objSlot, slotLive, slotDropped = {}, {}, {}
   tiles, createQ, deleteQ, walkQ, anchorId, loadedMaterials = {}, {}, {}, {}, nil, false
   far, farQ = {}, {}
-  collisionDirty, deletesDirty = false, false
+  collisionDirty, deletesDirty, urgentAsked = false, false, false
 end
 
 -- On / off (the settings page, through core.setRoadsEnabled, which asks the server for the tiles

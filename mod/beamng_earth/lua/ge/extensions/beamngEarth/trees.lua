@@ -39,6 +39,28 @@ M.FOREST_NAME = 'bngEarthForest'      -- a prefix: small Forests from a pool ('b
 M.SOLID_M = 200       -- (was 300 + 100: up to ~20k solid trees in a forest, and every terrain block move rebuilt all their
                       -- collision, a ~30 ms physics frame; 200 + 50 is still 5 s ahead at 100 mph, 2026-10-15)
 M.SOLID_HYST_M = 50
+-- At speed only the items along the car's path collide (Felix's log, 2026-10-26, 191 mph through the A13's pine forest:
+-- the physics' collision instances, nearly all of them solid trees, grew from 11k to 100k, and the frame after each
+-- rebuild (every roads.RELOAD_EVERY_S) took 100-154 ms more physics; a replay of that drive, 2026-10-26, showed why: each
+-- tile crossing SOLID_M re-made up to 6000 items, more than the budget at 85 m/s, and the nearest tiles came first, so
+-- the ones left behind never turned back). The items collide by CELL_M cells, not whole tiles (a tile whose square came
+-- within SOLID_M made items up to ~560 m away solid): a cell within SOLID_M of the car (SOLID_HYST_M farther once solid),
+-- and from FAST_MS on one within SOLID_SIDE_M of the line ahead of the car, from SOLID_BEHIND_M behind it to
+-- SOLID_LEAD_S of driving ahead (SOLID_M at least), or within SOLID_ROUND_M of it (CELL_HYST_M farther once solid).
+-- Tiles with items to turn back are done first.
+M.FAST_MS = 25
+M.CELL_M = 32
+M.SOLID_SIDE_M = 50
+M.SOLID_BEHIND_M = 40
+M.SOLID_LEAD_S = 8
+M.SOLID_ROUND_M = 60
+M.CELL_HYST_M = 16      -- a solid cell stays so this much farther out (the heading's jitter)
+-- Solid items made within URGENT_S of driving of the car (URGENT_MIN_M at least) are rebuilt into the collision at once
+-- (roads.lua: URGENT_GAP_S apart at most), not after RELOAD_EVERY_S: most of a tile's items only show (and so only
+-- become solid) once it is within its first ring, ~3.5 s ahead at 85 m/s (the replay: half of the trees the car passed
+-- within 12 m at 307 km/h were not in the collision yet).
+M.URGENT_S = 6
+M.URGENT_MIN_M = 60
 M.NO_COLLIDE = { shrub = true, desert_shrub = true, door = true, wallsign_logistics = true, wallsign_rentabox = true,
   wallsign_lemon = true, wallsign_turboburger = true }
 -- The 100 mph stutter (2026-10-15 probes): a frame that adds or removes Forest items costs the engine's tick ~0.5 us
@@ -417,6 +439,98 @@ local function tileThreshold(d, t)
 end
 M.tileThreshold = tileThreshold
 
+-- The solid cells of tile t for the car f {x, y; moving at FAST_MS or more: ux, uy (its direction), lead (m)}: a
+-- string of one '1' or '0' per CELL_M cell, row by row from the tile's south-west corner, or '' when none is.
+function M.cellMask(t, f)
+  local n = math.floor(256 / M.CELL_M)
+  local round, hyst = M.SOLID_M, M.SOLID_HYST_M
+  if f.ux then round, hyst = M.SOLID_ROUND_M, M.CELL_HYST_M end
+  local reach = 181 + hyst
+  local dx, dy = t.cx - f.x, t.cy - f.y
+  if dx * dx + dy * dy > (round + reach) ^ 2 then
+    if not f.ux then return '' end
+    local along, side = dx * f.ux + dy * f.uy, math.abs(dx * f.uy - dy * f.ux)
+    if side > M.SOLID_SIDE_M + reach or along < -(M.SOLID_BEHIND_M + reach) or along > f.lead + reach then return '' end
+  end
+  local old, half = t.mask or '', M.CELL_M * 0.7072
+  local x0, y0 = t.cx - 128 - f.x, t.cy - 128 - f.y
+  local out, any = {}, false
+  for j = 0, n - 1 do
+    for i = 0, n - 1 do
+      local k = j * n + i + 1
+      local r = half + (old:byte(k) == 49 and hyst or 0)
+      local cx, cy = x0 + (i + 0.5) * M.CELL_M, y0 + (j + 0.5) * M.CELL_M
+      local on = cx * cx + cy * cy <= (round + r) ^ 2
+      if not on and f.ux then
+        local a, s = cx * f.ux + cy * f.uy, math.abs(cx * f.uy - cy * f.ux)
+        on = a >= -(M.SOLID_BEHIND_M + r) and a <= f.lead + r and s <= M.SOLID_SIDE_M + r
+      end
+      out[k] = on and '1' or '0'
+      any = any or on
+    end
+  end
+  return any and table.concat(out) or ''
+end
+
+-- Does cell mask new turn off a cell solid in old?
+function M.cellsOff(old, new)
+  if old == '' or old == new then return false end
+  for k = 1, #old do
+    if old:byte(k) == 49 and new:byte(k) ~= 49 then return true end
+  end
+  return false
+end
+
+-- The cell (index into a cell mask) of tile t's row i (cached with the rows: t.cells, t.cellRows).
+local function cellRows(t)
+  if t.cells then return end
+  local n = math.floor(256 / M.CELL_M)
+  local x0, y0 = t.cx - 128, t.cy - 128
+  t.cells, t.cellRows = {}, {}
+  for i, row in ipairs(t.rows) do
+    local ci = math.max(0, math.min(n - 1, math.floor(((row[2] or 0) - x0) / M.CELL_M)))
+    local cj = math.max(0, math.min(n - 1, math.floor(((row[3] or 0) - y0) / M.CELL_M)))
+    local c = cj * n + ci + 1
+    t.cells[i] = c
+    local l = t.cellRows[c]
+    if not l then l = {}; t.cellRows[c] = l end
+    l[#l + 1] = i
+  end
+end
+function M.cellOf(t, i)
+  cellRows(t)
+  return t.cells[i]
+end
+-- Tile t's row -> cell table.
+function M.cellsOf(t)
+  cellRows(t)
+  return t.cells
+end
+
+-- The rows of tile t in the cells whose bit differs between masks old and new, and the rows in extra, in row order.
+function M.changedRows(t, old, new, extra)
+  local out = {}
+  local changed, any = {}, false
+  if old ~= new then
+    local n = math.floor(256 / M.CELL_M)
+    for k = 1, n * n do
+      if (old:byte(k) == 49) ~= (new:byte(k) == 49) then changed[k], any = true, true end
+    end
+  end
+  if not any then
+    for _, i in ipairs(extra or {}) do out[#out + 1] = i end
+    return out
+  end
+  local more = {}
+  for _, i in ipairs(extra or {}) do more[i] = true end
+  cellRows(t)
+  local cells = t.cells
+  for i = 1, #t.rows do
+    if changed[cells[i]] or more[i] then out[#out + 1] = i end
+  end
+  return out
+end
+
 -- M.suppress(group, x, y) -> true hides that item (set by navgraph.lua); M.refresh() re-runs every tile's rows
 -- after it changes.
 M.suppress = nil
@@ -540,22 +654,23 @@ function M.update(anchorId, player, view)
     end
   end
   if not player then return end
-  -- nearest tiles first (to the camera when it is away: view); [3] the distance to the car (the colliding items)
+  -- the colliding items: by cells round the car, at speed along its path (M.cellMask)
+  local car = { x = player.x, y = player.y }
+  local veh = getPlayerVehicle and getPlayerVehicle(0)
+  local vel = veh and veh.getVelocity and veh:getVelocity()
+  local sp = vel and math.sqrt(vel.x * vel.x + vel.y * vel.y) or 0
+  if sp >= M.FAST_MS then
+    car.ux, car.uy, car.lead = vel.x / sp, vel.y / sp, math.max(M.SOLID_M, sp * M.SOLID_LEAD_S)
+  end
+  M.lastFast = car.ux ~= nil
+  -- nearest tiles first (to the camera when it is away: view), those whose colliding items change before the rest;
+  -- [3] the distance to the car (the colliding items), [4] every item solid, [5] the solid cells, [6] the class
   local order = {}
   local function boxDist(p, t)
     local dx = math.max(math.abs(p.x - t.cx) - 128, 0)
     local dy = math.max(math.abs(p.y - t.cy) - 128, 0)
     return math.sqrt(dx * dx + dy * dy)
   end
-  for key, t in pairs(tiles) do
-    if t.anchor ~= anchorId or t.drop then goto continue end     -- still being emptied
-    local dCar = boxDist(player, t)
-    order[#order + 1] = { key, view and math.min(boxDist(view, t), dCar) or dCar, dCar }
-    ::continue::
-  end
-  table.sort(order, function(a, b) return a[2] < b[2] end)
-  local nearMade = false
-  local rowsScanned = 0
   -- solid round other players' cars too (collisionfoci.lua: the foci with trees; traffic has none)
   local function nearFocus(t)
     for _, f in ipairs(foci) do
@@ -563,10 +678,34 @@ function M.update(anchorId, player, view)
     end
     return false
   end
+  for key, t in pairs(tiles) do
+    if t.anchor ~= anchorId or t.drop then goto continue end     -- still being emptied
+    local dCar = boxDist(player, t)
+    local all, mask
+    if not t.ghost then
+      all, mask = nearFocus(t), M.cellMask(t, car)
+    else                                -- (a ghost's rows are in the old frame: by its tile, as before)
+      all = dCar <= M.SOLID_M or (t.near and dCar <= M.SOLID_M + M.SOLID_HYST_M) or nearFocus(t) or false
+      mask = ''
+    end
+    -- what collides changes first: items to turn back, then new solid ones, then what is only drawn
+    local class = 2
+    if (all and not t.all) or (not all and M.cellsOff(mask, t.mask or '')) then class = 0
+    elseif (t.all and not all) or (not all and M.cellsOff(t.mask or '', mask)) then class = 1 end
+    order[#order + 1] = { key, view and math.min(boxDist(view, t), dCar) or dCar, dCar, all, mask, class }
+    ::continue::
+  end
+  table.sort(order, function(a, b)
+    if a[6] ~= b[6] then return a[6] < b[6] end
+    return a[2] < b[2]
+  end)
+  local nearMade, urgentMade = false, false
+  local urgentR2 = math.max(M.URGENT_MIN_M, sp * M.URGENT_S) ^ 2
+  local rowsScanned = 0
   local function finish()
     if nearMade then
       local ok, roads = pcall(require, 'beamngEarth/roads')
-      if ok and roads.requestCollision then roads.requestCollision() end
+      if ok and roads.requestCollision then roads.requestCollision(urgentMade) end
     end
   end
   for _, o in ipairs(order) do
@@ -575,12 +714,29 @@ function M.update(anchorId, player, view)
     local function data() fd = fd or forest(t):getData(); return fd end
     local want = tileThreshold(o[2], t)
     local band = groupBand(t, o[2])
-    local near = o[3] <= M.SOLID_M or (t.near and o[3] <= M.SOLID_M + M.SOLID_HYST_M) or nearFocus(t) or false
-    if want ~= t.shown or band ~= t.band or near ~= t.near or t.pending then
-      t.pending = false
+    local all, mask = o[4], o[5]
+    local near = all or mask ~= ''
+    if want ~= t.shown or band ~= t.band or all ~= t.all or mask ~= (t.mask or '') or t.pending then
+      -- only solid cells changed: those cells' rows and the ones left over (t.pendingRows), else every row
+      local idxs = nil
+      if want == t.shown and band == t.band and all == t.all and (not t.pending or t.pendingRows) then
+        idxs = M.changedRows(t, t.mask or '', mask, t.pending and t.pendingRows or nil)
+      end
       if rowsScanned > M.ROWS_PER_FRAME then finish(); return end
-      rowsScanned = rowsScanned + #t.rows
-      for i, row in ipairs(t.rows) do
+      -- (the tile's state is what it shows once its rows are done: the rows not done yet are its pendingRows)
+      t.pending, t.pendingRows = false, nil
+      t.all, t.mask, t.shown, t.band, t.near = all, mask, want, band, near
+      local left = {}
+      local cells = mask ~= '' and not all and M.cellsOf(t) or nil
+      local nrows = idxs and #idxs or #t.rows
+      rowsScanned = rowsScanned + nrows
+      for k = 1, nrows do
+        local i = idxs and idxs[k] or k
+        if budget <= 0 then          -- (the rest another frame)
+          for k2 = k, nrows do left[#left + 1] = idxs and idxs[k2] or k2 end
+          break
+        end
+        local row = t.rows[i]
         local r = row[8] or 0
         local g = (t.groups or GROUPS)[(row[1] or 0) + 1]
         local cap = g and M.GROUP_MAX_M[g]
@@ -592,30 +748,31 @@ function M.update(anchorId, player, view)
         end
         -- an item something else stands in for (navgraph.lua's switchable signal heads)
         if g and M.suppress and M.suppress(g, row[2], row[3]) then r = 2 end
-        local solid = near and not M.NO_COLLIDE[g or '']
+        local solid = (all or (cells ~= nil and mask:byte(cells[i]) == 49)) and not M.NO_COLLIDE[g or '']
         if r < want and (not t.made[i] or (t.solid[i] == true) ~= solid) then
           local sh, sc = shapeOf(t, i, row)
-          if budget <= 0 then t.pending = true; finish(); return end
           if allow(sh) then
             if t.made[i] then removeItem(data(), t.made[i], t.madeShape[i]); budget = budget - 1 end  -- solid <-> not
             t.made[i] = makeItem(data(), row, sh, sc, solid, g, t.variant)
             t.solid[i] = (t.made[i] and solid) or nil      -- true or nil
             t.madeShape[i] = t.made[i] and sh or nil
-            if solid then nearMade = true end
+            if solid then
+              nearMade = true
+              local dx, dy = (row[2] or 0) - car.x, (row[3] or 0) - car.y
+              if not urgentMade and dx * dx + dy * dy <= urgentR2 then urgentMade = true end
+            end
             budget = budget - 1
-          else t.pending = true end                -- another frame (this one's shapes are full)
+          else left[#left + 1] = i end            -- another frame (this one's shapes are full)
         elseif r >= want and t.made[i] then
-          if budget <= 0 then t.pending = true; finish(); return end
           if allow(t.madeShape[i] or '') then
             removeItem(data(), t.made[i], t.madeShape[i])
             t.made[i], t.solid[i], t.madeShape[i] = nil, nil, nil
             budget = budget - 1
-          else t.pending = true end
+          else left[#left + 1] = i end
         end
       end
-      t.shown = want
-      t.band = band
-      t.near = near
+      if #left > 0 then t.pending, t.pendingRows = true, left end
+      if budget <= 0 then finish(); return end
     end
   end
   finish()

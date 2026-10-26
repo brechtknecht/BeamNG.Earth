@@ -52,8 +52,8 @@ T.check(count() == 35, 'beyond 700 m: 35 %')
 trees.update(1, { x = 50, y = 600 })
 T.check(count() == 60, 'middle distance: 60 %')
 
--- only near tiles collide: their items are re-made of solid types when the tile comes near, and of non-solid ones
--- once it is beyond SOLID_M + SOLID_HYST_M
+-- only near items collide (by CELL_M cells): re-made of solid types when their cell comes within SOLID_M, and of
+-- non-solid ones once it is beyond SOLID_M + SOLID_HYST_M
 local function solidCount()
   local n = 0
   for it in pairs(items) do if it.d and it.d.fields and it.d.fields.collidable == '1' then n = n + 1 end end
@@ -62,13 +62,13 @@ end
 T.check(solidCount() == 0, 'far: nothing collides')
 trees.update(1, { x = 50, y = 50 })
 T.check(count() == 100 and solidCount() == 100, 'near: every item collides')
-trees.update(1, { x = 50, y = 256 + trees.SOLID_M + 50 })
+trees.update(1, { x = 50, y = 10 + trees.SOLID_M + 30 })
 T.check(count() > 0 and solidCount() == count(), 'just beyond SOLID_M: still solid (hysteresis)')
-trees.update(1, { x = 50, y = 256 + trees.SOLID_M + trees.SOLID_HYST_M + 20 })
+trees.update(1, { x = 50, y = 10 + trees.SOLID_M + trees.SOLID_HYST_M + 40 })
 T.check(count() > 0 and solidCount() == 0, 'beyond the hysteresis: re-made, not solid')
 do
   local m, r = trees.made, trees.removed
-  trees.update(1, { x = 50, y = 256 + trees.SOLID_M + trees.SOLID_HYST_M + 20 })
+  trees.update(1, { x = 50, y = 10 + trees.SOLID_M + trees.SOLID_HYST_M + 40 })
   T.check(trees.made == m and trees.removed == r, 'a settled tile of non-solid items: nothing re-made')
 end
 -- the camera away from the car (core.viewAway): what is shown follows the camera, what collides the car (the user,
@@ -217,5 +217,72 @@ trees.onTile({ anchorId = 4, key = 'u', path = '/t/u', n = 2 }, 4)
 trees.update(4, { x = 2, y = 10 })
 T.check(count() == 1, 'unknown group: only the bench is made')
 T.check(trees.unknownGroups.nl_unknown_sign == true, 'unknown group: noted')
+trees.clear()
+-- what collides goes by CELL_M cells, not whole tiles: a tile's square within SOLID_M, its items beyond it (the corner
+-- 300 m off) do not collide (before, a tile whose square came within SOLID_M made all its items solid)
+trees.clear()
+do
+  local rows = {}
+  for i = 0, 7 do rows[#rows + 1] = string.format('{0, %d, %d, 5, 0, 1, 12, 0.0}', 4 + i * 32, 4 + i * 32) end  -- the diagonal
+  files['/t/d'] = '{ groups = {}, items = { ' .. table.concat(rows, ', ') .. ' } }'
+end
+trees.onTile({ anchorId = 10, key = '0_0', path = '/t/d', n = 8 }, 10)
+trees.update(10, { x = -150, y = -150 })        -- (the tile's corner 212 m away, its square within SOLID_M + HYST)
+T.check(count() == 8 and solidCount() == 0, 'standing off its corner: shown, none collides (their cells are far)')
+trees.update(10, { x = -100, y = -100 })        -- (items 147 .. 450 m away)
+T.check(solidCount() > 0 and solidCount() < 8, 'nearer: the cells within SOLID_M collide, the far ones not: ' .. solidCount())
+trees.update(10, { x = 128, y = 128 })
+T.check(solidCount() == 8, 'in it: all of them')
+trees.clear()
+
+-- at speed only the items along the car's path collide: ahead within SOLID_SIDE_M of its line, not beside it, and
+-- those behind turn back; the tiles whose items turn back come first; solid items near the car ask for an urgent
+-- collision rebuild (roads.requestCollision(true))
+do
+  local car = { v = vec3(0, 0, 0) }
+  getPlayerVehicle = function() return { getVelocity = function() return car.v end } end
+  local asked = {}
+  package.loaded['beamngEarth/roads'] = { requestCollision = function(urgent) asked[#asked + 1] = urgent and true or false end }
+  for tx = 0, 3 do                  -- every 16 m on the path (y = 128) and 108 m beside it (y = 236)
+    local rows = {}
+    for i = 0, 15 do rows[#rows + 1] = string.format('{0, %d, 128, 5, 0, 1, 12, 0.0}', tx * 256 + 8 + i * 16) end
+    for i = 0, 15 do rows[#rows + 1] = string.format('{0, %d, 236, 5, 0, 1, 12, 0.0}', tx * 256 + 8 + i * 16) end
+    files['/t/f' .. tx] = '{ groups = {}, items = { ' .. table.concat(rows, ', ') .. ' } }'
+    trees.onTile({ anchorId = 11, key = tx .. '_0', path = '/t/f' .. tx, n = 32 }, 11)
+  end
+  local function solidAt(y)
+    local n = 0
+    for it in pairs(items) do
+      if it.d and it.d.fields and it.d.fields.collidable == '1' and it.m and it.m.p and math.abs(it.m.p.y - y) < 1 then n = n + 1 end
+    end
+    return n
+  end
+  local function solidBehind(x)
+    local n = 0
+    for it in pairs(items) do
+      if it.d and it.d.fields and it.d.fields.collidable == '1' and it.m and it.m.p and it.m.p.x < x then n = n + 1 end
+    end
+    return n
+  end
+  car.v = vec3(85, 0, 0)                         -- 306 km/h east along y = 128
+  for _ = 1, 20 do trees.update(11, { x = 0, y = 128 }) end
+  T.check(trees.lastFast == true, 'fast: the corridor rule')
+  local want = 0                     -- the path's items whose cell reaches within SOLID_LEAD_S (680 m)
+  for i = 0, 63 do if math.floor((8 + i * 16) / 32) * 32 + 16 <= 680 + 32 * 0.7072 then want = want + 1 end end
+  T.check(solidAt(128) == want, 'ahead on the path: solid out to SOLID_LEAD_S of driving: ' .. solidAt(128) .. ' / ' .. want)
+  T.check(solidAt(236) == 0, '108 m beside the path: not solid, though within SOLID_M')
+  T.check(#asked > 0 and asked[1] == true, 'solid items within URGENT_S of the car: an urgent rebuild asked')
+  for _ = 1, 20 do trees.update(11, { x = 600, y = 128 }) end
+  T.check(solidBehind(600 - trees.SOLID_ROUND_M - 64) == 0, 'behind the car: turned back')
+  car.v = vec3(0, 0, 0)
+  for _ = 1, 20 do trees.update(11, { x = 600, y = 128 }) end
+  T.check(trees.lastFast == false and solidAt(236) > 0, 'standing: round the car again, beside too')
+  -- the order: a tile with items to turn back before one with only shown items to make
+  local t = { cx = 128, cy = 128, mask = string.rep('1', 64) }
+  T.check(trees.cellsOff(t.mask, string.rep('0', 64)) and not trees.cellsOff('', string.rep('1', 64)),
+    'cellsOff: a solid cell turned off')
+  getPlayerVehicle = nil
+  package.loaded['beamngEarth/roads'] = nil
+end
 trees.clear()
 T.done('test_trees')
