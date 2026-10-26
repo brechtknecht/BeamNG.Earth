@@ -656,6 +656,7 @@ local function commitTerrain(msg)
   end
   local tColl = sw()
   local coverN = farfield.onBlockCommit(msg.cx, msg.cy)     -- (far tiles whose cover changed)
+  st.photolessCheckAt = nil       -- a block without its photo: the tiles stand in from this frame (updatePhotoless)
   local ls = swapped and terrain.lastSwap or nil
   local c = { load = tLoad, coll = tColl - tLoad, cover = sw() - tColl, f = {}, e = {}, swap = swapped or nil,
     coverN = tonumber(coverN), photo = type(msg.base) == 'string',
@@ -1894,6 +1895,7 @@ local function onUpdate(dtReal, dtSim)
     gasstations.update(gov)
     t = mark('roads', t)
     farfield.update(gov, (gov.w1 or dtReal * 1000) / 1000, st.cam, st.player)
+    M.updatePhotoless()
     t = mark('far', t)
     sea.update(st.anchorId, st.player)
     trees.update(st.anchorId, st.player, M.viewAway())
@@ -2184,13 +2186,17 @@ function M.setBlockSize(size)
   return n, ok
 end
 
+-- Who draws the ground in detail mode (one local: the main chunk is at Lua's limit of 200): raw = the dev tools' raw
+-- view (setRawView), photoless = the block has no photo yet (updatePhotoless); drawn(): whether the block is drawn.
+local ground = { raw = false, photoless = false }
+function ground.drawn() return nearVisual == 'terrain' or (nearVisual == 'detail' and not ground.raw and not ground.photoless) end
+
 -- Who draws the near ground: 'mesh' (far tiles; the TerrainBlock is physics-only, render disabled),
 -- 'detail' (the mesh layout with the block drawn: aerial photo base, surface textures; 2026-10-12) or
 -- 'terrain' (v1.2; anything else). Set by the server's hello; callable from the console to test.
-local rawView = false
 function M.setNearVisual(mode)
   nearVisual = (mode == 'mesh' or mode == 'detail') and mode or 'terrain'
-  terrain.setRenderEnabled(nearVisual == 'terrain' or (nearVisual == 'detail' and not rawView))
+  terrain.setRenderEnabled(ground.drawn())
   farfield.setNearVisual(nearVisual)
   return nearVisual
 end
@@ -2199,13 +2205,41 @@ end
 -- generated near ground (the drawn block), for before / after captures. No server round trip: the tiles
 -- under the block are loaded anyway (hidden or sunk). Returns the state.
 function M.setRawView(on)
-  rawView = on and true or false
-  farfield.setRawView(rawView)
-  terrain.setRenderEnabled(nearVisual == 'terrain' or (nearVisual == 'detail' and not rawView))
-  return rawView
+  ground.raw = on and true or false
+  farfield.setRawView(ground.raw)
+  terrain.setRenderEnabled(ground.drawn())
+  return ground.raw
 end
 
-function M.rawView() return rawView end
+function M.rawView() return ground.raw end
+
+-- Detail mode: a committed block without its aerial photo (a stand-in, or a block the server sent before its
+-- photo at speed, which follows as block_base) is drawn in the level's flat colour, and when the photo comes the
+-- whole ground ahead changes at once (pop-in thread, 2026-10-26: 250 km/h on 2 cores, 9 such blocks in 9 km,
+-- 1.4-6.5 s each, 36 s in all). Meanwhile the far tiles under it are the ground, as in the raw view: they carry
+-- the same imagery and are graded like the block at L0 and finer, so the roads and trees still sit on them. Only
+-- once they cover the whole block with their textures (else the block stays: no holes); back to the block in the
+-- frame its photo is there. Every frame (cheap until a block lacks its photo); PHOTOLESS_TILES = false: off.
+M.PHOTOLESS_TILES = true
+M.PHOTOLESS_CHECK_S = 0.2
+function M.updatePhotoless()
+  local want = false
+  if M.PHOTOLESS_TILES and nearVisual == 'detail' and not ground.raw and st.block and terrain.base() == nil then
+    want = ground.photoless
+    if not want and st.clock >= (st.photolessCheckAt or -1) then
+      st.photolessCheckAt = st.clock + M.PHOTOLESS_CHECK_S
+      want = farfield.tilesCoverBlock()
+    end
+  end
+  if want == ground.photoless then return want end
+  ground.photoless = want
+  farfield.setPhotoless(want)
+  terrain.setRenderEnabled(ground.drawn())
+  if want then st.photolessShown = (st.photolessShown or 0) + 1 end
+  return want
+end
+
+function M.photoless() return ground.photoless end
 
 function M.nearVisualMode() return nearVisual end
 
@@ -2248,7 +2282,8 @@ end
 
 function M.status()
   return dumps({ net = net.state(), lastError = net.lastError, session = st.sessionId, active = st.active,
-    inOurLevel = st.inOurLevel, nearVisual = nearVisual, rawView = rawView, terrainRendered = terrain.isRenderEnabled(),
+    inOurLevel = st.inOurLevel, nearVisual = nearVisual, rawView = ground.raw, photoless = ground.photoless,
+    photolessShown = st.photolessShown, terrainRendered = terrain.isRenderEnabled(),
     anchorId = st.anchorId, anchorKey = st.anchorKey, pending = st.pending and st.pending.purpose,
     block = st.block, terrainPending = st.terrainPending and { st.terrainPending.cx, st.terrainPending.cy },
     followWait = st.followWait, commits = st.commits,

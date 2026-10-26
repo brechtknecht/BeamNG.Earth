@@ -79,6 +79,42 @@ step()
 T.check(farfield.stats().covered == 0 and visible(obj(interior)), 'mesh mode: nothing covered')
 T.check(farfield.uncoverReady(0, 0, 128, 0), 'mesh mode: gate open')
 farfield.setNearVisual('detail')
+step(30)
+
+-- a block without its photo: the textured tiles (L0 and finer) are the ground while they cover all of it
+local function texTile(l, i, j)
+  local m = tile(1, l, i, j, { sink = 0.4 })
+  m.material = 'bngEarthFar_' .. key(l, i, j); m.texture = '/temp/beamngEarth/t/far_1_' .. key(l, i, j) .. '.dds'
+  return m
+end
+T.check(not farfield.tilesCoverBlock(), 'no textured tiles: the block is not covered')
+local tex = {}
+for i = -2, 1 do
+  for j = -2, 1 do
+    if not (i == 1 and j == 1) then farfield.onTile(texTile(0, i, j)); tex[#tex + 1] = key(0, i, j) end
+  end
+end
+step()
+farfield.onSwap({ type = 'far_swap', anchorId = 1, id = 4, add = tex, remove = {} })
+step(30)
+T.check(not farfield.tilesCoverBlock(), '[256, 512]² only under an untextured tile: not covered')
+tex = {}
+for i = 2, 3 do
+  for j = 2, 3 do farfield.onTile(texTile(-1, i, j)); tex[#tex + 1] = key(-1, i, j) end
+end
+step()
+farfield.onSwap({ type = 'far_swap', anchorId = 1, id = 5, add = tex, remove = {} })
+step(30)
+T.check(farfield.tilesCoverBlock(), 'textured L0 + L-1 tiles cover the whole block')
+T.check(obj(key(0, -1, -1)).hidden, 'photo or not, covered until core says so')
+T.check(farfield.setPhotoless(true) == true and farfield.photoless(), 'photoless on')
+step()
+T.check(visible(obj(key(0, -1, -1))) and obj(key(0, -1, -1)).pos.z == 50, 'photoless: the textured tile is the ground')
+T.check(farfield.stats().covered == 0 and farfield.stats().photoless == true, 'photoless: nothing covered')
+T.check(farfield.uncoverReady(0, 0, 128, 0), 'photoless: the block is not drawn, nothing gates a move')
+farfield.setPhotoless(false)
+step(30)
+T.check(obj(key(0, -1, -1)).hidden and obj(interior).hidden, 'photo there: covered again')
 
 -- terrain.setBase: the photo into every layer of the block, then back to the level's flat base
 local mats = { { 'bngEarthGroundAsphalt', 'ASPHALT_OLD' }, { 'bngEarthGroundGrass', 'GRASS' }, { 'beamngEarthDirt', 'DIRT' } }

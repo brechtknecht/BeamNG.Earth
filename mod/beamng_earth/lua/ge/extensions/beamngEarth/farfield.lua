@@ -161,11 +161,12 @@ local clock = 0         -- s, transition clock (advanced by update)
 local materialChecked = false
 local nearVisual = 'terrain' -- 'terrain' | 'mesh' | 'detail' (server hello; survives forget(): a server setting)
 local rawView = false        -- detail mode, dev tools: the tiles are the ground (the block hidden by core)
+local photoless = false      -- detail mode: the block has no aerial photo yet, the tiles are the ground (core)
 
 -- The tiles use the mesh-mode layout and rules (import order, old-anchor drops, the exact-ground metric).
 local function meshLayout() return nearVisual ~= 'terrain' end
 -- The TerrainBlock is the visible near ground: tiles under it are covered.
-local function blockShown() return nearVisual == 'terrain' or (nearVisual == 'detail' and not rawView) end
+local function blockShown() return nearVisual == 'terrain' or (nearVisual == 'detail' and not rawView and not photoless) end
 -- Level of the tiles the server forces under the block: L0 (terrain mode, 256 m grid) or L-1 (detail).
 local function forcedLevel() return nearVisual == 'detail' and -1 or 0 end
 local counters = { imports = 0, failed = 0, crossovers = 0, instant = 0, pops = 0, textured = 0, materials = 0,
@@ -905,6 +906,49 @@ end
 
 function M.rawView() return rawView end
 
+-- Detail mode: the committed block shows the level's flat colour until its aerial photo comes (a stand-in, or a
+-- block sent before its photo at speed: block_base); meanwhile core hides it and the tiles are the ground, as in
+-- the raw view (on), until the photo is there (off). Re-applies every tile's cover at once.
+function M.setPhotoless(on)
+  on = on and true or false
+  if on == photoless then return photoless end
+  photoless = on
+  for _, inst in pairs(live) do applyCover(inst, false) end
+  for _, inst in pairs(old) do applyCover(inst, false) end
+  return photoless
+end
+
+function M.photoless() return photoless end
+
+-- Is the committed block's whole footprint shown by loaded tiles with their own aerial texture at L0 or finer
+-- (graded like the block there, so the roads and trees on it still sit on them)? Checked on the 64 m grid.
+M.PHOTOLESS_MAX_LEVEL = 0
+function M.tilesCoverBlock()
+  local b = block
+  if not b then return false end
+  local S = 64
+  local nx, ny = floor((b.x1 - b.x0) / S + 0.5), floor((b.y1 - b.y0) / S + 0.5)
+  if nx < 1 or ny < 1 then return false end
+  local hit, n = {}, 0
+  for _, inst in pairs(live) do
+    if inst.id and inst.material and not inst.failed and not inst.doomed and inst.level <= M.PHOTOLESS_MAX_LEVEL
+      and inst.x0 < b.x1 and b.x0 < inst.x1 and inst.y0 < b.y1 and b.y0 < inst.y1 then
+      -- the grid points (cell centres) inside this tile
+      local i0 = max(0, math.ceil((inst.x0 - b.x0) / S - 0.5))
+      local i1 = min(nx - 1, math.ceil((inst.x1 - b.x0) / S - 0.5) - 1)
+      local j0 = max(0, math.ceil((inst.y0 - b.y0) / S - 0.5))
+      local j1 = min(ny - 1, math.ceil((inst.y1 - b.y0) / S - 0.5) - 1)
+      for i = i0, i1 do
+        for j = j0, j1 do
+          local k = i * ny + j
+          if not hit[k] then hit[k] = true; n = n + 1 end
+        end
+      end
+    end
+  end
+  return n == nx * ny
+end
+
 -- The terrain block moved (terrain-follow commit frame, after importMaps + setPosition). Covers and
 -- uncovers far tiles; about 48 setPosition/setHidden calls for a 256 m move. Returns the changes.
 function M.onBlockCommit(cx, cy)
@@ -1481,6 +1525,7 @@ function M.stats()
     instant = counters.instant, pops = counters.pops, capWaits = counters.capWaits, frameUnits = lastFrame.units,
     moving = lastFrame.moving, materials = satmat.count(), materialsCreated = counters.materials,
     textured = counters.textured, oldCovered = counters.oldCovered, nearVisual = nearVisual, rawView = rawView,
+    photoless = photoless,
     waitingGroups = waiting, exactLevel = exactLevel, underLevel = under.level, underOld = under.old,
     exactMiss = counters.exactMiss, exactFrames = counters.exactFrames, retex = counters.retex,
     retexStale = counters.retexStale, retexFailed = counters.retexFailed, overBlock = over, overBlockLevel = overLevel, partial = partial,
