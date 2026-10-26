@@ -1709,6 +1709,9 @@ local function perfContext()
   end
   local okT, ts = pcall(trees.status)
   if okT and ts and (ts.pending or 0) > 0 then d[#d + 1] = 'tree tiles ' .. ts.pending .. ' pending' end
+  -- (trees.lua FIRST_LOADS: shapes the engine loads for the first time, and those still to load ahead)
+  if okT and ts and (ts.fresh or 0) > 0 then d[#d + 1] = ts.fresh .. ' new tree shapes (' .. (ts.shapes or 0) .. ' loaded)' end
+  if okT and ts and (ts.warmLeft or 0) > 0 then d[#d + 1] = 'tree shapes ' .. ts.warmLeft .. ' to load ahead' end
   if (st.serverBacklog or 0) > 0 then d[#d + 1] = 'server backlog ' .. st.serverBacklog end
   c.doing = table.concat(d, ', ')
   c.extra = string.format('Lua %.0f MB%s', collectgarbage('count') / 1024,

@@ -87,6 +87,22 @@ M.VIEW_COS = 0.77       -- 40 deg either side of the car's heading
 M.SIDE_K = 2
 M.BEHIND_K = 4
 M.BEHIND_M = 2000
+-- First loads (Felix's drive on a5ca450, 2026-10-26: 13 engine "Ticking" hitches of 70-250 ms in the first 5 minutes,
+-- tree tiles pending, the collision rebuilds round them a few ms, and one of 1.3 s at the start). The engine loads a
+-- shape, its materials and textures in the tick after its first item; a replay of captured drives (A13, Munich) gives
+-- the same picture if a shape it never loaded costs ~100 ms there (probe PF5, 2026-10-11: a tree's first TSStatic
+-- 125 ms) and another spelling of a loaded one (SHAPE_VARIANTS) ~12 ms: ~35-40 shapes in the start's frames, then 6-11
+-- more one or two at a time as the drive meets them. So while the car stands (slower than WARM_MAX_MS) every shape of
+-- the groups the tiles name is loaded ahead, one a work frame (and then WARM_SPELLINGS spellings), by an item of it in
+-- a Forest of its own WARM_DEPTH_M under the car for WARM_KEEP_FRAMES; and a shape never loaded comes alone in its
+-- frame, at speed COLD_GAP_S after the last one (at most COLD_SPELLINGS new spellings a work frame).
+M.FIRST_LOADS = true     -- false: none of this (every shape as its items come)
+M.WARM_MAX_MS = 3
+M.WARM_DEPTH_M = 500
+M.WARM_KEEP_FRAMES = 30
+M.WARM_SPELLINGS = 3
+M.COLD_GAP_S = 0.5
+M.COLD_SPELLINGS = 2
 
 local ECA = '/levels/east_coast_usa/art/shapes/'
 local WCA = '/levels/west_coast_usa/art/shapes/'
@@ -244,6 +260,14 @@ local foci = {}         -- other vehicles' collision foci { x, y, r, trees } (M.
 local ghostSince = nil               -- since the last rebase that left ghost tiles (M.transform)
 local types = {}        -- "shape" / "shape#n" (not solid) -> TSForestItemData
 local pop = {}          -- shape -> its items in the level
+local loaded, loadedBase = {}, {}   -- shape (as spelled) / its plain path -> true once an item of it was made
+local warmBases, warmSpells, warmQueued = {}, {}, {}   -- shapes to load ahead (M.WARM_MAX_MS)
+local warmItems = {}    -- { item, frame } made to load a shape
+local warmForestId = nil
+local coldBase, coldSpell, coldLast = 0, 0, nil      -- this work frame's first loads; the clock of the last shape's
+local slowNow = true    -- the car slower than WARM_MAX_MS (this work frame)
+local clock = nil       -- ms (stopwatch.clock)
+M.coldLoads, M.warmLoads, M.coldRecent = 0, 0, {}
 local ready = false
 M.made, M.removed, M.errors = 0, 0, 0
 M.unknownGroups = {}      -- groups seen without a CATALOG entry (logged once each)
@@ -320,25 +344,28 @@ local function itemType(shape, solid)
 end
 
 -- The variant of a group for an item of height h: those within 0.8 .. 1.25 of it (else 0.6 .. 1.6), picked by the
--- item's rank; else the nearest. Returns shape, scale.
+-- item's rank; else the nearest. Returns shape, scale. (No tables made: a call for every row of every new tile.)
+local RANGES = { { 0.8, 1.25 }, { 0.6, 1.6 } }
+local cands = {}
 function M.pick(group, h, rank)
   local list = M.CATALOG[group] or M.CATALOG.deciduous
-  local cands = {}
-  for _, range in ipairs({ { 0.8, 1.25 }, { 0.6, 1.6 } }) do      -- near its size first, then wider
+  local nc = 0
+  for _, range in ipairs(RANGES) do      -- near its size first, then wider
     for _, v in ipairs(list) do
-      if v[2] >= h * range[1] and v[2] <= h * range[2] then cands[#cands + 1] = v end
+      if v[2] >= h * range[1] and v[2] <= h * range[2] then nc = nc + 1; cands[nc] = v end
     end
-    if #cands > 0 then break end
+    if nc > 0 then break end
   end
-  if #cands == 0 then
-    local best, bd
-    for _, v in ipairs(list) do
-      local d = math.abs(math.log(v[2] / math.max(h, 0.1)))
-      if not bd or d < bd then best, bd = v, d end
+  local v
+  if nc == 0 then
+    local bd
+    for _, c in ipairs(list) do
+      local d = math.abs(math.log(c[2] / math.max(h, 0.1)))
+      if not bd or d < bd then v, bd = c, d end
     end
-    cands = { best }
+  else
+    v = cands[math.floor(rank * 7919) % nc + 1]
   end
-  local v = cands[math.floor(rank * 7919) % #cands + 1]
   return v[1], math.max(0.3, math.min(2.5, h / v[2]))
 end
 
@@ -347,9 +374,17 @@ local releaseGhosts
 local groupBand
 
 -- Pure: the variant v's spelling of a shape path (0: itself).
+local spelled = {}       -- shape -> { v -> its spelling } (no new string a row)
 function M.variant(shape, v)
   if not v or v <= 0 then return shape end
-  return (shape:gsub('/([^/]+)$', '/' .. string.rep('./', v) .. '%1'))
+  local c = spelled[shape]
+  if not c then c = {}; spelled[shape] = c end
+  local sp = c[v]
+  if not sp then
+    sp = shape:gsub('/([^/]+)$', '/' .. string.rep('./', v) .. '%1')
+    c[v] = sp
+  end
+  return sp
 end
 
 -- Pure: a tile's shape variant from its key ("a:tx_ty" / "a:ptx_ty"): neighbours differ.
@@ -374,6 +409,118 @@ end
 -- group: a sign's group (vienna_convention_speed_signs.lua) also makes a second item at the same spot and scale, its
 -- body, and takes the collision. Only the first shape is counted in pop (allow's budget): the body is shared by every
 -- sign, spelled in the tile's variant like the rest, so its population is split.
+-- Pure: a shape's plain path (M.variant's spellings undone).
+function M.baseOf(shape)
+  local b, n = shape, 1
+  while n > 0 do b, n = b:gsub('/%./', '/') end
+  return b
+end
+
+local function now()
+  clock = clock or stopwatch.clock()
+  return clock()
+end
+
+local function markLoaded(shape)
+  if loaded[shape] then return end
+  loaded[shape] = true
+  local b = M.baseOf(shape)
+  if not loadedBase[b] then
+    loadedBase[b] = true
+    M.coldLoads = M.coldLoads + 1
+    local r = M.coldRecent
+    r[#r + 1] = now()
+    if #r > 8 then table.remove(r, 1) end
+  end
+end
+
+-- May the first item of a shape the engine has not loaded be made now? (see WARM_MAX_MS)
+local function coldOk(shape)
+  if loaded[shape] or not M.FIRST_LOADS then return true end
+  if loadedBase[M.baseOf(shape)] then
+    if coldSpell >= M.COLD_SPELLINGS then return false end
+    coldSpell = coldSpell + 1
+    return true
+  end
+  if coldBase > 0 then return false end
+  if not slowNow and coldLast and now() - coldLast < M.COLD_GAP_S * 1000 then return false end
+  coldBase, coldLast = coldBase + 1, now()
+  return true
+end
+
+-- The shapes of a tile's groups to load ahead (each once).
+local function queueWarm(groups)
+  for _, g in ipairs(groups or {}) do
+    local list = M.CATALOG[g] or {}
+    local body = vienna.body(g)
+    if body then list = { { body }, unpack(list) } end
+    for _, v in ipairs(list) do
+      local b = v[1]
+      if not warmQueued[b] then
+        warmQueued[b] = true
+        warmBases[#warmBases + 1] = b
+        for k = 1, M.SHAPE_VARIANTS - 1 do warmSpells[#warmSpells + 1] = M.variant(b, k) end
+      end
+    end
+  end
+end
+
+local function warmForest()
+  local f = warmForestId and scenetree.findObjectById(warmForestId)
+  if not f then
+    f = createObject('Forest')
+    f:registerObject(M.FOREST_NAME .. '_warm')
+    if scenetree.MissionGroup then scenetree.MissionGroup:addObject(f) end
+    warmForestId = f:getID()
+  end
+  return f
+end
+
+-- Items made to load a shape go after M.WARM_KEEP_FRAMES (all: now).
+local function expireWarm(frame, all)
+  if #warmItems == 0 then return end
+  local f = warmForestId and scenetree.findObjectById(warmForestId)
+  local fd = f and f:getData()
+  local keep = {}
+  for _, w in ipairs(warmItems) do
+    if all or frame - w[2] >= M.WARM_KEEP_FRAMES then
+      if fd then pcall(function() fd:removeItem(w[1]) end) end
+    else keep[#keep + 1] = w end
+  end
+  warmItems = keep
+end
+
+-- An item of a shape WARM_DEPTH_M under the car, for WARM_KEEP_FRAMES: the engine loads the shape.
+local function warmShape(shape, player, frame)
+  local d = itemType(shape, false)
+  if d then
+    local m = MatrixF(true)
+    m:setPosition(vec3(player.x, player.y, (player.z or 0) - M.WARM_DEPTH_M))
+    local fd = warmForest():getData()
+    local ok, it = pcall(function() return fd:createNewItem(d, m, 1) end)
+    if ok and it then warmItems[#warmItems + 1] = { it, frame } end
+  end
+  markLoaded(shape)
+  M.warmLoads = M.warmLoads + 1
+end
+
+-- One shape loaded ahead (else up to WARM_SPELLINGS spellings of loaded ones).
+local function warmStep(player, frame)
+  local list, n = warmBases, 1
+  while #warmBases > 0 and loadedBase[warmBases[1]] do table.remove(warmBases, 1) end
+  if #warmBases == 0 then
+    while #warmSpells > 0 and loaded[warmSpells[1]] do table.remove(warmSpells, 1) end
+    if #warmSpells == 0 then return end
+    list, n = warmSpells, M.WARM_SPELLINGS
+  end
+  for _ = 1, n do
+    local shape = list[1]
+    if not shape or not coldOk(shape) then return end
+    table.remove(list, 1)
+    warmShape(shape, player, frame)
+  end
+end
+
 local function makeItem(fd, f, j, shape, sc, solid, group, variant)
   local d = itemType(shape, vienna.faceSolid(group, solid))
   if not d then M.errors = M.errors + 1; return nil end
@@ -392,6 +539,7 @@ local function makeItem(fd, f, j, shape, sc, solid, group, variant)
   end
   M.made = M.made + 1
   pop[shape] = (pop[shape] or 0) + 1
+  markLoaded(shape)
   return it
 end
 
@@ -407,6 +555,7 @@ local function allow(shape)
   if touched[shape] then return true end
   local n = pop[shape] or 0
   if next(touched) ~= nil and touchedItems + n > M.SHAPE_ITEMS_PER_FRAME then return false end
+  if not loaded[shape] and not coldOk(shape) then return false end
   touched[shape], touchedItems = true, touchedItems + n
   return true
 end
@@ -441,6 +590,7 @@ function M.onRows(anchorId, tileKey, rows, groups)
     madeShape = old and old.madeShape or {}, shown = old and old.shown or 0, forestId = old and old.forestId or nil,
     variant = M.tileVariant(key), cx = (tonumber(tx) or 0) * 256 + 128, cy = (tonumber(ty) or 0) * 256 + 128, drop = false }
   tiles[key] = t
+  queueWarm(t.groups or GROUPS)
 end
 
 -- The tile "anchorId:key" goes (roads.lua's furniture).
@@ -485,6 +635,7 @@ M.tileThreshold = tileThreshold
 
 -- The solid cells of tile t for the car f {x, y; moving at FAST_MS or more: ux, uy (its direction), lead (m)}: a
 -- string of one '1' or '0' per CELL_M cell, row by row from the tile's south-west corner, or '' when none is.
+local maskBuf = {}      -- (cellMask's, reused: every cell is written each call)
 function M.cellMask(t, f)
   local n = math.floor(256 / M.CELL_M)
   local round, hyst = M.SOLID_M, M.SOLID_HYST_M
@@ -498,7 +649,7 @@ function M.cellMask(t, f)
   end
   local old, half = t.mask or '', M.CELL_M * 0.7072
   local x0, y0 = t.cx - 128 - f.x, t.cy - 128 - f.y
-  local out, any = {}, false
+  local out, any = maskBuf, false
   for j = 0, n - 1 do
     for i = 0, n - 1 do
       local k = j * n + i + 1
@@ -513,7 +664,7 @@ function M.cellMask(t, f)
       any = any or on
     end
   end
-  return any and table.concat(out) or ''
+  return any and table.concat(out, '', 1, n * n) or ''
 end
 
 -- Does cell mask new turn off a cell solid in old?
@@ -553,26 +704,40 @@ function M.cellsOf(t)
   return t.cells
 end
 
--- The rows of tile t in the cells whose bit differs between masks old and new, and the rows in extra, in row order.
-function M.changedRows(t, old, new, extra)
-  local out = {}
-  local changed, any = {}, false
+-- The rows of tile t in the cells whose bit differs between masks old and new and those in extra (left over from an
+-- earlier frame): extra's first, then the changed cells' nearest the car {x, y} first (a frame's budget may end in the
+-- list). Read only by the caller: extra itself when no cell changed. (No set of extra's rows, no scan of every row:
+-- at 307 km/h that made ~3 MB of garbage a second, the replay 2026-10-26.)
+local changedCells, cellOrder, cellDist = {}, {}, {}
+function M.changedRows(t, old, new, extra, car)
+  local n = math.floor(256 / M.CELL_M)
+  local nc = 0
   if old ~= new then
-    local n = math.floor(256 / M.CELL_M)
+    local x0, y0 = t.cx - 128 - (car and car.x or t.cx), t.cy - 128 - (car and car.y or t.cy)
     for k = 1, n * n do
-      if (old:byte(k) == 49) ~= (new:byte(k) == 49) then changed[k], any = true, true end
+      local c = (old:byte(k) == 49) ~= (new:byte(k) == 49)
+      changedCells[k] = c
+      if c then
+        local dx, dy = x0 + ((k - 1) % n + 0.5) * M.CELL_M, y0 + (math.floor((k - 1) / n) + 0.5) * M.CELL_M
+        nc = nc + 1
+        cellOrder[nc], cellDist[k] = k, dx * dx + dy * dy
+      end
     end
   end
-  if not any then
-    for _, i in ipairs(extra or {}) do out[#out + 1] = i end
-    return out
-  end
-  local more = {}
-  for _, i in ipairs(extra or {}) do more[i] = true end
+  if nc == 0 then return extra or {} end
+  for q = nc + 1, #cellOrder do cellOrder[q] = nil end
+  table.sort(cellOrder, function(a, b) return cellDist[a] < cellDist[b] end)
   cellRows(t)
-  local cells = t.cells
-  for i = 1, t.n do
-    if changed[cells[i]] or more[i] then out[#out + 1] = i end
+  local out, cr, cells = {}, t.cellRows, t.cells
+  if extra then
+    for q = 1, #extra do
+      local i = extra[q]
+      if not changedCells[cells[i]] then out[#out + 1] = i end
+    end
+  end
+  for q = 1, nc do
+    local l = cr[cellOrder[q]]
+    if l then for r = 1, #l do out[#out + 1] = l[r] end end
   end
   return out
 end
@@ -678,6 +843,8 @@ function M.update(anchorId, player, view)
   local budget = M.PER_FRAME * M.EVERY_N
   M.lastShapeItems = touchedItems        -- the previous frame's (diagnostics)
   touched, touchedItems = {}, 0
+  coldBase, coldSpell = 0, 0
+  expireWarm(frameN)
   releaseGhosts(anchorId, player)
   for key, t in pairs(tiles) do
     if (t.anchor ~= anchorId and not t.ghost) or t.drop then
@@ -709,6 +876,8 @@ function M.update(anchorId, player, view)
     car.ux, car.uy, car.lead = vel.x / sp, vel.y / sp, math.max(M.SOLID_M, sp * M.SOLID_LEAD_S)
   end
   M.lastFast = car.ux ~= nil
+  slowNow = sp < M.WARM_MAX_MS
+  if slowNow and M.FIRST_LOADS then warmStep(player, frameN) end
   -- nearest tiles first (to the camera when it is away: view), those whose colliding items change before the rest;
   -- [3] the distance to the car (the colliding items), [4] every item solid, [5] the solid cells, [6] the class
   local order = {}
@@ -787,7 +956,7 @@ function M.update(anchorId, player, view)
       -- only solid cells changed: those cells' rows and the ones left over (t.pendingRows), else every row
       local idxs = nil
       if want == t.shown and band == t.band and all == t.all and (not t.pending or t.pendingRows) then
-        idxs = M.changedRows(t, t.mask or '', mask, t.pending and t.pendingRows or nil)
+        idxs = M.changedRows(t, t.mask or '', mask, t.pending and t.pendingRows or nil, car)
       end
       if rowsScanned > M.ROWS_PER_FRAME then finish(); return end
       -- (the tile's state is what it shows once its rows are done: the rows not done yet are its pendingRows)
@@ -819,7 +988,12 @@ function M.update(anchorId, player, view)
         local solid = (all or (cells ~= nil and mask:byte(cells[i]) == 49)) and not M.NO_COLLIDE[g or '']
         if r < want and (not t.made[i] or (t.solid[i] == true) ~= solid) then
           local sh, sc = shapeOf(t, i)
-          if allow(sh) then
+          local body = M.FIRST_LOADS and vienna.body(g)
+          body = body and M.variant(body, t.variant)
+          if body and not loaded[body] then     -- (a sign's body first, alone: the face another frame)
+            if coldOk(body) then warmShape(body, player, frameN) end
+            left[#left + 1] = i
+          elseif allow(sh) then
             if t.made[i] then removeItem(data(), t.made[i], t.madeShape[i]); budget = budget - 1 end  -- solid <-> not
             t.made[i] = makeItem(data(), f, j, sh, sc, solid, g, t.variant)
             t.solid[i] = (t.made[i] and solid) or nil      -- true or nil
@@ -854,12 +1028,15 @@ function M.clear()
     for i, it in pairs(t.made) do if fd then removeItem(fd, it, t.madeShape[i]) end end
     releaseForest(t)
   end
+  expireWarm(frameN, true)
   tiles, frameN = {}, 0
 end
 
 -- Level end: the level deletes its objects itself.
 function M.reset()
   tiles, types, ready, pool, forestCount, pop = {}, {}, false, {}, 0, {}
+  loaded, loadedBase, warmBases, warmSpells, warmQueued, warmItems, warmForestId = {}, {}, {}, {}, {}, {}, nil
+  coldLast, M.coldRecent, clock, M.coldLoads, M.warmLoads = nil, {}, nil, 0, 0
 end
 
 function M.status()
@@ -869,7 +1046,11 @@ function M.status()
     if t.pending or t.shown == 0 then pending = pending + 1 end
     for _ in pairs(t.made) do items = items + 1 end
   end
-  return { tiles = n, items = items, pending = pending, made = M.made, removed = M.removed, errors = M.errors }
+  -- fresh: shapes loaded for the first time within the last 0.5 s (their cost lands in the engine's next ticks)
+  local fresh, t0 = 0, now()
+  for _, at in ipairs(M.coldRecent) do if t0 - at <= 500 then fresh = fresh + 1 end end
+  return { tiles = n, items = items, pending = pending, made = M.made, removed = M.removed, errors = M.errors,
+    fresh = fresh, shapes = M.coldLoads, warmLeft = #warmBases + #warmSpells }
 end
 
 return M
