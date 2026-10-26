@@ -20,6 +20,12 @@ M.APPLY_WAIT_FRAMES = 30
 -- reaches WINDOW_M = 1100 m, the block ~450 m; without it the graph ran out ahead of a car driving on before the next
 -- graph came, every 400 m: the GPS arrows ended and the autodrive stopped, the user's Cannonball run 2026-10-14)
 M.RECLIP_M = 150
+-- Without traffic (no traffic, parked or police cars chosen) a re-apply waits while the car is faster than FAST_MS, up to
+-- FAST_MAX_GAP_S since the last one: each apply is a single ~90 ms frame (map.reset), and with no AI cars nothing on the
+-- road needs the new graph at once (Felix 2026-10-26, a first-visit drive at 100-150 mph: 5 of the 23 hitches were
+-- navgraph applies). The GPS arrows and the autodrive get it once the car slows down, or a minute on.
+M.FAST_MS = 30
+M.FAST_MAX_GAP_S = 60
 M.UI_MAP = false        -- send our graph to the UI (the big map) on every apply
 M.RULES_FILE = '/temp/beamngEarth/roadRules.json'
 M.rules = { rightHandDrive = false, turnOnRed = true }    -- US; `rightHandDrive = true` means driving on the left
@@ -551,6 +557,18 @@ local function room(gov)
   return false
 end
 
+-- Wait with this (re-)apply? applied: the graph in the map (nil: none yet, never waits); foreign: someone else's map is
+-- in (never waits); since: s since the last apply.
+function M.deferFast(applied_, foreign_, since)
+  if not applied_ or foreign_ or since >= M.FAST_MAX_GAP_S then return false end
+  local c = M.choice or {}
+  if c.traffic or c.parked or c.police then return false end
+  local veh = getPlayerVehicle and getPlayerVehicle(0)
+  local v = veh and veh.getVelocity and veh:getVelocity()
+  if not v then return false end
+  return v.x * v.x + v.y * v.y > M.FAST_MS * M.FAST_MS
+end
+
 function M.update(aid, b, gov)
   if not M.enabled or not graph then return end
   local t0 = os.clock()
@@ -580,6 +598,10 @@ function M.update(aid, b, gov)
   if not (dirty or foreign) then return end
   local t = os.clock()
   if t - lastApply < M.MIN_GAP_S and not foreign then return end
+  if M.deferFast(applied, foreign, t - lastApply) then
+    stats.deferred = (stats.deferred or 0) + 1
+    return
+  end
   local pre = buildNodes(b)
   if not pre or not room(gov) then return end
   prep = nil

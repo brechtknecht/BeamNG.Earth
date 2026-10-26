@@ -74,4 +74,22 @@ T.check(math.abs(N.boxMoved({ -708, -452, 196, 452 }, { -1092, -452, -188, 452 }
   'the block moved 384 m: measured between the boxes\' centres')
 T.check(N.boxMoved(nil, { 0, 0, 1, 1 }) == 0 and N.boxMoved({}, { 0, 0, 1, 1 }) == 0, 'no box yet: not moved')
 T.check(384 >= N.RECLIP_M and 128 < N.RECLIP_M, 'a 384 m move re-clips the graph, one step of 128 m does not')
+-- without traffic a re-apply waits while the car is fast (each apply is a ~90 ms frame), up to FAST_MAX_GAP_S
+do
+  local NG = require('beamngEarth/navgraph')
+  local gpv, ch = getPlayerVehicle, NG.choice
+  local vel = { x = 40, y = 0, z = 0 }
+  getPlayerVehicle = function() return { getVelocity = function() return vel end } end
+  NG.choice = { traffic = false, parked = false, police = false }
+  T.check(NG.deferFast({}, false, 5) == true, 'no traffic, 144 km/h: waits')
+  T.check(NG.deferFast(nil, false, 5) == false, 'no graph in yet: never waits')
+  T.check(NG.deferFast({}, true, 5) == false, "someone else's map in: never waits")
+  T.check(NG.deferFast({}, false, NG.FAST_MAX_GAP_S) == false, 'a minute on: applied')
+  vel = { x = 10, y = 0, z = 0 }
+  T.check(NG.deferFast({}, false, 5) == false, 'slow: applied')
+  vel = { x = 40, y = 0, z = 0 }
+  NG.choice = { traffic = true }
+  T.check(NG.deferFast({}, false, 5) == false, 'with traffic: applied at once')
+  getPlayerVehicle, NG.choice = gpv, ch
+end
 T.done('test_navgraph')

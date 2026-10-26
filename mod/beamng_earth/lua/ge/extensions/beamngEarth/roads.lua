@@ -685,7 +685,28 @@ local viewAt = nil  -- core.viewAway(): the camera's { x, y } when it is away fr
 local prewarmId, prewarmPath, prewarmWant = nil, nil, nil     -- (the materials' prewarm shape, below)
 local prewarmNow
 
+-- A roads frame this slow (ms) is logged with the units it ran (Felix 2026-10-26: 5 of 23 hitches in a first-visit
+-- drive were 'roads 76-93 ms' frames of unknown cause)
+M.SLOW_FRAME_MS = 40
+local updateBody
+
 function M.update(gov, currentAnchor, player, view)
+  local t0, n0 = now(), #unitLog
+  local first = unitLog[1]
+  updateBody(gov, currentAnchor, player, view)
+  local ms = now() - t0
+  if ms >= M.SLOW_FRAME_MS then
+    local i0 = (unitLog[1] == first) and n0 + 1 or 1     -- (the log may have rolled over)
+    local u = {}
+    for i = i0, #unitLog do
+      local e = unitLog[i]
+      u[#u + 1] = string.format('%s %.1f%s', tostring(e[1]), e[2] or 0, e[3] and (' ' .. tostring(e[3]):match('[^/]*$')) or '')
+    end
+    log('W', 'beamngEarth.roads', string.format('slow roads frame %.0f ms: %s', ms, #u > 0 and table.concat(u, ', ') or 'no unit (prewarm, release, collide range)'))
+  end
+end
+
+updateBody = function(gov, currentAnchor, player, view)
   viewAt = view
   if prewarmWant then prewarmNow()
   elseif prewarmId and not scenetree.findObjectById(prewarmId) then   -- (the level loaded again: gone with it)
