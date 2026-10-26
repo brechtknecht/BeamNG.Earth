@@ -11,6 +11,8 @@ are in the anchor frame, z the ground (elev); the mod clips the graph to the ter
 Pure given the map cells and elev; deterministic.
 """
 import math
+import os
+import time
 
 import numpy as np
 
@@ -431,6 +433,13 @@ def country_near(db, lat, lon):
 
 
 REBUILD_M = 400.0           # a new graph once the player is this far from the last one's centre
+# At FAST_MS and over, a graph is centred ahead of the car by the time the last one took (at most AHEAD_MAX_M: the car
+# reaches its middle as it comes), and the next one starts no sooner than that time after it (a road process for the
+# AI graph at most half the time): at 300 km/h a graph every 400 m started the next as soon as one was done (10-24 s
+# each on 2 cores), and the road tiles waited behind it in the two road processes (2026-10-26). BNGE_NAV_AHEAD=0: off.
+FAST_MS = 25.0
+AHEAD_MAX_M = 550.0
+AHEAD = os.environ.get("BNGE_NAV_AHEAD", "1") != "0"
 
 
 def write(out_dir, vfs_dir, aid, serial, graph):
@@ -457,15 +466,25 @@ class Tracker:
         self.building = False
         self.serial = 0
         self.pool = None        # one thread of its own (vegetation.Tracker: not behind other trackers' builds)
+        self.took = 0.0         # s the last graph took to build (AHEAD)
+        self.done_at = 0.0      # monotonic time it was done
 
     def close(self):
         if self.pool is not None:
             self.pool.shutdown(wait=False, cancel_futures=True)
 
-    def on_pose(self, conn, aid, x, y, loop, build):
-        """build(aid, x, y, serial) runs in a worker and returns (vfs path, nodes, edges) or None."""
+    def on_pose(self, conn, aid, x, y, loop, build, vel=(0.0, 0.0)):
+        """build(aid, x, y, serial) runs in a worker and returns (vfs path, nodes, edges) or None. vel: the car's (m/s;
+        AHEAD)."""
         if self.building:
             return
+        vx, vy = (float(vel[0]), float(vel[1])) if vel else (0.0, 0.0)
+        v = math.hypot(vx, vy)
+        if AHEAD and v >= FAST_MS and aid == self.aid:
+            if time.monotonic() - self.done_at < self.took:
+                return
+            lead = min(self.took * v, AHEAD_MAX_M) / v
+            x, y = x + vx * lead, y + vy * lead
         if aid == self.aid and self.centre is not None and \
                 max(abs(x - self.centre[0]), abs(y - self.centre[1])) < self.rebuild_m:
             return
@@ -475,11 +494,15 @@ class Tracker:
         if self.pool is None:
             from concurrent.futures import ThreadPoolExecutor
             self.pool = ThreadPoolExecutor(1, thread_name_prefix="navgraph")
+        t0 = time.monotonic()
         fut = loop.run_in_executor(self.pool, build, aid, x, y, serial)
-        fut.add_done_callback(lambda f: self._built(conn, aid, (x, y), serial, f))
+        fut.add_done_callback(lambda f: self._built(conn, aid, (x, y), serial, f, t0))
 
-    def _built(self, conn, aid, centre, serial, fut):
+    def _built(self, conn, aid, centre, serial, fut, t0=None):
         self.building = False
+        if t0 is not None:
+            self.done_at = time.monotonic()
+            self.took = self.done_at - t0
         try:
             res = fut.result()
         except Exception as e:      # map data not at hand: the next pose asks again

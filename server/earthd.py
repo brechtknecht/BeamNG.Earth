@@ -1104,7 +1104,10 @@ class Server:
             t0 = time.perf_counter()
             cla, clo, _ = anchor.frame.enu_to_geodetic(x, y, 0.0)
             rules = navgraphmod.road_rules(navgraphmod.country_near(self.airports_db, float(cla), float(clo)))
-            path, n_nodes, n_edges = self.road_pool.submit(
+            # (in the far buildings' process when there is one: a graph held a road process for 10-35 s at 300 km/h,
+            # and the road tiles waited behind it, 2026-10-26; NAV_FAR_BLD)
+            pool = self.far_bld_pool if NAV_FAR_BLD and self.far_bld_pool is not None else self.road_pool
+            path, n_nodes, n_edges = pool.submit(
                 blockworker.navgraph, aid, anchor.lat, anchor.lon, anchor.zooms[0], x, y, self.out_dir,
                 self.vfs_dir, serial, self.left_hand(anchor), self.mph(anchor), rules).result()
             log.debug("navgraph %d of anchor %d: %d nodes in %.2f s (queue + build)", serial, aid, n_nodes,
@@ -1262,9 +1265,11 @@ class Server:
                        key=lambda kl: (self.WARM_ORDER.get(kl[1], 9), where(kl[0]), str(kl[0]), kl[1]))
         return self.mapdata.warm(order)
 
-    def build_roads_tile(self, aid, tx, ty):
+    def build_roads_tile(self, aid, tx, ty, verify=False):
         """roads.py: one road tile of anchor aid, written to the session folder. Returns (vfs path,
-        chunks) or None if the anchor is gone. Worker threads (fetches the map cells it lacks)."""
+        chunks[, True: graded from region plans]) or None if the anchor is gone; verify: roads.UNCHANGED when a tile
+        graded from region plans comes out the same from its cells' whole plans (roads.Tracker). Worker threads
+        (fetches the map cells it lacks)."""
         anchor = self.anchors.get(aid)
         if anchor is None or self.mapdata is None:
             return None
@@ -1274,10 +1279,15 @@ class Server:
                 blockworker.roads_tile, aid, anchor.lat, anchor.lon, anchor.zooms[0], tx, ty, self.out_dir,
                 self.vfs_dir, self.sidewalks, DETAIL_ROAD_LIFT if self.near_visual == "detail" else 0.0,
                 self.buildings, self.left_hand(anchor), self.mph(anchor), self.anchor_q(anchor),
-                self.gas_stations).result()
-            log.debug("road tile %d_%d: %.2f s (queue + build)", tx, ty, time.perf_counter() - t0)
+                self.gas_stations, verify).result()
+            log.debug("road tile %d_%d: %.2f s (queue + build%s)", tx, ty, time.perf_counter() - t0,
+                      ", check" if verify else "")
+            if isinstance(res, str):        # (roads.UNCHANGED)
+                return res
             self.keep_fuel_pads(res[2])
-            return res[:2]
+            return res[:2] + ((True,) if len(res) > 3 and res[3] else ())
+        if verify:                  # (graded here from the whole plans only: never from region plans)
+            return roadsmod.UNCHANGED
         self.mapdata.warm(roadsmod.tile_needs(anchor.frame, tx, ty, self.buildings, self.road_widths is not None,
                                               1 + seacarvemod.LINE_CELLS if self.sea is not None else 0))
         cells = [self.mapdata.cell(k, layers=("roads",), kind="demand").layers.get("roads")
@@ -2996,6 +3006,8 @@ REGION_FORGET_S = 900.0     # s a block's answer is waited for at most
 PROVISIONAL_FOLLOW = os.environ.get("BNGE_PROVISIONAL_FOLLOW", "1") != "0"
 # ... graded under the roads whose cells' plans are made already (Grader.adopt: the block processes' plans on disk)
 PROVISIONAL_GRADE = os.environ.get("BNGE_PROVISIONAL_GRADE", "1") != "0"
+# The AI graph is built in the far buildings' process (when there is one), not in a road process (build_navgraph).
+NAV_FAR_BLD = os.environ.get("BNGE_NAV_FARBLD", "1") != "0"
 FOLLOW_PROV_EST_S = 3.0     # s a provisional follow block takes, until measured (Server.prov_est)
 # A provisional follow block is the fallback for a late one: it waits for nothing that is not at hand (_make_heightmap_here_
 # fast): not for its photo (2.2 s of its typical 3.7 s in Felix's 285 km/h log, 2026-10-26, longer than the graded block
@@ -4117,7 +4129,7 @@ class Connection:
             self.bldfar.on_pose(self, aid, *self.focus, asyncio.get_running_loop(), self.s.build_far_bld_tile,
                                 view=self.view_at)
         if self.s.traffic and aid == self.active and self.nav_may_start(aid):
-            self.nav.on_pose(self, aid, *self.focus, asyncio.get_running_loop(), self.s.build_navgraph)
+            self.nav.on_pose(self, aid, *self.focus, asyncio.get_running_loop(), self.s.build_navgraph, vel=self.vel)
         if aid == self.active:
             self.send_progress(aid)
         self.refresh_status()
