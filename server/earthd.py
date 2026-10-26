@@ -664,6 +664,10 @@ class Server:
         # blocks' (each holds a base-photo thread until its block process renders it; a teleport's photo waited
         # ~20 s behind the old place's on a Deck, 2026-10-23)
         self.urgent_base_pool = ThreadPoolExecutor(2, thread_name_prefix="base-urgent")
+        # late follow blocks without their road grading (make_follow_provisional): never behind the graded builds
+        self.prov_pool = ThreadPoolExecutor(1, thread_name_prefix="provisional")
+        self.prov_est = FOLLOW_PROV_EST_S   # s a provisional follow block takes (measured)
+        self.base_futs = {}             # block -> its base photo's future while it builds (the provisional shares it)
         self.ground_pool = ThreadPoolExecutor(1, thread_name_prefix="ground-ahead")   # groundahead.py
         # the world map's requests (GPS route, address search, map tiles): their own threads, so a teleport's tile
         # builds on the default pool do not hold them back (a route took 30 s after one, 2026-10-14)
@@ -1549,14 +1553,16 @@ class Server:
         if queued_at is not None and t0 - queued_at > 0.2:
             log.debug("terrain %s waited %.2f s for a heightmap worker", (anchor.id, cx, cy), t0 - queued_at)
         q = self.anchor_q(anchor)
+        key = (anchor.id, cx, cy)
         fb, base = anchor.first_base, None
         if fb is not None and fb[0] == (cx, cy):        # the provisional first block's photo (make_provisional)
             anchor.first_base, base = None, fb[1]
         elif self.near_visual == "detail" and self.imagery is not None:
-            base = (self.urgent_base_pool if lane == LANE_REQUEST else self.base_pool).submit(
-                self._base_photo, anchor, cx, cy, self._base_process(lane, anchor), lane == LANE_REQUEST)
+            base = self.base_futs.get(key)      # (a late block's provisional one started it: make_follow_provisional)
+            if base is None:
+                base = self.base_futs[key] = (self.urgent_base_pool if lane == LANE_REQUEST else self.base_pool).submit(
+                    self._base_photo, anchor, cx, cy, self._base_process(lane, anchor), lane == LANE_REQUEST)
         pool = self.block_pools[lane][0] if self.block_pools and progress is None else None
-        key = (anchor.id, cx, cy)
         try:
             if pool is not None:
                 self.hm_stage[key] = "the block process"
@@ -1573,6 +1579,31 @@ class Server:
                 return self._make_heightmap_here(anchor, cx, cy, progress, t0, q, base)
         finally:
             self.hm_stage.pop(key, None)
+            self.base_futs.pop(key, None)
+
+    def make_follow_provisional(self, anchor, cx, cy):
+        """Worker thread (prov_pool): a follow block the car would reach the stop line before (Connection.late_provisional),
+        built as make_provisional's (the DEM's ground with the runways, no road grading, tunnels or sea floor: those wait
+        on the road plans of the cells around), its photo the graded build's (base_futs; started here when that one's
+        has not). Its build time is kept (prov_est): the request starts it that long before the stop line."""
+        t0 = time.perf_counter()
+        key = (anchor.id, cx, cy)
+        base = self.base_futs.get(key)
+        if base is None and self.near_visual == "detail" and self.imagery is not None:
+            base = self.base_futs[key] = self.urgent_base_pool.submit(self._base_photo, anchor, cx, cy, None, True)
+        urgent = getattr(self.dem, "urgent", None)     # (test DEMs have no lane)
+        try:
+            with urgent() if urgent is not None else contextlib.nullcontext():
+                info = self._make_heightmap_here(anchor, cx, cy, None, t0, self.anchor_q(anchor), base,
+                                                 provisional=True)
+        finally:
+            if key not in self.hm_inflight:     # (the graded one done meanwhile: its photo future is not wanted)
+                self.base_futs.pop(key, None)
+        dt = time.perf_counter() - t0
+        self.prov_est = min(4 * FOLLOW_PROV_EST_S, 0.7 * self.prov_est + 0.3 * dt)
+        log.info("provisional follow block %s in %.2f s (%s)", key, dt,
+                 " ".join(f"{k} {v:.2f}" for k, v in info.get("stages", {}).items()))
+        return info
 
     def make_provisional(self, anchor, cx, cy, progress, ground_at=(0.0, 0.0)):
         """Worker thread: a teleport's first block before its road plans (the user, 2026-10-22: "place the car as
@@ -2768,6 +2799,15 @@ class Server:
 # instead of 15-60 s on a fresh place) and replaced by the graded one when that is built (terrain_refresh)
 PROVISIONAL_FIRST = os.environ.get("BNGE_PROVISIONAL", "1") != "0"
 PROVISIONAL_KEEP_S = 60.0   # the provisional .ter is deleted this long after its replacement was sent
+# A follow block that would come after the car reaches its block's stop line goes provisional the same way
+# (Connection.late_provisional): the edge guard held the car while the road plans of the block ahead were made
+# (2026-10-26, the MSFS lesson "never block on the full version")
+PROVISIONAL_FOLLOW = os.environ.get("BNGE_PROVISIONAL_FOLLOW", "1") != "0"
+FOLLOW_PROV_EST_S = 3.0     # s a provisional follow block takes, until measured (Server.prov_est)
+FOLLOW_PROV_MIN_V = 2.0     # m/s: slower, a block is late only for a car standing ...
+FOLLOW_PROV_HELD_M = 40.0   # ... this close to a stop line (the edge guard holds it there)
+FOLLOW_PROV_CHECK_S = 0.25  # a waiting follow request looks at the clock this often
+FOLLOW_REFRESH_WAIT_S = 120.0   # the graded follow block waits this long at most for the mod to take the provisional
 PADS_REFRESH_MS = 5.0       # the block in use built again with its gas station pads only below this speed (m/s) ...
 PADS_SETTLE_S = 3.0         # ... and this long after the last new pad (Connection.pads_refresh)
 NAV_WAIT_S = 30.0           # s an anchor's first AI graph waits at most for the road tiles round the car (nav_may_start)
@@ -3615,6 +3655,18 @@ class Connection:
         self.terrain_wait += 1
         try:
             job = asyncio.ensure_future(self.s.terrain(anchor, cx, cy))
+            # a block the car would reach the stop line before: an ungraded one in time, the graded one after it
+            prov = (await self.late_provisional(job, anchor, cx, cy)
+                    if PROVISIONAL_FOLLOW and self.s.grading and aid == self.active else None)
+            if prov is not None:
+                self.terrain_wait -= 1
+                key = (aid, cx, cy)
+                self.s.hm_sent.append(key)
+                log.info("terrain_ready %s (provisional) after %.0f ms", key, (time.perf_counter() - t0) * 1000)
+                self.send({"type": "terrain_ready", "requestId": req, "anchorId": aid, "provisional": True,
+                           **self.terrain_msg(key, prov)})
+                self.spawn(self.refine_follow(job, key, prov.get("ter"), t0))
+                return
             try:
                 info = await asyncio.wait_for(asyncio.shield(job), TERRAIN_STUCK_S)
             except asyncio.TimeoutError:
@@ -3913,11 +3965,11 @@ class Connection:
                 self.base_busy = False
         self.spawn(run())
 
-    def edge_at(self, x, y, vx, vy):
+    def edge_at(self, x, y, vx, vy, min_v=BASE_BUDGET_MIN_V):
         """time.monotonic() the game pauses at the committed block's edge at this velocity (edgeguard.lua: STOP_M
-        inside, LEAD_S ahead), None standing, slow or without a block."""
+        inside, LEAD_S ahead), None standing, slower than min_v or without a block."""
         v = math.hypot(vx, vy)
-        if self.block is None or v < BASE_BUDGET_MIN_V:
+        if self.block is None or v < min_v:
             return None
         x0, y0, x1, y1 = self.block.bbox
         t = math.inf
@@ -3927,6 +3979,81 @@ class Connection:
             elif w < 0:
                 t = min(t, (p - lo - BASE_EDGE_STOP_M) / -w)
         return time.monotonic() + max(0.0, t - BASE_EDGE_LEAD_S)
+
+    def stop_in(self):
+        """Seconds until the game pauses at the committed block's edge (edge_at, down to FOLLOW_PROV_MIN_V): 0 for a
+        car standing within FOLLOW_PROV_HELD_M of a stop line (the edge guard holds it there), else None."""
+        (x, y), (vx, vy) = self.focus, self.vel
+        at = self.edge_at(x, y, vx, vy, FOLLOW_PROV_MIN_V)
+        if at is not None:
+            return at - time.monotonic()
+        if self.block is None:
+            return None
+        x0, y0, x1, y1 = self.block.bbox
+        d = min(x - x0, x1 - heightmap.SQUARE - x, y - y0, y1 - heightmap.SQUARE - y) - BASE_EDGE_STOP_M
+        return 0.0 if d <= FOLLOW_PROV_HELD_M else None
+
+    async def late_provisional(self, job, anchor, cx, cy):
+        """A follow block's provisional build (Server.make_follow_provisional) once the graded one (job) would come
+        after the car reaches the stop line (stop_in, less the provisional's own time and the send): its info when it is
+        done first, else None (the graded one done first, never late, or the mod asks for another block now)."""
+        blk = self.s.layout.block_at(cx, cy)
+        while not job.done():
+            if self.pending_block != blk:
+                return None
+            left = self.stop_in()
+            if left is not None and left <= 1.5 * self.s.prov_est + BASE_MARGIN_S:
+                break
+            await asyncio.wait([job], timeout=FOLLOW_PROV_CHECK_S)
+        else:
+            return None
+        log.info("terrain %s late (%.1f s to the stop line): a provisional one first", (anchor.id, cx, cy), left)
+        prov = asyncio.ensure_future(self.loop.run_in_executor(
+            self.s.prov_pool, self.s.make_follow_provisional, anchor, cx, cy))
+        await asyncio.wait([job, prov], return_when=asyncio.FIRST_COMPLETED)
+        if job.done() and not job.cancelled() and job.exception() is None:
+
+            def drop(f):                # (the graded one came first: the provisional .ter is not sent)
+                if not f.cancelled() and f.exception() is None and f.result().get("ter"):
+                    self.s._remove(os.path.join(self.s.out_dir, f.result()["ter"]))
+            prov.add_done_callback(drop)
+            return None
+        try:
+            return await prov
+        except Exception:
+            log.exception("provisional follow block %s failed", (anchor.id, cx, cy))
+            return None
+
+    async def refine_follow(self, job, key, provisional_ter, t0):
+        """The graded follow block in place of the provisional one (late_provisional): sent as terrain_refresh once the
+        mod has that block in use (it drops a refresh of any other block), not at all once it moved on. The provisional
+        .ter is deleted a while later, as refine_first's."""
+        blk = self.s.layout.block_at(key[1], key[2])
+        info = None
+        self.refining.add(key)              # (the loading line's ground: send_progress)
+        try:
+            try:
+                info = await job
+            except Exception:
+                log.exception("graded follow block %s failed (the provisional one stays)", key)
+                return
+            log.info("graded follow block %s in %.2f s after the request", key, time.perf_counter() - t0)
+            end = time.monotonic() + FOLLOW_REFRESH_WAIT_S
+            while self.block != blk:
+                if self.pending_block != blk or time.monotonic() > end:
+                    log.info("graded follow block %s not sent: the game moved on", key)
+                    return
+                await asyncio.sleep(FOLLOW_PROV_CHECK_S)
+            self.s.hm_sent.append(key)
+            self.send({"type": "terrain_refresh", "anchorId": key[0], **self.terrain_msg(key, info)})
+        finally:
+            self.refining.discard(key)
+            if provisional_ter and provisional_ter != (info or {}).get("ter"):
+                self.spawn(self._remove_later(provisional_ter))
+
+    async def _remove_later(self, name):
+        await asyncio.sleep(PROVISIONAL_KEEP_S)     # (the game may still be reading it)
+        self.s._remove(os.path.join(self.s.out_dir, name))
 
     def pads_refresh(self, aid, now=None):
         """The block in use built again (terrain_refresh, as refine_first) when gas station pads came in after it was

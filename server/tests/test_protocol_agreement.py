@@ -187,7 +187,8 @@ SERVER_TO_MOD = {
                      "fuelShapes": F(list, OPT)},          # 2026-10-23: the region's gas station shapes (--gas-stations)
     "anchor_error": {"requestId": F(int, NULL), "error": F(str)},
     "share": {"port": F(int, NULL), "code": F(str), "weight": F(NUM, OPT)},   # our group service (mpsession.onShare)
-    "terrain_ready": {"requestId": F(int), "anchorId": F(int), **TERRAIN},
+    "terrain_ready": {"requestId": F(int), "anchorId": F(int), **TERRAIN,
+                      "provisional": F(bool, OPT)},         # 2026-10-26: a late follow block's ungraded one
     "terrain_refresh": {"anchorId": F(int), **TERRAIN},     # the graded block in place of the provisional one
     "terrain_error": {"requestId": F(int, NULL), "anchorId": F(int, NULL), "error": F(str)},
     "far_tile": {"anchorId": F(int), "key": F(str), "level": F(int), "shape": F(str), "pos": F(list),
