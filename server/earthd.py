@@ -213,6 +213,8 @@ GROUND_RESEND_M, GROUND_RESEND_S = 1.0, 1.5   # ground_ahead: sent on a change, 
                                                # follow.GROUND_STALE_S is 3 s)
 DETAIL_RING_M = 128.0           # detail mode: L-1 tiles this far beyond the block (forced())
 IMG_WARM_MARGIN = 200.0         # m beyond the block's half width that warm_imagery fetches ahead
+ANALYSES_MARGIN_DEG = 10.0      # ° around the USGS area where --deshadow / --colormatch may change a texture (the
+                                # far field reaches ~100 km; analyses_here)
 # photo_ahead: the base photos' tiles of the blocks along the way ahead (2026-10-26). A block's photo fetched and
 # decoded its imagery while the block was built (1.3-3.9 s of 3-7.5 s photos at 110-130 mph, 2026-10-25).
 PHOTO_AHEAD_S = 30.0            # s of driving ahead (aheadpath.points) ...
@@ -1415,7 +1417,7 @@ class Server:
             anchor.first_base, base = None, fb[1]
         elif self.near_visual == "detail" and self.imagery is not None:
             base = (self.urgent_base_pool if lane == LANE_REQUEST else self.base_pool).submit(
-                self._base_photo, anchor, cx, cy, self._base_process(lane), lane == LANE_REQUEST)
+                self._base_photo, anchor, cx, cy, self._base_process(lane, anchor), lane == LANE_REQUEST)
         pool = self.block_pools[lane][0] if self.block_pools and progress is None else None
         if pool is not None:
             info = pool.submit(
@@ -1582,11 +1584,24 @@ class Server:
         info["tunnelHoles"] = int(holes.sum())
         return idx
 
-    def _base_process(self, lane):
+    def analyses_here(self, anchor):
+        """Do the imagery analyses (--deshadow, --colormatch: they live in this process) change textures around
+        anchor? They correct only the USGS tiles (deshadow.SOURCE, colormatch.SOURCE), so far from the US they
+        change none, and the block photos and far textures render in the worker processes as without them (in
+        Europe with --deshadow full every block photo rendered here, 3-7.5 s next to the rest at 110-130 mph on an
+        i7-9700K, 2026-10-25)."""
+        if self.deshadow is None and self.colormatch is None:
+            return False
+        s, w, n, e = imagerymod.US_CREDIT_BOXES[deshadowmod.SOURCE]
+        m = ANALYSES_MARGIN_DEG
+        lon = anchor.lon - 360.0 if anchor.lon > 0 else anchor.lon     # (the Aleutians reach past 180°)
+        return s - m <= anchor.lat <= n + m and w - m <= lon <= e + m
+
+    def _base_process(self, lane, anchor):
         """The block process that renders the base photo of a block built in lane (blockworker.base_photo): the
         other lane's, usually idle while this one builds the heights; None (rendered here) with the imagery
-        analyses on (they live in this process) or without block processes."""
-        if not self.block_pools or self.imagery is None or self.deshadow is not None or self.colormatch is not None:
+        analyses at work there (analyses_here) or without block processes."""
+        if not self.block_pools or self.imagery is None or self.analyses_here(anchor):
             return None
         return self.block_pools[LANE_PREFETCH if lane == LANE_REQUEST else LANE_REQUEST][0]
 
@@ -2053,8 +2068,7 @@ class Server:
             base = seacarvemod.SeaDem(base, self.sea if lvl <= seacarvemod.CARVE_MAX_LEVEL else None)
         src = gradingmod.GradedDem(base, g) if g is not None else base
         done = None             # (texture file, bytes, sources used) when the worker rendered it (blockworker.far_tile)
-        if self.far_pool is not None and self.imagery is not None and self.deshadow is None \
-                and self.colormatch is None:
+        if self.far_pool is not None and self.imagery is not None and not self.analyses_here(anchor):
             # the texture in the far-tile process too, from the imagery on disk (no analyses to apply here)
             texture = self.texture_name(anchor.id, tile.key, self.tex_rev.get((anchor.id, tile.key), 0))
             im = self.imagery

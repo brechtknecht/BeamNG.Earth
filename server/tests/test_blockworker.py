@@ -186,13 +186,24 @@ class BaseRoutingTest(unittest.TestCase):
     def test_routing_and_fallback(self):
         import earthd
         S = earthd.Server
-        s = SimpleNamespace(block_pools=[("request", None), ("prefetch", None)], imagery=object(), deshadow=None,
-                            colormatch=None)
-        self.assertEqual(S._base_process(s, earthd.LANE_REQUEST), "prefetch")
-        self.assertEqual(S._base_process(s, earthd.LANE_PREFETCH), "request")
+        us, europe = SimpleNamespace(lat=40.0, lon=-105.0), SimpleNamespace(lat=50.9, lon=14.8)
+
+        def server(**kw):
+            o = SimpleNamespace(block_pools=[("request", None), ("prefetch", None)], imagery=object(), deshadow=None,
+                                colormatch=None)
+            vars(o).update(kw)
+            o.analyses_here = lambda anchor: S.analyses_here(o, anchor)
+            return o
+        s = server()
+        self.assertEqual(S._base_process(s, earthd.LANE_REQUEST, us), "prefetch")
+        self.assertEqual(S._base_process(s, earthd.LANE_PREFETCH, us), "request")
         for k in ("deshadow", "colormatch"):
-            self.assertIsNone(S._base_process(SimpleNamespace(**{**vars(s), k: object()}), earthd.LANE_REQUEST), k)
-        self.assertIsNone(S._base_process(SimpleNamespace(**{**vars(s), "block_pools": []}), earthd.LANE_REQUEST))
+            self.assertIsNone(S._base_process(server(**{k: object()}), earthd.LANE_REQUEST, us), k)
+            # they correct only the USGS tiles: elsewhere the photo goes to the block process as without them
+            self.assertEqual(S._base_process(server(**{k: object()}), earthd.LANE_REQUEST, europe), "prefetch", k)
+        self.assertIsNone(S._base_process(server(block_pools=[]), earthd.LANE_REQUEST, us))
+        aleutians = SimpleNamespace(lat=52.9, lon=173.0)
+        self.assertTrue(S.analyses_here(server(deshadow=object()), aleutians))
         calls = []
 
         def write_base(anchor, cx, cy, photo=None, quick=False):
