@@ -65,6 +65,11 @@ KINDS = ("demand", "prefetch", "background", "predownload", "urgent")
 URGENT_TOKENS = 2.0
 URGENT_CONC = 2
 PREFETCH_RESERVE = 0.5          # prefetch takes a token only while the bucket holds more than this x burst
+# prefetch / background hold at most this share of a host's request slots (at least 1; 0 = off): they took a free slot
+# whenever there was one, and the map data's bytes ahead (mapdata.fetch_ahead: 3 threads, 4 ranges each, seconds a
+# range from Oregon) then held all 4 of Overture's, so a block's own demand read waited for them (the I/O work,
+# 2026-10-26: 16 s of pauses -> 30-35 s). BNGE_PREFETCH_SLOTS=<share>
+PREFETCH_SLOTS = float(os.environ.get("BNGE_PREFETCH_SLOTS", "0.5"))
 BACKGROUND_RESERVE = 0.75       # background (de-shadow, weather) only above this: it comes after prefetch
 RETRY_AFTER_MIN, RETRY_AFTER_MAX = 1.0, 900.0
 BUDGET_WARN = 0.8               # share of the soft daily budget where prefetch / background stop
@@ -507,6 +512,29 @@ class CircuitBreaker:
 
 
 # --- transport ---------------------------------------------------------------------------------
+_tls = []
+_tls_lock = threading.Lock()
+
+
+def tls_context():
+    """One TLS context for every connection of the process (http.client's own, made once): without one http.client
+    made a context per connection and loaded the CA certificates again, ~23 ms of CPU each (Linux; Windows reads its
+    certificate store too), for ~100 fetch threads x hosts per process (the I/O audit, 2026-10-26)."""
+    with _tls_lock:
+        if not _tls:
+            import ssl
+            make = getattr(http.client, "_create_https_context", None)
+            try:
+                _tls.append(make(11) if make is not None else ssl.create_default_context())
+            except TypeError:
+                _tls.append(ssl.create_default_context())
+        return _tls[0]
+
+
+SHARED_TLS = os.environ.get("BNGE_SHARED_TLS", "1") != "0"
+_HTTPS = http.client.HTTPSConnection
+
+
 class HttpsTransport:
     """GET over one persistent HTTP(S) connection per thread and host (a fresh TLS handshake per tile
     roughly doubled the latency). No redirects are followed."""
@@ -524,8 +552,12 @@ class HttpsTransport:
             conn = conns.get(key)
             reused = conn is not None
             if conn is None:
-                cls = http.client.HTTPSConnection if u.scheme == "https" else http.client.HTTPConnection
-                conn = conns[key] = cls(u.netloc, timeout=timeout)
+                if u.scheme == "https":
+                    cls = http.client.HTTPSConnection
+                    kw = {"context": tls_context()} if SHARED_TLS and cls is _HTTPS else {}    # (tests: a stand-in)
+                    conn = conns[key] = cls(u.netloc, timeout=timeout, **kw)
+                else:
+                    conn = conns[key] = http.client.HTTPConnection(u.netloc, timeout=timeout)
             try:
                 conn.request("GET", path, headers=dict(headers, Connection="keep-alive"))
                 r = conn.getresponse()
@@ -544,12 +576,27 @@ COUNTERS = ("requests", "bytes", "s2xx", "s3xx", "s4xx", "s404", "s429", "s5xx",
             "trips", "deferred", "unavailable")
 
 
+class _Slots:
+    """Two semaphores taken for one request (a shared slot and prefetch's share), given back together."""
+    __slots__ = ("sems",)
+
+    def __init__(self, *sems):
+        self.sems = sems
+
+    def release(self):
+        for s in self.sems:
+            s.release()
+
+
 class Host:
     def __init__(self, name, policy, clock, sleep):
         self.name, self.policy = name, policy
         self.bucket = TokenBucket(policy.rate, policy.burst, clock, sleep)
         self.sem = threading.BoundedSemaphore(max(1, policy.max_conc))
         self.urgent_sem = threading.BoundedSemaphore(URGENT_CONC)  # (urgent requests' own slots, then the shared ones)
+        # (the slots prefetch / background may hold of the shared ones: PREFETCH_SLOTS)
+        self.ahead_sem = (threading.BoundedSemaphore(max(1, int(policy.max_conc * PREFETCH_SLOTS)))
+                          if PREFETCH_SLOTS > 0 else None)
         self.breaker = CircuitBreaker(policy.breaker_threshold, policy.breaker_window, policy.breaker_open,
                                       policy.breaker_max, clock)
         self.day = dict.fromkeys(COUNTERS, 0)       # this UTC day (persisted)
@@ -698,15 +745,23 @@ class Fetcher:
                 wait = h.bucket.wait_time()
                 raise RateLimited(f"{h.name}: rate limited for {wait:.1f} s", url, h.name, retry_after=wait)
             return h.sem
+        ahead = h.ahead_sem
+        if ahead is not None and not ahead.acquire(blocking=False):
+            self._bump(h, "deferred")
+            raise Deferred(f"{h.name}: {kind}'s share of the slots in use, dropped", url, h.name)
         if not h.sem.acquire(blocking=False):
+            if ahead is not None:
+                ahead.release()
             self._bump(h, "deferred")
             raise Deferred(f"{h.name}: busy, {kind} dropped", url, h.name)
         reserve = PREFETCH_RESERVE if kind == "prefetch" else BACKGROUND_RESERVE
         if not h.bucket.try_take(reserve):
             h.sem.release()
+            if ahead is not None:
+                ahead.release()
             self._bump(h, "deferred")
             raise Deferred(f"{h.name}: bucket low, {kind} dropped", url, h.name)
-        return h.sem
+        return h.sem if ahead is None else _Slots(h.sem, ahead)
 
     def _admit(self, url, kind):
         """Everything before the network: (Host, is_probe). The caller then _acquire()s per attempt."""
