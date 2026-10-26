@@ -23,7 +23,9 @@ the block's critical path and starts the critical work earlier:
 The cores come first: at 144 km/h in Munich the server's own 2 cores paused the game 9 times (98 s), with 4 cores
 once (3 s) (2026-10-26). The road plans and photos are looked ahead longer (lead_scale) only while the blocks wait
 on the road plans (their grading stage, plan_bound): more lookahead is more work at once, and a cloud drive at
-200 km/h whose blocks were short of CPU (landcover, road paint) paused longer with it (2026-10-26).
+200 km/h whose blocks were short of CPU (landcover, road paint) paused longer with it (2026-10-26). A block late on
+its road plans (a fresh place's first cells: 55-80 s in Munich) lowers the level to 1 at most: less far field and
+more blocks ahead do not bring its downloads sooner.
 
 Pure apart from the clock; earthd asks it (Server.quality) at its decisions.
 """
@@ -81,7 +83,10 @@ class Governor:
             if self.load >= DOWN_LOAD:
                 self.calm_t = now
             old = self.level
-            if (min(self.load, load) > UP_LOAD or load > 1.0) and self.level < LEVELS and now - self.step_t >= UP_HOLD_S:
+            # a block late on its road plans (a fresh place's downloads) is helped by the cores and the lookahead,
+            # not by less far field: at most level 1 for it
+            top = 1 if plan_s >= PLAN_SHARE * budget else LEVELS
+            if (min(self.load, load) > UP_LOAD or load > 1.0) and self.level < top and now - self.step_t >= UP_HOLD_S:
                 self.level += 1
                 self.step_t = now
             else:

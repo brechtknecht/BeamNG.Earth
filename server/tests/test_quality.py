@@ -56,7 +56,11 @@ class GovernorTest(unittest.TestCase):
             self.clock.t += quality.UP_HOLD_S
             self.g.record(12.0, 6.0, plan_s=9.0)
         self.assertTrue(self.g.plan_bound())
-        self.assertEqual(self.g.lead_scale(), 1.0 + quality.LEAD_STEP * 3)
+        self.assertEqual(self.g.level, 1)                        # (no far field shed for the road plans)
+        self.assertEqual(self.g.lead_scale(), 1.0 + quality.LEAD_STEP)
+        self.clock.t += quality.UP_HOLD_S
+        self.g.record(12.0, 6.0, plan_s=0.5)                     # late on the CPU: further down
+        self.assertEqual(self.g.level, 2)
 
     def test_prefetched_blocks_are_no_build_time(self):
         self.g.record(12.0, 6.0)
