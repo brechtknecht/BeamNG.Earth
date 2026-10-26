@@ -12,6 +12,7 @@ init(...) runs once in the process (ProcessPoolExecutor initializer); build(...)
 far_geometry(...) (the far-tile workers, the same state) are its jobs. warm_q (a multiprocessing queue) carries the road cells to plan ahead of the player: (anchor id, lat,
 lon, [mapcells.CellKey]), the latest list replacing the earlier one.
 """
+import itertools
 import logging
 import os
 import queue
@@ -268,13 +269,31 @@ def build(aid, lat, lon, hm_zoom, q, cx, cy, size, out_dir, name, ter_name=None,
     frame = geodesy.EnuFrame(lat, lon)
     keep = {}
     grade_s = [0.0]
+    _resolve_regions()          # (before its chunks are reused: those of a region that came out different go)
+    half = size * heightmap.SQUARE / 2
+    reg, rid = None, None
+    if g is not None:
+        try:                    # its cells not planned yet: the plans of the roads near it (grading.Grader.region)
+            reg = g.region((cx - half - REGION_PAD_M, cy - half - REGION_PAD_M, cx + half + REGION_PAD_M,
+                            cy + half + REGION_PAD_M))
+        except Exception:       # (the cells' whole plans, waited for)
+            log.exception("block region (%s, %s)", cx, cy)
+    with _s.lock:
+        tags = _regions_state().setdefault(("tags", aid), {})
+        if reg is not None:
+            rid = next(_REGION_IDS)
+            _regions_state()[rid] = [aid, reg, None]
+    if reg is not None or tags:
+        chunks = _TaggedChunks(chunks, tags, rid, _s.lock)
+    _s.building, _s.building_more = reg, []    # (the tunnels' ends graded from it too: _region_over)
+    t_heights = time.perf_counter()
 
     def elev(la, lo):
         z = ground(frame, la, lo, _s.dem.sample(la, lo, hm_zoom))
         if g is None:
             return z
         t1 = time.perf_counter()
-        z = g.apply(la, lo, z, gradingmod.ROAD_LIFT)
+        z = g.apply(la, lo, z, gradingmod.ROAD_LIFT, region=reg)
         grade_s[0] += time.perf_counter() - t1
         return z
     import roads as roadsmod
@@ -282,7 +301,6 @@ def build(aid, lat, lon, hm_zoom, q, cx, cy, size, out_dir, name, ter_name=None,
     gen = elev
     if ter_name is not None and getattr(_s, "md", None) is not None:
         tun = tunnel_profiles(aid, frame, elev, g)
-        half = size * heightmap.SQUARE / 2
         cell_fn = lambda key: _s.md.cell(key, layers=("roads",), kind="demand").layers.get("roads")   # noqa: E731
 
         def gen(la, lo):        # the ground over the low arches raised over their vaults (roads.arch_raise)
@@ -291,6 +309,11 @@ def build(aid, lat, lon, hm_zoom, q, cx, cy, size, out_dir, name, ter_name=None,
     info = heightmap.generate(frame, gen, os.path.join(out_dir, name), cx, cy, q=q, size=size, keep=keep,
                               chunks=chunks)
     stages = {"heights": time.perf_counter() - t0, "grading": grade_s[0]}
+    if reg is not None:
+        stages["region"] = t_heights - t0
+    deps = set(chunks.used) if isinstance(chunks, _TaggedChunks) else set()
+    if rid is not None:
+        deps.add(rid)
     idx = None
     if _s.surface is not None:
         t1 = time.perf_counter()
@@ -303,7 +326,8 @@ def build(aid, lat, lon, hm_zoom, q, cx, cy, size, out_dir, name, ter_name=None,
         t1 = time.perf_counter()
         if road_feats:
             idx = surfacemod.paint_roads(idx, keep["lat"], keep["lon"], road_feats, heightmap.SQUARE,
-                                         _s.surface.urban, _s.widths, _open_tunnels(g, keep))
+                                         _s.surface.urban, reg.widths if reg is not None and reg.widths is not None
+                                         else _s.widths, _open_tunnels(g, keep, reg))
         idx = (surfacemod.paint_lots(idx, keep["lat"], keep["lon"], _s.surface.lots(keep["lat"], keep["lon"]))
             if hasattr(_s.surface, "lots") else idx)
         if hasattr(_s.surface, "fuel_pads"):    # gas station forecourts (--gas-stations on)
@@ -319,7 +343,151 @@ def build(aid, lat, lon, hm_zoom, q, cx, cy, size, out_dir, name, ter_name=None,
             info["mats"] = mats
         stages["ter"] = time.perf_counter() - t1
     info["stages"] = stages
+    whole = [(rid, reg)] if reg is not None else []
+    with _s.lock:
+        for more in _s.building_more:       # (the regions its tunnels' portals were graded from)
+            whole.append((next(_REGION_IDS), more))
+            _regions_state()[whole[-1][0]] = [aid, more, None]
+            _regions_state()[("parent", whole[-1][0])] = rid     # (its heights in rid's chunks)
+            deps.add(whole[-1][0])
+        if deps:                # graded from region plans (its own or its reused chunks'): told apart later (region_poll)
+            _regions_state()[("block", aid, cx, cy)] = deps
+            info["gradePending"] = True
+    _s.building, _s.building_more = None, []
+    for r_id, r in whole:       # (after the block: its cells' whole plans wait for the cells around)
+        threading.Thread(target=_plan_whole, args=(g, r_id, r), daemon=True, name="region-whole").start()
     return info
+
+
+REGION_PAD_M = 16.0         # m around a block's lattice its region's box reaches (its samples' surface points)
+_REGION_IDS = itertools.count(1)
+
+
+def _regions_state():
+    """The blocks graded from region plans in this process (under _s.lock): region id -> [anchor id, grading.Region,
+    None while unresolved / True: as the cells' whole plans / False: not, + "applied" once _resolve_regions has];
+    ("tags", anchor id) -> {height chunk key: the region id it was graded from}; ("block", anchor id, cx, cy) -> {the
+    region ids its heights came from}; ("parent", region id) -> the block region whose chunks a tunnel portal's region
+    (_region_over) went into; "done" -> [(block key, same)] resolved since the last region_poll."""
+    st = getattr(_s, "regions", None)
+    if st is None:
+        st = _s.regions = {"done": []}
+    return st
+
+
+class _TaggedChunks:
+    """A heightmap.ChunkCache as a block build sees it while regions are unresolved: the chunks it makes are tagged with
+    its region id (rid; untagged: whole plans), and the tagged chunks it reuses are noted (used: their region ids)."""
+
+    def __init__(self, cache, tags, rid, lock):
+        self.cache, self.tags, self.rid, self.lock, self.used = cache, tags, rid, lock, set()
+
+    def get(self, k):
+        u = self.cache.get(k)
+        if u is not None:
+            with self.lock:
+                r = self.tags.get(k)
+            if r is not None:
+                self.used.add(r)
+        return u
+
+    def put(self, k, u):
+        self.cache.put(k, u)
+        with self.lock:
+            if self.rid is None:
+                self.tags.pop(k, None)
+            else:
+                self.tags[k] = self.rid
+
+
+def _region_over(g, la, lo):
+    """While a block is built from a region (build: _s.building): the region that grades the points, its own when it
+    holds them, else one made for them (a tunnel's portal beyond the block: its cells planned whole waited for the
+    cells around too; kept in _s.building_more, the block's too); None otherwise."""
+    reg = getattr(_s, "building", None)
+    if reg is None or not np.size(la):
+        return None
+    e, n, _ = g.frame.geodetic_to_enu(np.asarray(la, np.float64).ravel(), np.asarray(lo, np.float64).ravel(), 0.0)
+    e, n = np.asarray(e), np.asarray(n)
+    for r in [reg] + _s.building_more:
+        x0, y0, x1, y1 = r.box
+        if e.min() >= x0 and e.max() <= x1 and n.min() >= y0 and n.max() <= y1:
+            return r
+    m = REGION_PAD_M
+    more = g.region((float(e.min()) - m, float(n.min()) - m, float(e.max()) + m, float(n.max()) + m))
+    if more is not None:
+        _s.building_more.append(more)
+    return more
+
+
+def _plan_whole(g, rid, reg):
+    """A region's cells planned whole, then the region told apart from them (grading.Region.same; a thread)."""
+    for k in reg.keys:
+        try:
+            g.warm(k)
+        except Exception as e:
+            log.debug("whole plans of %s: %s: %s", k, type(e).__name__, e)
+    try:
+        same = bool(reg.same(g))        # (None: a cell's roads not at hand: built again)
+    except Exception:
+        log.exception("block region %s against its cells' whole plans", rid)
+        same = False
+    log.log(logging.DEBUG if same else logging.INFO, "block region %s %s its cells' whole plans (cells not read: %s)",
+            tuple(round(c) for c in reg.box), "as" if same else "differs from", ", ".join(reg.missed) or "none")
+    with _s.lock:
+        v = _regions_state().get(rid)
+        if v is not None:
+            v[2] = same
+
+
+def _resolve_regions():
+    """The regions told apart (_plan_whole) applied: one that came out different has its chunks dropped (its blocks are
+    built again from the whole plans), and so has the anchor's TunnelProfiles here (their ends graded from it). The
+    blocks whose regions are all resolved go to "done" (same: all as the whole plans)."""
+    if _s is None or getattr(_s, "regions", None) is None:
+        return
+    with _s.lock:
+        st = _regions_state()
+        todo = [(rid, v) for rid, v in st.items() if isinstance(rid, int) and v[2] is not None and len(v) == 3]
+        todo.sort(key=lambda rv: bool(rv[1][2]))        # (the different ones first: their parents' chunks go too)
+        waiting = {p for k, p in st.items()
+                   if isinstance(k, tuple) and k[0] == "parent" and st.get(k[1], [0, 0, None])[2] is None}
+    for rid, v in todo:
+        if v[2] and rid in waiting:     # (a portal's region of its block still unresolved: its chunks kept tagged)
+            continue
+        aid, reg, same = v
+        v.append("applied")
+        if not same and getattr(_s, "tunnels", None) is not None:
+            _s.tunnels.pop(aid, None)
+        with _s.lock:
+            tags = st.get(("tags", aid), {})
+            parent = st.pop(("parent", rid), None)
+            ids = {rid} if same else {rid, parent}
+            gone = [k for k, r in tags.items() if r in ids]
+            for k in gone:
+                del tags[k]
+        if not same and gone and aid in _s.chunks:
+            _s.chunks[aid].drop(gone)
+    with _s.lock:
+        for bk in [k for k in st if isinstance(k, tuple) and k[0] == "block"]:
+            states = [st[r][2] if r in st else True for r in st[bk]]
+            if False in states or all(states):
+                st["done"].append((bk[1:], False not in states))
+                del st[bk]
+        live = {r for k, v in st.items() if isinstance(k, tuple) and k[0] == "block" for r in v}
+        for rid in [r for r, v in st.items() if isinstance(r, int) and len(v) > 3 and r not in live]:
+            del st[rid]
+
+
+def region_poll():
+    """The blocks graded from region plans resolved since the last call: [((anchor id, cx, cy), same)] (same False: to
+    be built again)."""
+    _resolve_regions()
+    if getattr(_s, "regions", None) is None:
+        return []
+    with _s.lock:
+        done, _s.regions["done"] = _s.regions["done"], []
+    return done
 
 
 def _bridges(aid, frame, elev):
@@ -607,12 +775,13 @@ def _tile_decks(bridges, cells, tx, ty):
         return []
 
 
-def _open_tunnels(g, keep):
-    """The tunnels' open sections over a block (grading.Grader.open_tunnels; none without a grader)."""
+def _open_tunnels(g, keep, region=None):
+    """The tunnels' open sections over a block (grading.Grader.open_tunnels; none without a grader; region: the block's
+    grading.Region, if it has one)."""
     if g is None:
         return []
     try:
-        return g.open_tunnels(keep["lat"], keep["lon"])
+        return g.open_tunnels(keep["lat"], keep["lon"], region)
     except Exception:
         log.exception("open tunnel sections")
         return []
@@ -654,7 +823,8 @@ def tunnel_profiles(aid, frame, elev, g=None):
             t.wet = sea.depth if sea is not None else None
             t.raw = lambda la, lo: ground(frame, la, lo, _s.dem.sample(la, lo, gradingmod.PROFILE_ZOOM))  # noqa: E731
             if g is not None:
-                t.ends = lambda la, lo: g.apply(la, lo, t.raw(la, lo), gradingmod.ROAD_LIFT, roads_only=True)    # noqa: E731
+                t.ends = lambda la, lo: g.apply(la, lo, t.raw(la, lo), gradingmod.ROAD_LIFT, roads_only=True,  # noqa: E731
+                                                region=_region_over(g, la, lo))
             for old in sorted(_s.tunnels)[:-ANCHORS_KEPT]:
                 del _s.tunnels[old]
         return t

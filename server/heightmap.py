@@ -147,6 +147,12 @@ class ChunkCache:
             while len(self.chunks) > self.cap:
                 self.chunks.popitem(last=False)
 
+    def drop(self, keys):
+        """Forget these chunks (graded from plans that turned out different: blockworker._resolve_regions)."""
+        with self.lock:
+            for k in keys:
+                self.chunks.pop(k, None)
+
 
 def grid_u_chunked(frame, elev_fn, cx, cy, size, cache, keep=None):
     """grid_u through a ChunkCache: elev_fn runs once, on the samples of the chunks the cache lacks.
