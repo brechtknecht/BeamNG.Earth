@@ -329,25 +329,28 @@ local function itemType(shape, solid)
 end
 
 -- The variant of a group for an item of height h: those within 0.8 .. 1.25 of it (else 0.6 .. 1.6), picked by the
--- item's rank; else the nearest. Returns shape, scale.
+-- item's rank; else the nearest. Returns shape, scale. (No tables made: a call for every row of every new tile.)
+local RANGES = { { 0.8, 1.25 }, { 0.6, 1.6 } }
+local cands = {}
 function M.pick(group, h, rank)
   local list = M.CATALOG[group] or M.CATALOG.deciduous
-  local cands = {}
-  for _, range in ipairs({ { 0.8, 1.25 }, { 0.6, 1.6 } }) do      -- near its size first, then wider
+  local nc = 0
+  for _, range in ipairs(RANGES) do      -- near its size first, then wider
     for _, v in ipairs(list) do
-      if v[2] >= h * range[1] and v[2] <= h * range[2] then cands[#cands + 1] = v end
+      if v[2] >= h * range[1] and v[2] <= h * range[2] then nc = nc + 1; cands[nc] = v end
     end
-    if #cands > 0 then break end
+    if nc > 0 then break end
   end
-  if #cands == 0 then
-    local best, bd
-    for _, v in ipairs(list) do
-      local d = math.abs(math.log(v[2] / math.max(h, 0.1)))
-      if not bd or d < bd then best, bd = v, d end
+  local v
+  if nc == 0 then
+    local bd
+    for _, c in ipairs(list) do
+      local d = math.abs(math.log(c[2] / math.max(h, 0.1)))
+      if not bd or d < bd then v, bd = c, d end
     end
-    cands = { best }
+  else
+    v = cands[math.floor(rank * 7919) % nc + 1]
   end
-  local v = cands[math.floor(rank * 7919) % #cands + 1]
   return v[1], math.max(0.3, math.min(2.5, h / v[2]))
 end
 
@@ -356,9 +359,17 @@ local releaseGhosts
 local groupBand
 
 -- Pure: the variant v's spelling of a shape path (0: itself).
+local spelled = {}       -- shape -> { v -> its spelling } (no new string a row)
 function M.variant(shape, v)
   if not v or v <= 0 then return shape end
-  return (shape:gsub('/([^/]+)$', '/' .. string.rep('./', v) .. '%1'))
+  local c = spelled[shape]
+  if not c then c = {}; spelled[shape] = c end
+  local sp = c[v]
+  if not sp then
+    sp = shape:gsub('/([^/]+)$', '/' .. string.rep('./', v) .. '%1')
+    c[v] = sp
+  end
+  return sp
 end
 
 -- Pure: a tile's shape variant from its key ("a:tx_ty" / "a:ptx_ty"): neighbours differ.
@@ -609,6 +620,7 @@ M.tileThreshold = tileThreshold
 
 -- The solid cells of tile t for the car f {x, y; moving at FAST_MS or more: ux, uy (its direction), lead (m)}: a
 -- string of one '1' or '0' per CELL_M cell, row by row from the tile's south-west corner, or '' when none is.
+local maskBuf = {}      -- (cellMask's, reused: every cell is written each call)
 function M.cellMask(t, f)
   local n = math.floor(256 / M.CELL_M)
   local round, hyst = M.SOLID_M, M.SOLID_HYST_M
@@ -622,7 +634,7 @@ function M.cellMask(t, f)
   end
   local old, half = t.mask or '', M.CELL_M * 0.7072
   local x0, y0 = t.cx - 128 - f.x, t.cy - 128 - f.y
-  local out, any = {}, false
+  local out, any = maskBuf, false
   for j = 0, n - 1 do
     for i = 0, n - 1 do
       local k = j * n + i + 1
@@ -637,7 +649,7 @@ function M.cellMask(t, f)
       any = any or on
     end
   end
-  return any and table.concat(out) or ''
+  return any and table.concat(out, '', 1, n * n) or ''
 end
 
 -- Does cell mask new turn off a cell solid in old?
@@ -677,26 +689,40 @@ function M.cellsOf(t)
   return t.cells
 end
 
--- The rows of tile t in the cells whose bit differs between masks old and new, and the rows in extra, in row order.
-function M.changedRows(t, old, new, extra)
-  local out = {}
-  local changed, any = {}, false
+-- The rows of tile t in the cells whose bit differs between masks old and new and those in extra (left over from an
+-- earlier frame): extra's first, then the changed cells' nearest the car {x, y} first (a frame's budget may end in the
+-- list). Read only by the caller: extra itself when no cell changed. (No set of extra's rows, no scan of every row:
+-- at 307 km/h that made ~3 MB of garbage a second, the replay 2026-10-26.)
+local changedCells, cellOrder, cellDist = {}, {}, {}
+function M.changedRows(t, old, new, extra, car)
+  local n = math.floor(256 / M.CELL_M)
+  local nc = 0
   if old ~= new then
-    local n = math.floor(256 / M.CELL_M)
+    local x0, y0 = t.cx - 128 - (car and car.x or t.cx), t.cy - 128 - (car and car.y or t.cy)
     for k = 1, n * n do
-      if (old:byte(k) == 49) ~= (new:byte(k) == 49) then changed[k], any = true, true end
+      local c = (old:byte(k) == 49) ~= (new:byte(k) == 49)
+      changedCells[k] = c
+      if c then
+        local dx, dy = x0 + ((k - 1) % n + 0.5) * M.CELL_M, y0 + (math.floor((k - 1) / n) + 0.5) * M.CELL_M
+        nc = nc + 1
+        cellOrder[nc], cellDist[k] = k, dx * dx + dy * dy
+      end
     end
   end
-  if not any then
-    for _, i in ipairs(extra or {}) do out[#out + 1] = i end
-    return out
-  end
-  local more = {}
-  for _, i in ipairs(extra or {}) do more[i] = true end
+  if nc == 0 then return extra or {} end
+  for q = nc + 1, #cellOrder do cellOrder[q] = nil end
+  table.sort(cellOrder, function(a, b) return cellDist[a] < cellDist[b] end)
   cellRows(t)
-  local cells = t.cells
-  for i = 1, t.n do
-    if changed[cells[i]] or more[i] then out[#out + 1] = i end
+  local out, cr, cells = {}, t.cellRows, t.cells
+  if extra then
+    for q = 1, #extra do
+      local i = extra[q]
+      if not changedCells[cells[i]] then out[#out + 1] = i end
+    end
+  end
+  for q = 1, nc do
+    local l = cr[cellOrder[q]]
+    if l then for r = 1, #l do out[#out + 1] = l[r] end end
   end
   return out
 end
@@ -894,7 +920,7 @@ function M.update(anchorId, player, view)
       -- only solid cells changed: those cells' rows and the ones left over (t.pendingRows), else every row
       local idxs = nil
       if want == t.shown and band == t.band and all == t.all and (not t.pending or t.pendingRows) then
-        idxs = M.changedRows(t, t.mask or '', mask, t.pending and t.pendingRows or nil)
+        idxs = M.changedRows(t, t.mask or '', mask, t.pending and t.pendingRows or nil, car)
       end
       if rowsScanned > M.ROWS_PER_FRAME then finish(); return end
       -- (the tile's state is what it shows once its rows are done: the rows not done yet are its pendingRows)
