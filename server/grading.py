@@ -56,6 +56,16 @@ CLIP_MARGIN_M = 400.0
 PLAN_THREADS = 4            # cells planned at once (_plan_missing)
 PLAN_SETS_MAX = 16          # cell sets whose merged plans are kept (Grader._plan_set; ~1 MB each in a town)
 SPREAD_CELLS = 16           # plans(): more map cells in the points' bbox: only the cells around the points
+# A block's region (Grader.region, 2026-10-26): a block whose cells are not planned yet is graded from the plans of only
+# the roads near it, made from its own cells' map data (and any other cell on disk already), instead of waiting for
+# its cells' whole plans, each of which waited for the map data of the 8 cells around it (the bridges a road crosses
+# under, the roads a road goes on in): a fresh place's first follow block waited 79 s in Munich, its cells planned
+# in 79-104 s while their own roads took 13-17 s. The cells' whole plans are still made (the lookahead, the road
+# tiles); Region.same then tells whether the block came out as they make it (blockworker.region_poll: it is built
+# again when not).
+REGION_ON = os.environ.get("BNE_GRADE_REGION", "on") != "off"
+REGION_REACH_M = 80.0       # m: the roads whose lines come this near the block are planned (a plan grades its core half
+                            # width + T_MAX from its line: ~30 m for the widest motorway)
 T_MIN, T_MAX = 5.0, 12.0    # m, transition back to the natural ground (5: roads close together meet gently)
 SLOPE_RUN = 2.0             # transition = SLOPE_RUN x the height difference (1:2 slope)
 VERTEX_STEP = 4.0           # m between the plan's vertices (segments for the grading pass; linear between: at 16 m a
@@ -532,8 +542,9 @@ class Grader:
             self.opens.setdefault(key, opens)
             return self.cells[key]
 
-    def _make_cell(self, key):
-        """(plans, keeps, covers, opens) of cell key, or None when its roads could not be fetched."""
+    def _make_cell(self, key, box=None):
+        """(plans, keeps, covers, opens) of cell key, or None when its roads could not be fetched. box: only the roads,
+        tunnels and railways whose lines come within REGION_REACH_M of box (x0, y0, x1, y1) in the frame (region)."""
         t0 = time.perf_counter()
         try:
             feats = self.md.cell(key, layers=("roads",), kind="demand").layers.get("roads")
@@ -547,7 +558,7 @@ class Grader:
         if feats is not None and len(feats):
             specs = roadsmod.road_specs(feats, None, self.widths)
             parts, ids, clipped = [], [], []
-            box = self._clip_box(key)
+            clip = self._clip_box(key)
             keeps = []
             for i in range(len(feats)):
                 if specs[i] is not None and specs[i].cls in UNGRADED:
@@ -559,8 +570,10 @@ class Grader:
                 if specs[i] is None:
                     continue
                 for ring in roadsmod.ground_parts(feats, i):     # not bridges / tunnels
-                    pieces = self._near_cell(np.asarray(ring, np.float64), box)
+                    pieces = self._near_cell(np.asarray(ring, np.float64), clip)
                     for r in pieces:
+                        if box is not None and not self._meets(r, box):
+                            continue
                         parts.append((r, specs[i]))
                         ids.append(str(feats.ids[i]))
                         clipped.append(len(pieces) > 1 or r is not ring)
@@ -610,6 +623,8 @@ class Grader:
                     rcells = [self.md.cell(k, layers=("roads",), kind="demand").layers.get("roads")
                               for k in railways.cells_near(self.frame, own)]
                     for fid, xy, z in railways.grade_plans(self.frame, rcells, own, self.elev):
+                        if box is not None and not _xy_meets(xy, _grow(box, REGION_REACH_M)):
+                            continue    # (clipped to the cell as in its whole plans, then left out)
                         p = Plan(xy, z, railways.GRADE_HALF_M)
                         p.rid = road_id(RAIL_TAG + fid)
                         plans.append((RAIL_TAG + fid, p))
@@ -621,7 +636,7 @@ class Grader:
                 for (fid, p), cl in zip(plans, pclip):
                     kept.extend((fid, q) for q in (trim_plan(p, own) if cl else [p]))
                 plans = kept
-            secs = self._tunnel_sections(feats, key, [p for _f, p in plans])
+            secs = self._tunnel_sections(feats, key, [p for _f, p in plans], box)
             plans.extend((fid + TUNNEL_TAG, Plan(xy, z, spec.width / 2 + shoulder(spec)))
                          for fid, spec, xy, z, k in secs if k == 0)
             plans.extend(self._mouth_plans(secs))
@@ -629,9 +644,16 @@ class Grader:
             opens = [(xy, spec) for _f, spec, xy, _z, k in secs if k == 0]
         else:
             covers, opens, keeps = [], [], []
-        log.info("grading: cell %s planned in %.2f s (its roads %.2f s, %d plans)", key, time.perf_counter() - t0,
-                 t1 - t0, len(plans))
+        log.info("grading: cell %s%s planned in %.2f s (its roads %.2f s, %d plans)", key,
+                 "" if box is None else " (a block's region)", time.perf_counter() - t0, t1 - t0, len(plans))
         return plans, keeps, covers, opens
+
+    def _meets(self, ring, box):
+        """Whether lon/lat ring's line comes within REGION_REACH_M of box (x0, y0, x1, y1) in the frame."""
+        e, n, _ = self.frame.geodetic_to_enu(ring[:, 1], ring[:, 0], 0.0)
+        e, n = np.asarray(e), np.asarray(n)
+        m = REGION_REACH_M
+        return bool(e.max() >= box[0] - m and e.min() <= box[2] + m and n.max() >= box[1] - m and n.min() <= box[3] + m)
 
     def _chain_cands(self, key, feats=None, specs=None):
         """The graded ground parts of cell key's roads, as the continuations at a node in it are looked for (every cell
@@ -1246,16 +1268,18 @@ class Grader:
             self._chains = t
         return self._chains
 
-    def _tunnel_sections(self, feats, key=None, road_plans=()):
+    def _tunnel_sections(self, feats, key=None, road_plans=(), box=None):
         """[(fid, spec, xy, z, kind)] of the tunnels' sections (roads.tunnel_sections on the ungraded ground, its
         ends graded by road_plans: the cell's road Plans, as roads.TunnelProfiles.ends grades them with the roads'
-        plans alone): kind 0 an open road at z, 1 a low arch, 2 a full tunnel."""
+        plans alone): kind 0 an open road at z, 1 a low arch, 2 a full tunnel. box: only the tunnels near it (_meets)."""
         out = []
         ts = roadsmod.tunnel_specs(feats)
         for i in range(len(feats)):
             if ts[i] is None:
                 continue
             for j, ring in enumerate(roadsmod.tunnel_parts(feats, i)):
+                if box is not None and not self._meets(np.asarray(ring, np.float64), box):
+                    continue
                 ring = self._longest(str(feats.ids[i]), j, ring, key)
                 ll = np.asarray(ring, np.float64)
                 if len(ll) < 2:
@@ -1408,36 +1432,87 @@ class Grader:
                 memo[mk] = out
         return out
 
-    def apply(self, lat, lon, base, lift=0.0, roads_only=False, planned_only=False):
+    def region(self, box):
+        """A Region for the block over box (x0, y0, x1, y1) in the frame: the plans of the roads near it (REGION_REACH_M)
+        in the cells its points reach, made now from those cells' map data alone (and any other cell on disk), or None
+        when those cells are all planned already (or REGION_ON is off): apply(region=) then grades as their whole plans
+        would, as far as the cells around did not count (Region.same)."""
+        if not REGION_ON or not hasattr(self.md, "has"):
+            return None
+        t = np.linspace(0.0, 1.0, 9)
+        x0, y0, x1, y1 = box
+        ex = np.r_[x0 + (x1 - x0) * t, x0 + (x1 - x0) * t, np.full(9, x0), np.full(9, x1)]
+        ny = np.r_[np.full(9, y0), np.full(9, y1), y0 + (y1 - y0) * t, y0 + (y1 - y0) * t]
+        la, lo, _ = self.frame.enu_to_geodetic(ex, ny, 0.0)
+        keys = self._keys(la, lo)
+        with self.lock:
+            if all(k in self.cells for k in keys):
+                return None
+        t0 = time.perf_counter()
+        view = _Within(self.md, keys)
+        widths = _RegionWidths(self.widths, view) if self.widths is not None else None
+        sub = Grader(self.frame, view, self.elev, widths)
+        sub.wet = self.wet
+        dem = getattr(self, "dem", None)
+        urgent = dem is not None and hasattr(dem, "urgent")     # (the block waits for it: ahead of the lookahead's tiles)
+        failed = []
+
+        def one(k):
+            with self.lock:
+                if k in self.cells:         # (planned whole meanwhile: those)
+                    return self.cells[k], self.keeps.get(k, []), self.covers.get(k, []), self.opens.get(k, [])
+            with dem.urgent() if urgent else _nullctx():
+                got = sub._make_cell(k, box)
+            if got is None:
+                failed.append(k)
+                return [], [], [], []
+            return got
+        with ThreadPoolExecutor(min(len(keys), PLAN_THREADS), thread_name_prefix="region") as ex_:
+            cells = list(ex_.map(one, keys))
+        reg = Region(box, keys, cells, sorted(view.missed) + [str(k) for k in failed])
+        reg.widths = widths
+        log.info("grading: block region %s planned in %.2f s from %d cells (%d plans; cells not read: %s)",
+                 tuple(round(v) for v in box), time.perf_counter() - t0, len(keys), len(reg.plans),
+                 ", ".join(reg.missed) or "none")
+        return reg
+
+    def apply(self, lat, lon, base, lift=0.0, roads_only=False, planned_only=False, region=None):
         """base (the ungraded heights at the points) graded under the roads. Same shape as base.
         lift: m added under the roads (tapering with the grading's weight): the physics block and the
         road mesh use ROAD_LIFT, the visible ground tiles 0, so the road mesh lies exactly on the
         ground the tyres touch while the visible ground stays a little below it (no z-fighting;
         2026-10-11 the user saw the tyres sink into a road mesh lifted above the physics ground).
         planned_only: graded only under the cells planned already (none planned here: the AI graph's wide window, whose
-        planning held a Windows PC's road processes for minutes, 2026-10-25)."""
+        planning held a Windows PC's road processes for minutes, 2026-10-25). region: a Region (region()) whose box holds
+        the points: graded from its plans."""
         lat = np.asarray(lat, np.float64)
         lon = np.asarray(lon, np.float64)
         base = np.asarray(base, np.float64)
         shape = base.shape
         if base.size == 0:
             return base
-        keys = self._keys(lat, lon)
-        if planned_only:
+        if region is not None:
+            plans, pack = region.pack_of(roads_only)
             with self.lock:
-                keys = [k for k in keys if k in self.cells]
-            if not keys:
-                return base
-        plans, pack = self._plan_set(keys, roads_only)
+                keeps, covers = region.zones("keeps", self.keeps), region.zones("covers", self.covers)
+        else:
+            keys = self._keys(lat, lon)
+            if planned_only:
+                with self.lock:
+                    keys = [k for k in keys if k in self.cells]
+                if not keys:
+                    return base
+            plans, pack = self._plan_set(keys, roads_only)
+            keeps = covers = None
         if not plans:
             return base
         e, n, _ = self.frame.geodetic_to_enu(lat.ravel(), lon.ravel(), 0.0)
         e, n = np.asarray(e), np.asarray(n)
         out = grade_points(e, n, base.ravel(), pack, lift)
-        race = self._on_kept(e, n)
+        race = self._on_kept(e, n, keeps)
         if race is not None:                # (the terrain is a racetrack's surface: GitHub #143)
             out[race] = base.ravel()[race]
-        keep = self._over_tunnels(e, n)
+        keep = self._over_tunnels(e, n, covers)
         if keep is not None:
             # (a small change stays: a road over the tunnel lies on its own graded profile, the ground over the tunnel
             # left ungraded under it stood a few cm over the E6's lanes as patches of bare ground, GitHub #2)
@@ -1445,18 +1520,22 @@ class Grader:
             out[keep] = base.ravel()[keep]
         return out.reshape(shape)
 
-    def open_tunnels(self, lat, lon):
+    def open_tunnels(self, lat, lon, region=None):
         """[(lat (k,), lon (k,), Spec)] of the tunnels' open sections planned near the points: roads on the ground
         that the map calls tunnels (surface.paint_roads paints them: grass grew over the open road of Central Park's
-        79th Street Transverse, 2026-10-17)."""
+        79th Street Transverse, 2026-10-17). region: a Region over the points (region()): its sections."""
         lat = np.asarray(lat, np.float64)
         lon = np.asarray(lon, np.float64)
         if lat.size == 0:
             return []
-        for key in mapcells.cells_for_points(lat, lon):
-            self._cell_plans(key)
-        with self.lock:
-            secs = [o for v in self.opens.values() for o in v]
+        if region is not None:
+            with self.lock:
+                secs = region.zones("opens", self.opens)
+        else:
+            for key in mapcells.cells_for_points(lat, lon):
+                self._cell_plans(key)
+            with self.lock:
+                secs = [o for v in self.opens.values() for o in v]
         out, seen = [], set()
         for xy, spec in secs:
             k = (round(float(xy[0, 0]), 2), round(float(xy[0, 1]), 2), len(xy))
@@ -1471,10 +1550,12 @@ class Grader:
             out.append((la, lo, spec))
         return out
 
-    def _on_kept(self, e, n):
-        """Which points lie on an UNGRADED road's carriageway (+ UNGRADED_MARGIN_M), or None."""
-        with self.lock:
-            zones = [z for v in self.keeps.values() for z in v]
+    def _on_kept(self, e, n, zones=None):
+        """Which points lie on an UNGRADED road's carriageway (+ UNGRADED_MARGIN_M), or None. zones: those carriageways
+        (a Region's), else every planned cell's."""
+        if zones is None:
+            with self.lock:
+                zones = [z for v in self.keeps.values() for z in v]
         if not zones or not len(e):
             return None
         import fast
@@ -1485,10 +1566,12 @@ class Grader:
             fast._ef.over_tunnel(mask, ee, nn, np.ascontiguousarray(xy[:, :2], np.float64), float(hw), 0.0)
         return mask if mask.any() else None
 
-    def _over_tunnels(self, e, n):
-        """Which points lie over a covered tunnel (its half width + TUNNEL_KEEP_M), or None."""
-        with self.lock:
-            zones = [z for v in self.covers.values() for z in v]
+    def _over_tunnels(self, e, n, zones=None):
+        """Which points lie over a covered tunnel (its half width + TUNNEL_KEEP_M), or None. zones: those tunnels (a
+        Region's), else every planned cell's."""
+        if zones is None:
+            with self.lock:
+                zones = [z for v in self.covers.values() for z in v]
         if not zones or not len(e):
             return None
         import fast
@@ -1499,6 +1582,169 @@ class Grader:
             fast._ef.over_tunnel(mask, ee, nn, np.ascontiguousarray(xy[:, :2], np.float64), float(hw),
                                  float(TUNNEL_KEEP_IN_M))
         return mask if mask.any() else None
+
+
+def _nullctx():
+    import contextlib
+    return contextlib.nullcontext()
+
+
+def _grow(box, m):
+    return box[0] - m, box[1] - m, box[2] + m, box[3] + m
+
+
+def _xy_meets(xy, box):
+    xy = np.asarray(xy, np.float64)
+    return bool(xy[:, 0].max() >= box[0] and xy[:, 0].min() <= box[2] and xy[:, 1].max() >= box[1] and
+                xy[:, 1].min() <= box[3])
+
+
+class _NoCell:
+    layers = {}
+
+
+class _Within:
+    """A MapData as a Region's plans see it (Grader.region): the cells it was made for, and any other cell whose layers
+    are on disk already; any other cell is empty here, or raises OSError with strict (missed: the plans near it may
+    differ from the whole cells')."""
+
+    def __init__(self, md, keys):
+        self.md, self.keys, self.missed = md, {str(k) for k in keys}, set()
+        self.lock = threading.Lock()
+
+    def cell(self, key, layers=("roads",), kind="demand", strict=False):
+        if str(key) in self.keys or all(self.md.has(key, ly) for ly in layers):
+            return self.md.cell(key, layers=layers, kind=kind)
+        with self.lock:
+            self.missed.add(str(key))
+        if strict:
+            raise OSError(f"cell {key} is not read for a block's region")
+        return _NoCell
+
+    def __getattr__(self, name):
+        return getattr(self.md, name)
+
+
+class _RegionWidths:
+    """The street widths (roadwidth.RoadWidths.get) as a Region's plans see them: a road's width decided already, else
+    measured between the buildings of the region's cells alone (its own RoadWidths: the walls of a cell take the
+    buildings of the 8 around it; those not on disk count as missing, never stored). used: fid -> (geometry, the width
+    it gave)."""
+
+    def __init__(self, widths, view):
+        import roadwidth
+        self.real = getattr(widths, "__self__", None)
+        self.fallback = widths if self.real is None else None
+        self.mine = None if self.real is None else roadwidth.RoadWidths(
+            lambda k: view.cell(k, layers=("buildings",), kind="demand", strict=True).layers.get("buildings"),
+            self.real.store_dir)
+        self.used = {}
+        self.lock = threading.Lock()
+
+    def __call__(self, fid, lonlat):
+        if self.real is None:
+            return self.fallback(fid, lonlat)
+        with self.real.lock:
+            if fid in self.real.memo:
+                return self.real.memo[fid]
+        got = self.mine.get(fid, lonlat)
+        with self.lock:
+            self.used.setdefault(fid, (lonlat, got))
+        return got
+
+    def same(self):
+        """Whether every width it measured is the real one (those not decided there yet are measured now: it waits for
+        their buildings)."""
+        if self.real is None:
+            return True
+        with self.lock:
+            used = dict(self.used)
+        return all(self.real.get(fid, ll) == w for fid, (ll, w) in used.items())
+
+
+class Region:
+    """The road plans over one block (Grader.region): plans and PlanPack as Grader._plan_set makes them (each road once,
+    in its order), the cells' kept carriageways, tunnels' covers and open sections, and which cells (by str key) its
+    plans did not read (missed) or could not fetch."""
+
+    def __init__(self, box, keys, cells, missed):
+        self.box, self.keys, self.missed = box, list(keys), list(missed)
+        self.widths = None          # its _RegionWidths (region()), or None
+        self.cells = {str(k): c for k, c in zip(keys, cells)}
+        self.rows = _merged([c[0] for c in cells])
+        self.plans = [p for _k, p in self.rows]
+        self._packs = {}
+        self.own = {"keeps": [z for c in cells for z in c[1]], "covers": [z for c in cells for z in c[2]],
+                    "opens": [z for c in cells for z in c[3]]}
+
+    def pack_of(self, roads_only=False):
+        got = self._packs.get(roads_only)
+        if got is None:
+            plans = [p for k, p in self.rows if not (roads_only and TUNNEL_TAG in k[0])]
+            got = self._packs[roads_only] = (plans, PlanPack(plans))
+        return got
+
+    def zones(self, name, every):
+        """Its own kept carriageways, covers or open sections (name: keeps, covers, opens) and those of the other cells
+        planned in every (the Grader's dict of them, cell key -> list; taken under its lock)."""
+        return self.own[name] + [z for k, v in every.items() if str(k) not in self.cells for z in v]
+
+    def same(self, g):
+        """Whether its plans over its box are those of the cells' whole plans in Grader g, None until those are all
+        planned there: the plans that grade the box (their boxes meet it), the kept carriageways, covers and open
+        sections near it, and the street widths it measured (those not decided in g's yet are measured now)."""
+        with g.lock:
+            if not all(k in g.cells for k in self.keys):
+                return None
+            whole = [(g.cells[k], g.keeps.get(k, []), g.covers.get(k, []), g.opens.get(k, [])) for k in self.keys]
+        mine = _near_rows(self.rows, self.box)
+        if _near_rows(_merged([c[0] for c in whole]), self.box) != mine:
+            return False
+        for i, name in ((1, "keeps"), (2, "covers"), (3, "opens")):
+            if _near_zones([z for c in whole for z in c[i]], self.box) != _near_zones(self.own[name], self.box):
+                return False
+        return self.widths is None or self.widths.same()
+
+
+def _merged(cell_plans):
+    """[((fid part, x0, y0), Plan)] of the cells' plans: each road once (the first cell's), sorted (Grader._plan_set)."""
+    got = {}
+    for plans in cell_plans:
+        for fid_part, p in plans:
+            got.setdefault((fid_part, float(p.xy[0, 0]), float(p.xy[0, 1])), p)
+    return sorted(got.items(), key=lambda kv: kv[0])
+
+
+def _mm(a):
+    """An array to the mm, comparable (the same plan made in another batch can differ by ~1e-12 m)."""
+    return np.round(np.nan_to_num(np.asarray(a, np.float64), nan=-1e9), 3).tobytes()
+
+
+def _near_rows(rows, box):
+    """The rows (_merged) whose plans grade box, each as a comparable tuple of its key and its stretches within its
+    reach of box (to the mm: a road's other end, beyond, can differ unseen in the box)."""
+    out = []
+    for k, p in rows:
+        b = p.bbox
+        if b[2] < box[0] or b[0] > box[2] or b[3] < box[1] or b[1] > box[3]:
+            continue
+        near = tuple((_mm(q.xy), _mm(q.z), q.abut, None if q.cut is None else _mm(q.cut))
+                     for q in trim_plan(p, _grow(box, p.half + T_MAX + VERTEX_STEP)))
+        out.append(((k[0], round(k[1], 3), round(k[2], 3)), near, round(p.half, 3), round(p.road_half, 3), int(p.rid),
+                    float(p.max_wall)))
+    return sorted(out, key=lambda r: r[0])
+
+
+def _near_zones(zones, box, pad=T_MAX + 40.0):
+    """The zones [(xy (k, 2), value)] near box, comparable and in one order."""
+    out = []
+    for xy, v in zones:
+        xy = np.asarray(xy, np.float64)
+        if not len(xy) or xy[:, 0].max() < box[0] - pad or xy[:, 0].min() > box[2] + pad or \
+                xy[:, 1].max() < box[1] - pad or xy[:, 1].min() > box[3] + pad:
+            continue
+        out.append((_mm(xy), repr(v)))
+    return sorted(out)
 
 
 def trim_plan(p, box):

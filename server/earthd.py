@@ -728,6 +728,9 @@ class Server:
         self.base_stale = set()         # blocks whose base photo lacks lazy imagery (NAIP) still to come
         self.pads_rebuild = set()       # blocks built without gas station pads that lie on them (pads_stale)
         self.pads_changed_at = 0.0      # (time.monotonic) the last new pad: Connection.pads_refresh waits a little
+        self.grade_rebuild = set()      # blocks graded from region plans that came out unlike their cells' whole plans
+        self.region_pending = {}        # block -> the block process (lane) whose region plans graded it (region_poll)
+        self.region_thread = None
         self.fast = False               # the player faster than FAST_BASE_V (the latest pose): photos follow blocks
         self.edge_at = None             # time.monotonic() the moving player gets to its block's edge (_base_wait_s)
         self.base_pending = {}          # block -> the analysis regions its base photo was rendered without
@@ -1564,6 +1567,8 @@ class Server:
                     blockworker.build, anchor.id, anchor.lat, anchor.lon, anchor.hm_zoom, q, cx, cy,
                     self.layout.block, self.out_dir, self.hm_name(key), self.ter_name(key),
                     fuel_pads=self.block_fuel_pads(anchor, cx, cy, self.layout.block)).result()
+                if info.get("gradePending"):
+                    self.region_watch(key, lane)
                 self.hm_stage[key] = "its base photo"
                 return self._finish_heightmap(anchor, cx, cy, info, t0, base)
             self.hm_stage[key] = "the build in the server's process"
@@ -1573,6 +1578,37 @@ class Server:
                 return self._make_heightmap_here(anchor, cx, cy, progress, t0, q, base)
         finally:
             self.hm_stage.pop(key, None)
+
+    def region_watch(self, key, lane):
+        """Block key was graded from region plans in lane's block process (grading.Grader.region: its cells were not
+        planned yet): asked there every REGION_POLL_S whether it came out as their whole plans make it
+        (blockworker.region_poll); a block that did not goes to grade_rebuild (built again when asked for, the one in
+        use at a stop: Connection.pads_refresh)."""
+        self.region_pending[key] = (lane, time.monotonic())
+        if self.region_thread is None:
+            self.region_thread = threading.Thread(target=self._region_loop, name="block-regions", daemon=True)
+            self.region_thread.start()
+
+    def _region_loop(self):
+        while True:
+            time.sleep(REGION_POLL_S)
+            now = time.monotonic()
+            for key, (_lane, t) in list(self.region_pending.items()):
+                if now - t > REGION_FORGET_S:       # (its process respawned, or the anchor is long gone)
+                    self.region_pending.pop(key, None)
+            for lane in sorted({v[0] for v in list(self.region_pending.values())}):
+                try:
+                    done = self.block_pools[lane][0].submit(blockworker.region_poll).result(timeout=REGION_POLL_WAIT_S)
+                except Exception as e:      # (a busy or respawned process: asked again)
+                    log.debug("block regions of lane %d: %s: %s", lane, type(e).__name__, e)
+                    continue
+                for key, same in done:
+                    key = tuple(key)
+                    self.region_pending.pop(key, None)
+                    if not same:
+                        self.grade_rebuild.add(key)
+                        log.info("block %s graded from its region's plans differs from its cells' whole plans: "
+                                 "built again", key)
 
     def make_provisional(self, anchor, cx, cy, progress, ground_at=(0.0, 0.0)):
         """Worker thread: a teleport's first block before its road plans (the user, 2026-10-22: "place the car as
@@ -1975,6 +2011,9 @@ class Server:
         """Info of the (anchorId, cx, cy) terrain, generating it once (deduplicated). lane: the block
         process that builds it (LANE_PREFETCH for the prefetch)."""
         key = (anchor.id, cx, cy)
+        if key in self.grade_rebuild and key not in self.hm_inflight:     # (region plans unlike the whole ones)
+            self.grade_rebuild.discard(key)
+            self.hm.pop(key, None)
         if key in self.hm:
             self.hm.move_to_end(key)
             return self.hm[key]
@@ -2768,6 +2807,9 @@ class Server:
 # instead of 15-60 s on a fresh place) and replaced by the graded one when that is built (terrain_refresh)
 PROVISIONAL_FIRST = os.environ.get("BNGE_PROVISIONAL", "1") != "0"
 PROVISIONAL_KEEP_S = 60.0   # the provisional .ter is deleted this long after its replacement was sent
+REGION_POLL_S = 3.0         # s between asking the block processes about blocks graded from region plans (region_watch)
+REGION_POLL_WAIT_S = 60.0
+REGION_FORGET_S = 900.0     # s a block's answer is waited for at most
 PADS_REFRESH_MS = 5.0       # the block in use built again with its gas station pads only below this speed (m/s) ...
 PADS_SETTLE_S = 3.0         # ... and this long after the last new pad (Connection.pads_refresh)
 NAV_WAIT_S = 30.0           # s an anchor's first AI graph waits at most for the road tiles round the car (nav_may_start)
@@ -3936,15 +3978,17 @@ class Connection:
         brings several); one at a time."""
         s = self.s
         now = time.monotonic() if now is None else now
-        if (self.pads_busy or not s.pads_rebuild or math.hypot(*self.vel) > PADS_REFRESH_MS
+        if (self.pads_busy or not (s.pads_rebuild or s.grade_rebuild) or math.hypot(*self.vel) > PADS_REFRESH_MS
                 or now - s.pads_changed_at < PADS_SETTLE_S):
             return
-        key = next((k for k in list(s.hm_committed)[-1:] if k in s.pads_rebuild and k[0] == aid), None)
+        key = next((k for k in list(s.hm_committed)[-1:]
+                    if (k in s.pads_rebuild or k in s.grade_rebuild) and k[0] == aid), None)
         anchor = s.anchors.get(aid)
         if key is None or anchor is None:
             return
         self.pads_busy = True
         s.pads_rebuild.discard(key)
+        s.grade_rebuild.discard(key)        # (the region plans' block: built again from the cells' whole plans)
 
         async def run():
             old = s.hm.pop(key, None)
@@ -3959,7 +4003,7 @@ class Connection:
                 self.pads_busy = False
             s.base_stale.discard(key)           # (its photo built with them too)
             s.hm_sent.append(key)
-            log.info("block %s built again with its gas station pads", key)
+            log.info("block %s built again (its gas station pads, or its cells' whole road plans)", key)
             self.send({"type": "terrain_refresh", "anchorId": key[0], **self.terrain_msg(key, info)})
             old_ter = (old or {}).get("ter")
             if old_ter and old_ter != info.get("ter"):

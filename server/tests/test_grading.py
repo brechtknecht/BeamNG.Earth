@@ -555,5 +555,76 @@ class RacewayKeepTest(unittest.TestCase):
         self.assertAlmostEqual(float(out[0]), float(base[0]), places=6, msg="on the track: the terrain")
 
 
+class CellsMD(FakeMD):
+    """FakeMD with the cells' roads on disk (has) or not, and the cells asked for."""
+
+    def __init__(self, feats, on_disk=True):
+        super().__init__(feats)
+        self.on_disk, self.asked = on_disk, set()
+
+    def has(self, key, layer):
+        return self.on_disk
+
+    def cell(self, key, layers=None, kind=None):
+        self.asked.add(str(key))
+        return super().cell(key, layers, kind)
+
+
+class RegionTest(unittest.TestCase):
+    """A block whose cells are not planned yet graded from the plans of the roads near it (Grader.region): the heights
+    of the cells' whole plans, from its own cells' map data alone."""
+
+    @staticmethod
+    def hill(la, lo):
+        e, n, _ = FRAME.geodetic_to_enu(la, lo, 0.0)
+        return 10.0 + 0.02 * np.asarray(e) + 0.8 * np.sin(np.asarray(n) / 40.0)
+
+    def roads(self):
+        far = [[(2600 + 50 * i, -900), (2600 + 50 * i, 900)] for i in range(4)]
+        return features([[(-400, 20), (400, 20)], [(0, -400), (0, 400)], [(-400, 300), (-100, 330)]] + far,
+                        ["secondary", "residential", "residential"] + ["residential"] * 4)
+
+    def grid(self, box):
+        e, n = np.meshgrid(np.linspace(box[0], box[2], 41), np.linspace(box[1], box[3], 41))
+        la, lo, _ = FRAME.enu_to_geodetic(e.ravel(), n.ravel(), 0.0)
+        return la, lo
+
+    def test_same_heights_as_the_whole_plans(self):
+        box = (-300.0, -300.0, 300.0, 300.0)
+        g = grading.Grader(FRAME, CellsMD(self.roads()), self.hill)
+        reg = g.region(box)
+        self.assertIsNotNone(reg)
+        self.assertEqual(reg.missed, [], "every cell on disk")
+        la, lo = self.grid(box)
+        base = self.hill(la, lo)
+        got = g.apply(la, lo, base, grading.ROAD_LIFT, region=reg)
+        self.assertGreater(float(np.abs(got - base).max()), 0.1, "graded")
+        self.assertIsNone(reg.same(g), "the whole plans not made yet")
+        whole = g.apply(la, lo, base, grading.ROAD_LIFT)
+        np.testing.assert_allclose(got, whole, atol=1e-9)
+        self.assertTrue(reg.same(g))
+        far = [p for p in reg.plans if p.xy[:, 0].min() > 2000]
+        self.assertEqual(far, [], "the roads far from the block not planned")
+        self.assertIsNone(g.region(box), "its cells planned: their whole plans")
+
+    def test_reads_only_its_own_cells(self):
+        md = CellsMD(self.roads(), on_disk=False)
+        g = grading.Grader(FRAME, md, self.hill)
+        box = (-300.0, -300.0, 300.0, 300.0)
+        reg = g.region(box)
+        self.assertEqual(md.asked, {str(k) for k in reg.keys}, "not the cells around them")
+        la, lo = self.grid(box)
+        base = self.hill(la, lo)
+        got = g.apply(la, lo, base, grading.ROAD_LIFT, region=reg)
+        np.testing.assert_allclose(got, g.apply(la, lo, base, grading.ROAD_LIFT), atol=1e-9)
+        self.assertGreater(len(md.asked), len(reg.keys), "the whole plans read the cells around")
+        # a road whose plan the region made otherwise (its bridge in a cell it did not read): told apart
+        k, p = reg.rows[0]
+        q = grading.Plan(p.xy, p.z + 0.5, p.half, p.abut, p.cut, p.road_half)
+        q.rid, q.max_wall = p.rid, p.max_wall
+        reg.rows[0] = (k, q)
+        self.assertFalse(reg.same(g))
+
+
 if __name__ == "__main__":
     unittest.main()
