@@ -263,3 +263,41 @@ class RockSinkTest(unittest.TestCase):
         self.assertEqual(z[2], 30.0)
         flat = veg._sink_rocks(f, it, e, n, np.zeros(3), lambda la, lo: np.zeros(np.size(la)))
         self.assertTrue(np.allclose(flat, 0.0, atol=0.02), "no sinking on flat ground")
+
+
+class VineRowsTest(unittest.TestCase):
+    """vine_rows: Italy's vine groups in rows along a vineyard's long axis, inside it and off the blocked pixels."""
+
+    def setUp(self):
+        lat, lon = 49.9, 7.07
+        self.k = np.cos(np.radians(lat))
+        cx, cy = veg._to3857(lon, lat)
+        self.cx, self.cy = float(cx), float(cy)
+        t = np.radians(30.0)
+        corners = [(-60, -30), (60, -30), (60, 30), (-60, 30), (-60, -30)]      # 120 x 60 ground m, rows along 30 deg
+        ring = [veg._to4326(self.cx + (u * np.cos(t) - v * np.sin(t)) / self.k,
+                            self.cy + (u * np.sin(t) + v * np.cos(t)) / self.k) for u, v in corners]
+        self.f = Feats(3, [[(float(a), float(b)) for a, b in ring]], ["vineyard"])
+        self.dx = 1.2
+        self.chm = SimpleNamespace(x0=self.cx - 200, y0=self.cy + 200, dx=self.dx, dy=self.dx)
+        self.bounds = (self.cx - 200, self.cy - 200, self.cx + 200, self.cy + 200)
+
+    def test_rows_fill_the_vineyard(self):
+        it = veg.vine_rows(self.f, np.array([True]), self.chm, np.zeros((334, 334), bool), self.bounds)
+        self.assertGreater(len(it), 30)          # ~ (120 / 15) x (60 / 7.4), less the edge rows
+        self.assertLessEqual(len(it), 8 * 9)
+        self.assertTrue(np.allclose(it.yaw, 30.0, atol=0.5))
+        self.assertTrue((it.group == veg.G_VINE).all())
+        x, y = veg._to3857(it.lon, it.lat)
+        self.assertTrue(veg._inside(np.asarray(x), np.asarray(y),
+                                    [np.column_stack(veg._to3857(*np.asarray(self.f.rows[0]).T))]).all())
+        again = veg.vine_rows(self.f, np.array([True]), self.chm, np.zeros((334, 334), bool), self.bounds)
+        self.assertTrue(np.array_equal(it.lon, again.lon) and np.array_equal(it.rank, again.rank))
+
+    def test_blocked_and_unselected(self):
+        free = veg.vine_rows(self.f, np.array([True]), self.chm, np.zeros((334, 334), bool), self.bounds)
+        blocked = np.zeros((334, 334), bool)
+        blocked[160:174, :] = True                  # a road across the middle
+        cut = veg.vine_rows(self.f, np.array([True]), self.chm, blocked, self.bounds)
+        self.assertLess(len(cut), len(free))
+        self.assertEqual(len(veg.vine_rows(self.f, np.array([False]), self.chm, blocked, self.bounds)), 0)

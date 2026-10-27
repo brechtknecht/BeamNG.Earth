@@ -979,6 +979,11 @@ three days of testing: dem 741 MB / 7.5k files, imagery 1.4 GB / 35k, deshadow 7
   GroundCover costs its candidates in every rebuild whether its layer is there or not). A farm block lists one more
   material than before (crop next to the verges' dirt: ~20 ms more in the swap's first draw, `used_materials`).
   Server `BNGE_CROPS=0`: no crop layer, fields plain dirt as before, no crop objects in the mod.
+- Vineyards and orchards as Italy makes them (its level has no field shape: dry-grass ground cover, olive groves and
+  rows of `grape_vine_group`): OSM vineyards get rows of that vine group along the field's long side
+  (`vegetation.vine_rows`, 15 x 7.4 m pitch, the smallest rectangle's long axis, off roads and buildings) instead of the
+  canopy's bushes; the canopy's trees in OSM orchards are Italy's olive. Tree groups `vine` / `olive` (vegetation
+  VERSION 15), the same `BNGE_CROPS` switch.
 - A second TerrainBlock (even 5 km away with disableCollision) drops the player's vehicle through the
   ground at once (in-game, twice): never create one while a vehicle is in the world.
 

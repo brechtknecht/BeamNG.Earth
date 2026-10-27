@@ -33,15 +33,27 @@ import staging
 
 log = logging.getLogger("earthd.vegetation")
 
-VERSION = 14          # (the cached cells hold their groups: 14 for the regional rules of GitHub #110)
+VERSION = 15          # (the cached cells hold their groups: 14 for the regional rules of GitHub #110, 15 vineyards and orchards)
 TREE_MIN_M = 3.0
 CROWN_SPACING = 0.5          # tops kept this many crown radii apart (0.8 looked sparse: the user, 2026-10-13)
 BUSH_MIN_M = 1.0
 KIND_TREE, KIND_BUSH, KIND_ROCK = 0, 1, 2
 GROUPS = ("deciduous", "conifer", "shrub", "rock", "pine_west", "palm", "juniper", "desert_shrub", "desert_rock",
-          "oak_west", "tropical")
+          "oak_west", "tropical", "vine", "olive")
 (G_DECIDUOUS, G_CONIFER, G_SHRUB, G_ROCK, G_PINE_WEST, G_PALM, G_JUNIPER, G_DESERT_SHRUB, G_DESERT_ROCK,
- G_OAK_WEST, G_TROPICAL) = range(len(GROUPS))
+ G_OAK_WEST, G_TROPICAL, G_VINE, G_OLIVE) = range(len(GROUPS))
+# Vineyards and orchards as Italy's are made (the user, 2026-10-27: "do it as italy does it"; its level: rows of
+# grape_vine_group forest items, olive trees in groves). OSM vineyards (Overture land_use class "vineyard") get rows of
+# vine groups along the field's long axis (the shape: 16 m along its x, 7.2 m across, ~2.6 m tall; VINE_* its pitch),
+# no canopy bushes or scattered shrubs between; the canopy's trees and bushes in OSM orchards are olive trees. Off with
+# BNGE_CROPS=0, as the crop fields (surface.py).
+VINEYARD_CLASSES = {"vineyard"}
+ORCHARD_CLASSES = {"orchard"}
+VINE_ALONG_M = 15.0          # one group's pitch along its row (Italy's: ~14 m, the shape 16 m long)
+VINE_ACROSS_M = 7.4          # ... and across the rows (the shape 7.2 m wide)
+VINE_HEIGHT_M = 2.6          # (trees.lua's catalog height: scale 1)
+VINE_KEEP_M = 6.0            # canopy tops this tall inside a vineyard stay (a real tree in it)
+PLANTATIONS = os.environ.get("BNGE_CROPS", "1").strip() != "0"
 ROAD_CLEAR_M = 1.5          # trees kept this far off a road's edge (its width by class below)
 TREE_PIT_M = 0.4            # m past a road's edge (+ the push's 0.6) where a top over the road lands: a sidewalk's
                             # tree pit by the curb (pushed out of the full corridor, Boston Street's trees landed on the
@@ -356,13 +368,12 @@ class Vegetation:
         group = np.where(is_tree, np.where(conifer, G_CONIFER, G_DECIDUOUS), G_SHRUB).astype(np.uint8)
         group = regional(group, th, tlat, tlon, lcls, _hash01(gx, gy, 7))
         kind = np.where(is_tree, KIND_TREE, KIND_BUSH).astype(np.uint8)
-        jitter = chm.dx * 0.5
-        tlon2, tlat2 = _to4326(mx[ii] + (u3 - 0.5) * jitter, my[jj] + (u4 - 0.5) * jitter)
-        tree = Items(tlon2, tlat2, th.astype(np.float32), (0.12 * th + 1.0).astype(np.float32), kind, group,
-                     _hash01(gx, gy, 5).astype(np.float32), (u2 * 360.0).astype(np.float32),
-                     (0.85 + 0.3 * _hash01(gx, gy, 6)).astype(np.float32))
-        # squares, pedestrian areas and parking lots: no scattered bushes or rocks (a real tree there stays)
+        # land use: squares, pedestrian areas and parking lots get no scattered bushes or rocks (a real tree there
+        # stays); vineyards their vine rows instead of the canopy's bushes, orchards olive trees
         paved = np.zeros(h.shape, bool)
+        vines_at = np.zeros(h.shape, bool)
+        orchard = np.zeros(h.shape, bool)
+        lu = None
         try:
             cl = self.md.cell((mapcells.ZOOM, x, y), layers=("land_use", "infrastructure"))
             lu, inf = cl.layers.get("land_use"), cl.layers.get("infrastructure")
@@ -370,11 +381,31 @@ class Vegetation:
                 _mask_polys(lu, paved, chm, 0.0, select=lu.attrs["subtype"].astype(str) == "pedestrian")
             if inf is not None and len(inf) and inf.attrs.get("class") is not None:
                 _mask_polys(inf, paved, chm, 0.0, select=inf.attrs["class"].astype(str) == "parking")
+            if PLANTATIONS and lu is not None and len(lu) and lu.attrs.get("class") is not None:
+                lcl = lu.attrs["class"].astype(str)
+                _mask_polys(lu, vines_at, chm, 0.0, select=np.isin(lcl, list(VINEYARD_CLASSES)))
+                _mask_polys(lu, orchard, chm, 0.0, select=np.isin(lcl, list(ORCHARD_CLASSES)))
         except Exception as e:                  # not at hand: scattered as before
             log.debug("vegetation: land use of %s: %s", (x, y), e)
-        scatter = self._scatter(cd, lc, blocked | paved, chm, hs)
+        if vines_at.any() or orchard.any():
+            in_v = vines_at[jj, ii] & (th < VINE_KEEP_M)
+            group = np.where(orchard[jj, ii], G_OLIVE, group).astype(np.uint8)
+            if in_v.any():
+                k_ = ~in_v
+                jj, ii, th, tlon, tlat, group, kind, u2, u3, u4, gx, gy = (a[k_] for a in (
+                    jj, ii, th, tlon, tlat, group, kind, u2, u3, u4, gx, gy))
+        jitter = chm.dx * 0.5
+        tlon2, tlat2 = _to4326(mx[ii] + (u3 - 0.5) * jitter, my[jj] + (u4 - 0.5) * jitter)
+        tree = Items(tlon2, tlat2, th.astype(np.float32), (0.12 * th + 1.0).astype(np.float32), kind, group,
+                     _hash01(gx, gy, 5).astype(np.float32), (u2 * 360.0).astype(np.float32),
+                     (0.85 + 0.3 * _hash01(gx, gy, 6)).astype(np.float32))
+        scatter = self._scatter(cd, lc, blocked | paved | vines_at, chm, hs)
         edge = self._edge(cd, lc, blocked, road, chm, hs)
-        return _concat(_concat(tree, scatter), edge)
+        out = _concat(_concat(tree, scatter), edge)
+        if vines_at.any():
+            out = _concat(out, vine_rows(lu, np.isin(lu.attrs["class"].astype(str), list(VINEYARD_CLASSES)), chm,
+                                         blocked, (ex0, ey0, ex1, ey1)))
+        return out
 
     def _edge(self, cd, lc, blocked, road, chm, hs):
         """The thicket along forest edges beside roads (EDGE_*), outside the dry West."""
@@ -491,6 +522,95 @@ class Vegetation:
                      _hash01(GI[sel], GJ[sel], 15).astype(np.float32),
                      (_hash01(GI[sel], GJ[sel], 16) * 360.0).astype(np.float32),
                      (0.8 + 0.4 * _hash01(GI[sel], GJ[sel], 17)).astype(np.float32)) if n else _empty()
+
+
+def _inside(px, py, rings):
+    """Even-odd: True where (px, py) is inside the rings (outer and holes, each (k, 2) in px / py's units)."""
+    out = np.zeros(len(px), bool)
+    for ring in rings:
+        ring = np.asarray(ring, np.float64)
+        if len(ring) < 3:
+            continue
+        x1, y1 = ring[:, 0][None, :], ring[:, 1][None, :]
+        x2, y2 = np.roll(ring[:, 0], -1)[None, :], np.roll(ring[:, 1], -1)[None, :]
+        X, Y = px[:, None], py[:, None]
+        cross = ((y1 > Y) != (y2 > Y)) & (X < (x2 - x1) * (Y - y1) / np.where(y2 == y1, 1e-12, y2 - y1) + x1)
+        out ^= (np.count_nonzero(cross, axis=1) % 2).astype(bool)
+    return out
+
+
+def _long_axis(g):
+    """The direction (radians in [0, pi)) of the long side of the smallest-area rectangle around the ring g ((k, 2)
+    metres): tried along each edge's direction."""
+    d = np.diff(g, axis=0)
+    d = d[np.hypot(d[:, 0], d[:, 1]) > 1e-6]
+    if not len(d):
+        return 0.0
+    best = None
+    for a in np.unique(np.round(np.mod(np.arctan2(d[:, 1], d[:, 0]), np.pi / 2), 6)):
+        cs, sn = math.cos(a), math.sin(a)
+        u = g[:, 0] * cs + g[:, 1] * sn
+        v = -g[:, 0] * sn + g[:, 1] * cs
+        lu, lv = u.max() - u.min(), v.max() - v.min()
+        if best is None or lu * lv < best[0] - 1e-9:
+            best = (lu * lv, a if lu >= lv else a + math.pi / 2)
+    return float(best[1] % math.pi)
+
+
+def vine_rows(f, select, chm, blocked, bounds):
+    """Items: rows of vine groups (G_VINE) over the vineyard polygons of Features f that select picks, along each
+    polygon's long axis (_long_axis), VINE_ALONG_M x VINE_ACROSS_M apart on a lattice of that axis
+    through the world origin. A group stands where its middle and both ends lie in the polygon and off blocked (the
+    CHM grid's buildings, water, roads) and inside bounds (EPSG:3857 x0, y0, x1, y1: the cell). Pure."""
+    ex0, ey0, ex1, ey1 = bounds
+    n_r, n_c = blocked.shape
+    parts = []
+    for i in np.flatnonzero(select & (f.kind == 3)):
+        for part in f.parts(i):
+            if not part or len(part[0]) < 3:
+                continue
+            rings = [np.column_stack(_to3857(np.asarray(r)[:, 0], np.asarray(r)[:, 1])) for r in part]
+            outer = rings[0]
+            k = math.cos(math.radians(float(np.mean(np.asarray(part[0])[:, 1]))))     # 3857 m -> ground m
+            g = outer * k
+            th = _long_axis(g)
+            cs, sn = math.cos(th), math.sin(th)
+            # the outline in the row frame (u along the rows, v across), ground metres
+            u_ = g[:, 0] * cs + g[:, 1] * sn
+            v_ = -g[:, 0] * sn + g[:, 1] * cs
+            iu = np.arange(math.floor(u_.min() / VINE_ALONG_M), math.ceil(u_.max() / VINE_ALONG_M) + 1)
+            iv = np.arange(math.floor(v_.min() / VINE_ACROSS_M), math.ceil(v_.max() / VINE_ACROSS_M) + 1)
+            if len(iu) * len(iv) > 400000:          # (a broken giant polygon)
+                continue
+            IU, IV = np.meshgrid(iu, iv)
+            IU, IV = IU.ravel(), IV.ravel()
+            U, V = (IU + 0.5) * VINE_ALONG_M, IV * VINE_ACROSS_M
+            ok = np.ones(len(U), bool)
+            for du in (0.0, -0.45 * VINE_ALONG_M, 0.45 * VINE_ALONG_M):
+                gx_, gy_ = (U + du) * cs - V * sn, (U + du) * sn + V * cs
+                px, py = gx_ / k, gy_ / k
+                ok &= _inside(px, py, rings) if ok.any() else ok
+                col = np.floor((px - chm.x0) / chm.dx).astype(np.int64)
+                row = np.floor((chm.y0 - py) / chm.dy).astype(np.int64)
+                inb = (col >= 0) & (col < n_c) & (row >= 0) & (row < n_r)
+                ok &= inb
+                ok[ok] &= ~blocked[row[ok], col[ok]]
+            px, py = (U * cs - V * sn) / k, (U * sn + V * cs) / k
+            ok &= (px >= ex0) & (px < ex1) & (py >= ey0) & (py < ey1)
+            if not ok.any():
+                continue
+            IU, IV, px, py = IU[ok], IV[ok], px[ok], py[ok]
+            lon, lat = _to4326(px, py)
+            n = len(lon)
+            seed = int(round(math.degrees(th) * 10))
+            parts.append(Items(lon, lat, np.full(n, VINE_HEIGHT_M, np.float32), np.full(n, 4.0, np.float32),
+                               np.full(n, KIND_BUSH, np.uint8), np.full(n, G_VINE, np.uint8),
+                               _hash01(IU, IV, 31 + seed).astype(np.float32),
+                               np.full(n, math.degrees(th), np.float32), np.ones(n, np.float32)))
+    out = _empty()
+    for p_ in parts:
+        out = _concat(out, p_)
+    return out
 
 
 def _thin(jj, ii, h, px):
