@@ -3,6 +3,7 @@
 photos' tiles of the blocks ahead are fetched early (Server.photo_ahead)."""
 import sys
 import time
+import os
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -107,6 +108,11 @@ class SpeedBoostTest(unittest.TestCase):
         self.assertEqual(self.pinned[-1], {4, 5, 6, 7})      # back to the speed boost, not the server's own
         s.speed_boost(False, "slower")
         self.assertEqual(self.pinned[-1], {6, 7})
+
+    def test_off_unless_asked(self):
+        # (2026-10-27: the lent cores showed in the game's frames; BNGE_SPEED_BOOST=1 turns it back on)
+        if "BNGE_SPEED_BOOST" not in os.environ:
+            self.assertFalse(earthd.SPEED_BOOST)
 
     def test_nothing_to_lend(self):
         self.s.speed_cpus = None

@@ -3142,6 +3142,12 @@ BOOST_GRACE_S = 5.0         # (the car dropped into place moves a little at firs
 SPEED_BOOST_V = 40.0        # m/s (144 km/h): faster, the speed boost (Server.speed_boost) ...
 SPEED_BOOST_OFF_V = 30.0    # ... until the player is slower than this (108 km/h) ...
 SPEED_BOOST_HOLD_S = 20.0   # ... for this long
+# BNGE_SPEED_BOOST=1: lend the game's cores to the server at speed (above) and when the follow blocks run late
+# (quality level 1). Off by default since 2026-10-27: with stand-ins, the prefetch lanes and the faster builds the
+# server keeps up on its own 2 cores (profiler, 300 km/h, 2 cores: 0 pauses), and Felix's drives showed the lent
+# cores in the game's frames: 1 % lows 25-28 fps with the boost against 31-55 without it, the game "lehmig" once
+# the boost came on (RenderShadows 14 ms in the slow frames).
+SPEED_BOOST = os.environ.get("BNGE_SPEED_BOOST", "0") == "1"
 
 ANCHOR_TILE_FILES = ("roads", "road", "walks", "walkcol", "deck", "bld", "bldcol", "bldfar", "wire", "veg", "navgraph")
 
@@ -4176,7 +4182,7 @@ class Connection:
             if v > SPEED_BOOST_OFF_V:
                 self.fast_t = now
             behind = self.s.quality.boost() and v > BOOST_MOVE_MS   # (the follow blocks late: more cores at any speed)
-            if v > SPEED_BOOST_V or behind:
+            if SPEED_BOOST and (v > SPEED_BOOST_V or behind):
                 self.s.speed_boost(True, f"{v * 3.6:.0f} km/h" if not behind else f"behind, {v * 3.6:.0f} km/h")
             elif self.s.speed_on and now - getattr(self, "fast_t", 0.0) > SPEED_BOOST_HOLD_S:
                 self.s.speed_boost(False, "slower")
