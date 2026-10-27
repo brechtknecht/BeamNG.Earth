@@ -86,6 +86,19 @@ do
     return realRead and realRead(p)
   end
   T.check(gc.ensure() == true, 'ensure makes the objects')
+  local plain = 0
+  for _, d in ipairs(gc.DEFS) do if not d.needs then plain = plain + 1 end end
+  T.check(plain < #gc.DEFS and gc.status().objects == plain and not gc.status().crops,
+    'the crops wait for a block with the crop layer')
+  T.check(gc.ensure({ { 'bngEarthGroundGrass', 'GRASS' } }) == true and gc.status().objects == plain, 'no crop layer: no crops')
+  T.check(gc.ensure({ { 'bngEarthGroundCrop', 'DIRT' } }) == true and gc.status().crops, 'a crop layer: the crops made')
+  do
+    local c = scenetree.findObject(gc.PREFIX .. 'crop_grain_close')
+    T.check(c and c.fields.layer == 'bngEarthGroundCrop', 'crops on the crop layer')
+  end
+  local pend = gc.pending({ { src = 'a' }, { src = 'b', needs = 'L' } }, {}, {})
+  T.check(#pend == 1 and pend[1].src == 'a', 'pending: a def that needs a layer waits for it')
+  T.check(#gc.pending({ { src = 'a' } }, { [gc.PREFIX .. 'a'] = true }, {}) == 0, 'pending: made once')
   local o = scenetree.findObject(gc.PREFIX .. gc.DEFS[1].src)
   T.check(o and o.fields.useNewPlacement == '1' and o.fields.useNewPlacementGpu == '0', 'CPU placement over the stock GPU setting')
   T.check(o.fields.layer == gc.DEFS[1].layer and o.canSave == false, 'on our layer, not saved')
@@ -144,7 +157,7 @@ do
   local matLoads, realLoad = {}, _G.loadJsonMaterialsFile
   _G.loadJsonMaterialsFile = function(p) matLoads[#matLoads + 1] = p end
   gc.reset()
-  T.check(gc.ensure() == true, 'ensure after a module reload')
+  T.check(gc.ensure({ { 'bngEarthGroundCrop', 'DIRT' } }) == true, 'ensure after a module reload (a block with crops)')
   -- the level started again: its stock grass materials went with the old one and are loaded again
   T.check(#matLoads >= 1, 'the stock grass materials loaded again after a reset (' .. #matLoads .. ' files)')
   _G.loadJsonMaterialsFile = realLoad
@@ -199,6 +212,9 @@ do
   for i = 1, #calls do same = same and again[i][1] == calls[i][1] and again[i][2] == calls[i][2] and again[i][3] == calls[i][3] end
   T.check(same, 'deterministic order')
   T.check(gc.fieldsFor({ maxElements = 10 }, 'x', 0.01)[1][3] == '1', 'at least one element')
+  local big = {}
+  for _, c in ipairs(gc.fieldsFor(def, 'x', 1, 2)) do big[c[1] .. '#' .. c[2]] = c[3] end
+  T.check(big['sizeMin#0'] == '0.3' and big['sizeMax#1'] == '1' and big['radius#0'] == '50', 'sizeScale: the plants\' sizes only')
   local names = {}
   local unique = true
   for _, d in ipairs(gc.DEFS) do

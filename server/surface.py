@@ -52,14 +52,20 @@ MATERIALS = (
     ("bngEarthGroundMud", "MUD"),
     ("bngEarthGroundCobble", "COBBLESTONE"),      # roads with paving stones / setts (roads.py "cobble")
     ("bngEarthGroundLawn", "GRASS"),              # mown yards in towns (short grass only, groundcover.lua)
+    ("bngEarthGroundCrop", "DIRT"),               # crop fields (CROPS below; the field plants, groundcover.lua)
     ("beamngEarthDirt", "DIRT"),
 )
-ASPHALT, GRASS, DUSTY, LOOSE, ROCK, SNOW, MUD, COBBLE, LAWN, DIRT = range(len(MATERIALS))
+ASPHALT, GRASS, DUSTY, LOOSE, ROCK, SNOW, MUD, COBBLE, LAWN, CROP, DIRT = range(len(MATERIALS))
+# Crop fields (the user, 2026-10-27: fields are mapped in OSM, "beamng also has models for fields"): cropland is its
+# own layer, the dirt's ground model, which the mod's ground cover fills with tall dry grass close to the car (no stock
+# crop shape exists: groundcover.lua). WorldCover's cropland (40), refined by the OSM fields Overture carries (land_use
+# FIELD_CLASSES: CROP; NOT_FIELD_CLASSES: grass) where cached (paint_fields). BNGE_CROPS=0: fields stay plain dirt.
+CROPS = os.environ.get("BNGE_CROPS", "1").strip() != "0"
 # WorldCover class -> material (§5.4 of the world-data research). Built-up land is the plain dirt layer
 # (2026-10-14): its yards, lawns and lots took the asphalt layer's grey detail and macro textures, which
 # washed whole towns pale grey in the street photos (Moab, Frederick); the roads are painted asphalt anyway
 # (paint_roads), and the photo's own colours now show through.
-CLASS_MATERIAL = {0: DIRT, 10: GRASS, 20: DUSTY, 30: GRASS, 40: DIRT, 50: DIRT, 60: LOOSE, 70: SNOW,
+CLASS_MATERIAL = {0: DIRT, 10: GRASS, 20: DUSTY, 30: GRASS, 40: CROP if CROPS else DIRT, 50: DIRT, 60: LOOSE, 70: SNOW,
                   80: MUD, 90: MUD, 95: MUD, 100: GRASS}
 # Lawns (2026-10-14, street photos of Ocean City, Lancaster, Frederick, Moab): built-up land between the
 # buildings is mostly mown grass, which the dirt layer drew pale and bare. A share of it is LAWN, in patches
@@ -594,7 +600,7 @@ def road_mask(frame, x0, y0, size, px, surface, widths=None):
 # the ground cover goes by the 2 m layer samples, and tufts stood on the asphalt along its edges in many places (the
 # user, 2026-10-20: "grass on the road")
 VERGE_M = 2.0
-VERGE_FROM = (GRASS, LAWN, DUSTY)
+VERGE_FROM = (GRASS, LAWN, DUSTY, CROP)
 VERGE = DIRT
 AISLE_STALLS_M = 5.5        # a parking aisle's stall rows (parking.LOT_SPOT_D_M), painted with it
 PARKING_CLASSES = {"parking"}     # Overture infrastructure (transit) polygons drawn as asphalt: no grass on a lot
@@ -706,7 +712,9 @@ def _plazas(feats):
     return (sub.astype(str) == "pedestrian") & np.isin(cls.astype(str), list(PLAZA_CLASSES))
 
 
-def _paint(idx, lat, lon, feats_list, select, material):
+def _poly_mask(idx, lat, lon, feats_list, select, holes=False):
+    """Where the polygons of feats_list that select picks cover the samples (bool, idx's shape), or None when none
+    is drawn; holes: their inner rings left out."""
     h, w = idx.shape
     to_px = grid_affine(lat, lon)
     im = Image.new("L", (w, h), 0)
@@ -728,10 +736,53 @@ def _paint(idx, lat, lon, feats_list, select, material):
                     continue
                 draw.polygon(list(zip(c.tolist(), r.tolist())), fill=255)
                 n += 1
-    if n == 0:
+                for hole in (part[1:] if holes else ()):
+                    hole = np.asarray(hole, np.float64)
+                    if len(hole) >= 3:
+                        c, r = to_px(hole[:, 0], hole[:, 1])
+                        draw.polygon(list(zip(c.tolist(), r.tolist())), fill=0)
+    return np.asarray(im) > 0 if n else None
+
+
+def _paint(idx, lat, lon, feats_list, select, material):
+    m = _poly_mask(idx, lat, lon, feats_list, select)
+    if m is None:
         return idx
     out = idx.copy()
-    out[np.asarray(im) > 0] = material
+    out[m] = material
+    return out
+
+
+# OSM fields (Overture land_use class, from OSM landuse=*): FIELD_CLASSES are crop fields wherever the land cover is
+# open ground; NOT_FIELD_CLASSES are open land that is no field (WorldCover's cropland also takes in meadows, pastures,
+# vineyards and orchards): grass there. Only open land changes: roads, rock, snow, water, towns' lawns stay.
+FIELD_CLASSES = {"farmland"}
+NOT_FIELD_CLASSES = {"meadow", "grass", "orchard", "vineyard", "plant_nursery", "village_green", "recreation_ground"}
+FIELD_FROM = (GRASS, DUSTY, DIRT, CROP)
+
+
+def _class_in(classes):
+    def select(feats):
+        cls = feats.attrs.get("class")
+        return None if cls is None else np.isin(cls.astype(str), list(classes))
+    return select
+
+
+def paint_fields(idx, lat, lon, feats_list):
+    """idx with the OSM fields of feats_list (land_use Features) painted in (FIELD_CLASSES: CROP over FIELD_FROM) and
+    the open land that is no field taken out of the cropland (NOT_FIELD_CLASSES: CROP -> GRASS); idx as it is with
+    CROPS off. Before the roads (their verges stay bare). Pure."""
+    if not CROPS or not feats_list:
+        return idx
+    out = idx
+    m = _poly_mask(idx, lat, lon, feats_list, _class_in(FIELD_CLASSES), holes=True)
+    if m is not None:
+        out = out.copy()
+        out[m & np.isin(out, FIELD_FROM)] = CROP
+    m = _poly_mask(idx, lat, lon, feats_list, _class_in(NOT_FIELD_CLASSES), holes=True)
+    if m is not None:
+        out = out.copy() if out is idx else out
+        out[m & (out == CROP)] = GRASS
     return out
 
 

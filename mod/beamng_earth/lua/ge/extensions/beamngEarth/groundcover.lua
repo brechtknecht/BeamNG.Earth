@@ -40,12 +40,14 @@ function M.enginePatch(on)
   if not ok then log('W', 'beamngEarth', 'grass patch flag: ' .. tostring(err)) end
 end
 
-local HIROCHI, WCUSA = '/levels/hirochi_raceway/', '/levels/west_coast_usa/'
+local HIROCHI, WCUSA, ITALY = '/levels/hirochi_raceway/', '/levels/west_coast_usa/', '/levels/italy/'
 M.SOURCES = {
   hirochi = { materials = HIROCHI .. 'art/shapes/groundcover/main.materials.json',
               items = HIROCHI .. 'main/MissionGroup/vegetation/terrain_grass/items.level.json' },
   wcusa = { materials = WCUSA .. 'art/groundcover/main.materials.json',
             items = WCUSA .. 'main/MissionGroup/vegetation/items.level.json' },
+  italy = { materials = ITALY .. 'art/shapes/groundcover/main.materials.json',
+            items = ITALY .. 'main/MissionGroup/Level_objects/vegetation/terrain_Grass2/items.level.json' },
 }
 -- stock GroundCover (source, src name) -> our layer, element share; `name` (default src) names our
 -- object, for a stock definition used on two layers; `fields` override stock fields. The shares keep
@@ -63,6 +65,15 @@ M.DEFS = {
   { source = 'hirochi', src = 'small_grass_close', name = 'small_grass_close_scrub', layer = 'bngEarthGroundDusty', share = 0.08 },
   { source = 'hirochi', src = 'long_grass_distant', name = 'long_grass_distant_scrub', layer = 'bngEarthGroundDusty', share = 0.05,
     fields = LONG_NEAR },
+  -- crop fields (server/surface.py CROP, OSM farmland; the user 2026-10-27). The game has no crop shape (no wheat or
+  -- maize in any official level, the asset packs' t_cut_wheat has no material): Italy's long dry grass, scaled up
+  -- (sizeScale) to a ripe grain field's knee-to-hip height, dense close by and sparse to 90 m. `needs`: made only once
+  -- a block lists that layer (a GroundCover costs its candidates in every rebuild, layer or not: none in towns,
+  -- deserts, forests). Off with the server's BNGE_CROPS=0 (no crop layer, so never made).
+  { source = 'italy', src = 'medium_grass_dry_close', name = 'crop_grain_close', layer = 'bngEarthGroundCrop', share = 0.2,
+    sizeScale = 2.2, needs = 'bngEarthGroundCrop' },
+  { source = 'italy', src = 'long_dry_grass_distant', name = 'crop_grain_far', layer = 'bngEarthGroundCrop', share = 0.04,
+    sizeScale = 1.4, fields = { radius = 90, dissolveRadius = 60 }, needs = 'bngEarthGroundCrop' },
 }
 M.PREFIX = 'bngEarthGC_'
 -- set on every object after the stock fields (see the header)
@@ -88,6 +99,8 @@ M.SPREAD = 2
 M.SPREAD_MAX = 4
 
 local created = {}        -- object names we made
+local made = {}           -- object name -> true (created as a set)
+local seenLayers = {}     -- surface layer names some block of this level listed (DEFS' needs)
 local layered = false     -- a block with surface layers was loaded this level (objects can exist)
 local defsCache = {}      -- source -> stock definitions by name (read once per level)
 local loadedMaterials = {} -- source -> true
@@ -128,8 +141,8 @@ local function readDefs(source)
 end
 
 -- Pure: the setField calls (name, index, value) that recreate a stock definition on `layer`, its
--- element count scaled by `share`.
-function M.fieldsFor(def, layer, share)
+-- element count scaled by `share` (and its plants' sizes by sizeScale, default 1).
+function M.fieldsFor(def, layer, share, sizeScale)
   local calls = {}
   for k, v in pairs(def) do
     if not SKIP[k] and v ~= jsonNull then
@@ -142,6 +155,7 @@ function M.fieldsFor(def, layer, share)
       for k, v in pairs(t) do
         if v ~= nil and v ~= jsonNull then
           if k == 'layer' then v = (v ~= '' and layer or '') end
+          if sizeScale and (k == 'sizeMin' or k == 'sizeMax') and tonumber(v) then v = tonumber(v) * sizeScale end
           calls[#calls + 1] = { k, i - 1, fieldValue(v) }
         end
       end
@@ -172,6 +186,7 @@ local function removeAll()
     if o then pcall(function() o:delete() end) end
   end
   created = {}
+  made = {}
   weights = {}
 end
 
@@ -201,14 +216,33 @@ function M.groupsOf(names, weightOf, n)
   return out
 end
 
--- Create the GroundCovers (once per level; the surface layers exist). Returns true if made.
-function M.ensure()
+-- Pure: the DEFS to make now: those not made yet whose `needs` layer (if any) is among seen.
+function M.pending(defs, madeSet, seen)
+  local out = {}
+  for _, d in ipairs(defs) do
+    if not madeSet[M.PREFIX .. (d.name or d.src)] and (not d.needs or seen[d.needs]) then out[#out + 1] = d end
+  end
+  return out
+end
+
+-- Create the GroundCovers (the surface layers exist): the plain ones once per level, the ones that need a layer
+-- (crops) once a block lists it. materials (optional): the block's { { name, groundmodel }, ... }. Returns true if
+-- any exist.
+function M.ensure(materials)
   layered = true
-  if not M.enabled or #created > 0 then return #created > 0 end
+  if type(materials) == 'table' then
+    for _, m in ipairs(materials) do
+      local n = type(m) == 'table' and m[1] or m
+      if type(n) == 'string' then seenLayers[n] = true end
+    end
+  end
+  if not M.enabled then return #created > 0 end
+  local todo = M.pending(M.DEFS, made, seenLayers)
+  if #todo == 0 then return #created > 0 end
   if not scenetree.MissionGroup then return false end
   local ok, err = pcall(function()
     local defs = defsCache
-    for _, d in ipairs(M.DEFS) do
+    for _, d in ipairs(todo) do
       if not defs[d.source] then
         if not loadedMaterials[d.source] then
           loadJsonMaterialsFile(M.SOURCES[d.source].materials)
@@ -227,7 +261,7 @@ function M.ensure()
         if old then old:delete() end
         do
           local gc = createObject('GroundCover')
-          for _, c in ipairs(M.fieldsFor(def, d.layer, d.share * M.density)) do
+          for _, c in ipairs(M.fieldsFor(def, d.layer, d.share * M.density, d.sizeScale)) do
             gc:setField(c[1], c[2], c[3])
             if c[1] == 'maxElements' then weights[name] = tonumber(c[3]) end
           end
@@ -239,7 +273,9 @@ function M.ensure()
           pcall(function() gc:postApply() end) -- the first layered GroundCover once showed nothing until this
         end
         created[#created + 1] = name
+        made[name] = true
       else
+        made[M.PREFIX .. (d.name or d.src)] = true     -- (tried: not looked for again with every block)
         log('W', 'beamngEarth', 'ground cover: no ' .. d.src .. ' in ' .. d.source)
       end
     end
@@ -326,6 +362,8 @@ end
 -- the same game session found no m_grass_* / wca_groundcover and drew no grass, 2026-10-19).
 function M.reset()
   created = {}
+  made = {}
+  seenLayers = {}
   weights = {}
   spread = nil
   defsCache = {}
@@ -343,7 +381,7 @@ function M.rebuild()
 end
 
 function M.status()
-  return { enabled = M.enabled, density = M.density, objects = #created, materialsLoaded = next(loadedMaterials) ~= nil, error = lastError,
+  return { enabled = M.enabled, density = M.density, objects = #created, crops = made[M.PREFIX .. 'crop_grain_close'] == true, materialsLoaded = next(loadedMaterials) ~= nil, error = lastError,
     spread = M.SPREAD }
 end
 

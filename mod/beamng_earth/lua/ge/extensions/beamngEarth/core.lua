@@ -368,7 +368,7 @@ local function loadBlock(tr)
   if warn then warnOnce('height', 'terrain height scale: ' .. warn) end
   local layers = (type(tr.layers) == 'table' and type(tr.materials) == 'table')
     and { masks = tr.layers, materials = tr.materials } or nil -- server --surface on (surface.py)
-  if layers then groundcover.ensure() end
+  if layers then groundcover.ensure(layers.materials) end
   -- detail mode: the block's aerial photo as its base colour (server write_base); else the level's
   -- (false: detail mode without a photo -> the level's flat base; nil: other modes, untouched)
   local base = nil

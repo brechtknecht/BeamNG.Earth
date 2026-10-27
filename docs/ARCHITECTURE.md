@@ -970,6 +970,15 @@ three days of testing: dem 741 MB / 7.5k files, imagery 1.4 GB / 35k, deshadow 7
   in the governor's two quiet frames after the heavy one. Each group's grass is missing for its 1-2 frames.
   Imports, teleports and rebases still rebuild in their own frame. Every 20 swaps the game log gets a line
   `terrain swaps (last 20): frames p50/p90/max ms #1 ... (Render ..)` for an A/B.
+- Crop fields (2026-10-27, prototype): WorldCover's cropland (40) and the OSM fields Overture carries (land_use class
+  `farmland`, `surface.paint_fields`, before the roads so the verges stay bare) are the `bngEarthGroundCrop` layer
+  (the dirt's look and ground model); meadows, pastures, orchards and vineyards inside WorldCover's cropland become
+  grass. The game ships no crop shape (no wheat or maize in any official level; the asset packs' `t_cut_wheat`
+  texture has no material), so `groundcover.lua` fills the layer with Italy's long dry grass scaled to grain height,
+  dense to 50 m and sparse to 90 m. Those GroundCovers are made only once a block lists the crop layer (a
+  GroundCover costs its candidates in every rebuild whether its layer is there or not). A farm block lists one more
+  material than before (crop next to the verges' dirt: ~20 ms more in the swap's first draw, `used_materials`).
+  Server `BNGE_CROPS=0`: no crop layer, fields plain dirt as before, no crop objects in the mod.
 - A second TerrainBlock (even 5 km away with disableCollision) drops the player's vehicle through the
   ground at once (in-game, twice): never create one while a vehicle is in the world.
 

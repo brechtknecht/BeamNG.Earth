@@ -24,7 +24,7 @@ class ClassifyTest(unittest.TestCase):
     def test_classes_map_to_materials(self):
         classes = np.array([[0, 10, 20, 30], [40, 50, 60, 70], [80, 90, 95, 100]], np.uint8)
         idx = sf.classify(classes, np.zeros(classes.shape), 2.0)
-        self.assertEqual(idx.tolist(), [[sf.DIRT, sf.GRASS, sf.DUSTY, sf.GRASS], [sf.DIRT, sf.DIRT, sf.LOOSE, sf.SNOW],
+        self.assertEqual(idx.tolist(), [[sf.DIRT, sf.GRASS, sf.DUSTY, sf.GRASS], [sf.CROP, sf.DIRT, sf.LOOSE, sf.SNOW],
                                         [sf.MUD, sf.MUD, sf.MUD, sf.GRASS]])
         self.assertEqual(sf.MATERIALS[sf.DIRT], ("beamngEarthDirt", "DIRT"))
         self.assertEqual(sf.DIRT, len(sf.MATERIALS) - 1, "the default material goes last (ties pick the later layer)")
@@ -422,17 +422,17 @@ class ServerSurfaceTest(unittest.TestCase):
         self.assertEqual(info["layers"], sf.mask_names(s.hm_name((a.id, 0.0, 0.0))[:-4]))
         self.assertTrue(info["surfaceComplete"])
         grass = np.array(Image.open(os.path.join(s.out_dir, info["layers"][sf.GRASS])))
-        dirt = np.array(Image.open(os.path.join(s.out_dir, info["layers"][sf.DIRT])))
+        crop = np.array(Image.open(os.path.join(s.out_dir, info["layers"][sf.CROP])))     # (cropland, 40)
         self.assertEqual(grass.shape, (512, 512))
         self.assertTrue((grass[:200] == 255).all() and (grass[-200:] == 0).all(), "row 0 is north (grass)")
-        self.assertTrue((dirt[-200:] == 255).all())
+        self.assertTrue((crop[-200:] == 255).all())
         conn = earthd.Connection.__new__(earthd.Connection)
         conn.s = s
         msg = conn.terrain_msg((a.id, 0.0, 0.0), info)
-        # only the .ter's own materials (grass and dirt), in its order
-        self.assertEqual(info["mats"], [sf.GRASS, sf.DIRT])
-        self.assertEqual(msg["layers"], [f"{s.vfs_dir}/{info['layers'][i]}" for i in (sf.GRASS, sf.DIRT)])
-        self.assertEqual(msg["materials"], [list(sf.MATERIALS[i]) for i in (sf.GRASS, sf.DIRT)])
+        # only the .ter's own materials (grass and the fields), in its order
+        self.assertEqual(info["mats"], [sf.GRASS, sf.CROP])
+        self.assertEqual(msg["layers"], [f"{s.vfs_dir}/{info['layers'][i]}" for i in (sf.GRASS, sf.CROP)])
+        self.assertEqual(msg["materials"], [list(sf.MATERIALS[i]) for i in (sf.GRASS, sf.CROP)])
 
     def test_default_server_sends_no_layers(self):
         s = self.make()
@@ -472,6 +472,43 @@ class LotTest(unittest.TestCase):
         self.assertEqual(out[40, 40], sf.GRASS)
         self.assertEqual(int((out == sf.ASPHALT).sum()), int((sf.paint_lots(idx, lat, lon, [Lots()]) == sf.ASPHALT).sum()))
 
+
+    def test_fields_painted_crop(self):
+        """An OSM field (land_use class farmland) is crops over open ground, its inner ring (a farmyard) not; a meadow
+        on WorldCover's cropland is grass; roads and lawns stay; nothing changes with CROPS off."""
+        lat0, lon0 = 50.0, 9.0
+        lat = lat0 + np.arange(50)[:, None] * 2e-5 + np.zeros((1, 50))
+        lon = lon0 + np.arange(50)[None, :] * 3e-5 + np.zeros((50, 1))
+
+        def box(i0, i1, j0, j1):
+            a, b, c, d = lon0 + i0 * 3e-5, lon0 + i1 * 3e-5, lat0 + j0 * 2e-5, lat0 + j1 * 2e-5
+            return np.array([(a, c), (b, c), (b, d), (a, d), (a, c)])
+
+        class LandUse:
+            kind = np.array([3, 3], np.uint8)
+            attrs = {"class": np.array(["farmland", "meadow"], object)}
+
+            def __len__(self):
+                return 2
+
+            def parts(self, i):
+                return [[box(2, 22, 2, 22), box(10, 14, 10, 14)]] if i == 0 else [[box(30, 45, 30, 45)]]
+        idx = np.full((50, 50), sf.GRASS, np.uint8)
+        idx[:, 5] = sf.ASPHALT
+        idx[3, 3] = sf.LAWN
+        idx[30:45, 30:45] = sf.CROP
+        out = sf.paint_fields(idx, lat, lon, [LandUse()])
+        self.assertEqual(out[18, 18], sf.CROP)
+        self.assertEqual(out[12, 12], sf.GRASS, "the farmyard (inner ring) is no field")
+        self.assertEqual(out[18, 5], sf.ASPHALT)
+        self.assertEqual(out[3, 3], sf.LAWN)
+        self.assertEqual(out[40, 40], sf.GRASS, "a meadow WorldCover called cropland")
+        self.assertEqual(out[25, 25], sf.GRASS)
+        old, sf.CROPS = sf.CROPS, False
+        try:
+            self.assertIs(sf.paint_fields(idx, lat, lon, [LandUse()]), idx)
+        finally:
+            sf.CROPS = old
 
     def test_square_painted_paving(self):
         """A land-use square (subtype pedestrian) is paving (the Zocalo read as dirt); a park is not."""

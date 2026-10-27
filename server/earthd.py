@@ -1909,6 +1909,9 @@ class Server:
             if self.sea is not None and not provisional:    # under water: the bed (no grass through the surface)
                 idx[self.sea.depth(keep["lat"], keep["lon"]) > blockworker.WATER_BED_M] = surfacemod.MUD
             road_feats, roads_complete = self.surface.roads(keep["lat"], keep["lon"])
+            lots = self.surface.lots(keep["lat"], keep["lon"]) if hasattr(self.surface, "lots") else None
+            if lots:                    # the OSM fields (crops), under the roads
+                idx = surfacemod.paint_fields(idx, keep["lat"], keep["lon"], lots)
             stages["landcover"] = time.perf_counter() - t1
             perftrace.stage("landcover", t1, cx=cx, cy=cy, provisional=provisional)
             t1 = time.perf_counter()
@@ -1916,8 +1919,7 @@ class Server:
                 idx = surfacemod.paint_roads(idx, keep["lat"], keep["lon"], road_feats, heightmap.SQUARE,
                                              self.surface.urban, None if provisional else self.road_widths,
                                              blockworker._open_tunnels(g, keep))
-            idx = (surfacemod.paint_lots(idx, keep["lat"], keep["lon"], self.surface.lots(keep["lat"], keep["lon"]))
-                if hasattr(self.surface, "lots") else idx)
+            idx = surfacemod.paint_lots(idx, keep["lat"], keep["lon"], lots) if lots is not None else idx
             if hasattr(self.surface, "fuel_pads"):      # gas station forecourts (--gas-stations on)
                 idx = surfacemod.paint_pads(idx, keep["lat"], keep["lon"],
                                             self.surface.fuel_pads(keep["lat"], keep["lon"]))

@@ -325,6 +325,9 @@ def build(aid, lat, lon, hm_zoom, q, cx, cy, size, out_dir, name, ter_name=None,
         if _s.sea is not None:          # under water: the bed (no grass growing through the surface)
             idx[_s.sea.depth(keep["lat"], keep["lon"]) > WATER_BED_M] = surfacemod.MUD
         road_feats, roads_complete = _s.surface.roads(keep["lat"], keep["lon"])
+        lots = _s.surface.lots(keep["lat"], keep["lon"]) if hasattr(_s.surface, "lots") else None
+        if lots:                        # the OSM fields (crops), under the roads
+            idx = surfacemod.paint_fields(idx, keep["lat"], keep["lon"], lots)
         stages["landcover"] = time.perf_counter() - t1
         perftrace.stage("landcover", t1, cx=cx, cy=cy)
         t1 = time.perf_counter()
@@ -332,8 +335,7 @@ def build(aid, lat, lon, hm_zoom, q, cx, cy, size, out_dir, name, ter_name=None,
             idx = surfacemod.paint_roads(idx, keep["lat"], keep["lon"], road_feats, heightmap.SQUARE,
                                          _s.surface.urban, reg.widths if reg is not None and reg.widths is not None
                                          else _s.widths, _open_tunnels(g, keep, reg))
-        idx = (surfacemod.paint_lots(idx, keep["lat"], keep["lon"], _s.surface.lots(keep["lat"], keep["lon"]))
-            if hasattr(_s.surface, "lots") else idx)
+        idx = surfacemod.paint_lots(idx, keep["lat"], keep["lon"], lots) if lots is not None else idx
         if hasattr(_s.surface, "fuel_pads"):    # gas station forecourts (--gas-stations on)
             idx = surfacemod.paint_pads(idx, keep["lat"], keep["lon"], _s.surface.fuel_pads(keep["lat"], keep["lon"]))
         stages["roadPaint"] = time.perf_counter() - t1
@@ -469,13 +471,15 @@ def stand_in(aid, lat, lon, hm_zoom, q, cx, cy, size, out_dir, name, ter_name, d
                                                getattr(chunks, "landcover", None), coarse=True)
         idx = surfacemod.slope_rock(lc, keep["u"], heightmap.SQUARE)
         road_feats, roads_complete = _s.surface.roads(keep["lat"], keep["lon"])
+        lots = _s.surface.lots(keep["lat"], keep["lon"]) if hasattr(_s.surface, "lots") else None
+        if lots:
+            idx = surfacemod.paint_fields(idx, keep["lat"], keep["lon"], lots)
         stages["landcover"] = time.perf_counter() - t1
         t1 = time.perf_counter()
         if road_feats:              # (the widths' guesses, not measured between the buildings)
             idx = surfacemod.paint_roads(idx, keep["lat"], keep["lon"], road_feats, heightmap.SQUARE,
                                          _s.surface.urban, None, [])
-        idx = (surfacemod.paint_lots(idx, keep["lat"], keep["lon"], _s.surface.lots(keep["lat"], keep["lon"]))
-               if hasattr(_s.surface, "lots") else idx)
+        idx = surfacemod.paint_lots(idx, keep["lat"], keep["lon"], lots) if lots is not None else idx
         if hasattr(_s.surface, "fuel_pads"):
             idx = surfacemod.paint_pads(idx, keep["lat"], keep["lon"], _s.surface.fuel_pads(keep["lat"], keep["lon"]))
         stages["roadPaint"] = time.perf_counter() - t1

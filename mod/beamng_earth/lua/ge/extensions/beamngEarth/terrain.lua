@@ -89,6 +89,7 @@ M.LOOKS = {
   bngEarthGroundMud = look('mud/mud/t_mud', 2, 'soil/macro_clumply/t_macro_clumpy', 64),
   bngEarthGroundCobble = look('asphalt/t_asphalt_02/t_asphalt_02', 2, 'asphalt/macro_asphalt/t_macro_asphalt', 32, 0.3),
   bngEarthGroundLawn = look('grass/t_grass_01/t_grass_01', 1, 'grass/t_macro_grass/t_macro_grass', 64, 0.2),
+  bngEarthGroundCrop = look('soil/dirt_crumbly/t_dirt_crumbly', 2, 'soil/macro_clumply/t_macro_clumpy', 64),
   beamngEarthDirt = look('soil/dirt_crumbly/t_dirt_crumbly', 2, 'soil/macro_clumply/t_macro_clumpy', 64),
 }
 M.LEVEL_BASE = { tex = TERRAIN_DIR_BASE, size = '256' }
