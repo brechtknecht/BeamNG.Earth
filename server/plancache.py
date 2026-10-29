@@ -201,7 +201,8 @@ class PlanCache:
 def _write(folder, p, plans, keeps, covers, opens, extra=None):
     """One cell's plans written to p (npz: the arrays, and the rest as JSON in "meta"; extra: more of that)."""
     meta = {"plans": [{"fid": fid, "half": p_.half, "abut": list(p_.abut), "road_half": p_.road_half,
-                       "rid": int(p_.rid), "max_wall": float(p_.max_wall), "cut": p_.cut is not None}
+                       "rid": int(p_.rid), "max_wall": float(p_.max_wall), "cut": p_.cut is not None,
+                       "bank": getattr(p_, "bank", None) is not None}
                       for fid, p_ in plans],
             "keeps": [float(hw) for _xy, hw in keeps], "covers": [float(w) for _xy, w in covers],
             "opens": [{k: (v.item() if hasattr(v, "item") else v) for k, v in sp._asdict().items()}
@@ -211,6 +212,7 @@ def _write(folder, p, plans, keeps, covers, opens, extra=None):
         _pack(arrays, "p", [p_.xy for _f, p_ in plans])
         _pack(arrays, "z", [p_.z for _f, p_ in plans])
         _pack(arrays, "c", [p_.cut for _f, p_ in plans if p_.cut is not None])
+        _pack(arrays, "b", [p_.bank for _f, p_ in plans if getattr(p_, "bank", None) is not None])
         _pack(arrays, "k", [xy for xy, _hw in keeps])
         _pack(arrays, "v", [xy for xy, _w in covers])
         _pack(arrays, "o", [xy for xy, _sp in opens])
@@ -232,12 +234,14 @@ def _read(src):
         with np.load(src, allow_pickle=False) as f:
             meta = json.loads(bytes(f["meta"]).decode("utf-8"))
             lists = {g: _split(f, g) for g in ("p", "z", "c", "k", "v", "o")}
+            lists["b"] = _split(f, "b") if "b_n" in f.files else []
     except (OSError, ValueError, KeyError, TypeError):
         return None
-    plans, cuts = [], iter(lists["c"])
+    plans, cuts, banks = [], iter(lists["c"]), iter(lists["b"])
     for m, xy, z in zip(meta["plans"], lists["p"], lists["z"]):
         pl = Plan(xy, z, m["half"], tuple(m["abut"]), next(cuts) if m["cut"] else None, m["road_half"])
         pl.rid, pl.max_wall = m["rid"], m["max_wall"]
+        pl.bank = next(banks) if m.get("bank") else None
         plans.append((m["fid"], pl))
     keeps = list(zip(lists["k"], meta["keeps"]))
     covers = list(zip(lists["v"], meta["covers"]))

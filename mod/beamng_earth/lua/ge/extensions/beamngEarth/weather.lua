@@ -526,6 +526,7 @@ local function applyPrecip(e, c)
   local alt = e.getCloudAltitudeKm and tonumber(e.getCloudAltitudeKm())
   local cz = cameraZ()
   if alt and cz and cz > alt * 1000 then rain, snow = 0, 0 end
+  M.rainNow = rain                          -- (its sound: ambience.lua)
   drivePrecip(M.RAIN_NAME, rain, M.RAIN_POOL)
   drivePrecip(M.SNOW_NAME, snow, M.SNOW_POOL)
 end
@@ -641,6 +642,7 @@ end
 
 local function hidePrecip()
   for name in pairs(S.precip) do pcall(drivePrecip, name, 0, 0) end
+  M.rainNow = 0
   pcall(restoreSun)
 end
 
@@ -676,6 +678,7 @@ local function switchToManual()
     local ok, err = pcall(st.set, 'weatherMode', 'manual')
     if not ok then log('W', 'beamngEarth', 'weather: saving the mode failed: ' .. tostring(err)) end
   end
+  log('I', 'beamngEarth', 'weather: changed by someone else: ' .. tostring(p.values) .. ' from' .. tostring(p.by))
   notify('Weather set to Manual because it was changed'
     .. (p.bwm and ' (BWM_Weather is changing the weather: set it to Clear with automatic weather off to keep real weather)' or '')
     .. '. Choose Real in the BeamNG.Earth settings to go back.')
@@ -768,7 +771,11 @@ function M.onEnvironmentChanged(changes)
   local keys = M.changedKeys(changes, env(), { groundWind = S.windSent })
   if #keys == 0 then return end
   S.quietUntil = S.clock + M.USER_QUIET_S
-  if not S.pending then S.pending = { at = S.clock, keys = keys } end
+  if not S.pending then
+    local vals = {}         -- (what and who, for the log: GitHub #418)
+    for _, k in ipairs(keys) do vals[#vals + 1] = k .. '=' .. tostring(changes[k]) end
+    S.pending = { at = S.clock, keys = keys, values = table.concat(vals, ', '), by = debug.traceback('', 2) }
+  end
 end
 
 function M.onAnyMissionChanged(state)
@@ -861,6 +868,10 @@ function M.statusLine()
     M.describe(m.code), tonumber(w.ms) or 0, M.compass(w.fromDeg),
     m.visM and string.format('%.0f km', m.visM / 1000) or '?')
 end
+
+-- The latest weather message (code, cover, wind, tempC, ...) as a plain table, unlike status() (a dumps() string
+-- for the console): the world map's weather badge (settings.uiMapState) reads it every second, too often to parse.
+function M.current() return lastMsg end
 
 function M.status()
   return dumps({ mode = mode, pending = S.pending, switched = S.switched, bwmFighting = bwmNow(),

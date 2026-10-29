@@ -1,6 +1,6 @@
 -- BeamNG.Earth settings: GE extension 'beamngEarth_settings' and the module the other parts read
--- (docs/DEVTOOLS.md "Pause-menu integration"). The pause menu's Mods tab has a "BeamNG.Earth"
--- button (ui/ui-vue/mods/beamngEarth/index.js) that opens EarthSettings.vue; the page reads and
+-- (docs/DEVTOOLS.md "Pause-menu integration"). The pause menu has a "BeamNG.Earth" tab with a button
+-- per settings page (ui/ui-vue/mods/beamngEarth/index.js, EarthSettingsPage.vue); the pages read and
 -- writes everything here through the bridge (bngApi.engineLua, as the user's taa_standalone mod):
 --   beamngEarth_settings.uiState()             -> { settings, schema, status, dev }
 --   beamngEarth_settings.uiSet(key, value)     -> { ok, value, error } (validated, saved, applied)
@@ -32,11 +32,38 @@ local places = require('beamngEarth/places')
 
 M.FILE = '/settings/beamngEarth.json'
 M.VERSION = 1
-M.BUTTON_ID = 'beamngEarth-settings' -- index.js registerModButton id
+M.BUTTON_ID = 'beamngEarth-settings' -- index.js: the pause tab's first page button (earthSettingsStore.js pageId)
 M.LEVEL_ID = 'beamng_earth'
 
 -- key -> { kind = 'number'|'bool'|'enum', default, min, max, values, label }. Order = ORDER.
 M.SCHEMA = {
+  -- the quality presets (M.PRESETS; the user, 2026-10-28: "proper quality presets", picked from the hardware on the
+  -- first run: M.detectQuality); 'custom' once a knob is changed away from every preset
+  quality = { kind = 'enum', default = 'auto', values = { 'auto', 'low', 'medium', 'high', 'ultra', 'extreme', 'custom' },
+    label = 'Quality' },
+  -- tree density (trees.lua QUALITY_LEVELS: ranks and tile caps) and draw distance (DISTANCES: the rings and the
+  -- server's tree tile reach), split 2026-10-28 (the user: "give player much more control in the graphics settings")
+  trees = { kind = 'enum', default = 'normal', values = { 'low', 'medium', 'normal', 'high', 'ultra', 'extreme' },
+    label = 'Tree density' },
+  treeDistance = { kind = 'enum', default = 'normal', values = { 'near', 'medium', 'normal', 'far', 'farther', 'max' },
+    label = 'Tree draw distance' },
+  nightLights = { kind = 'enum', default = 'normal', values = { 'few', 'normal', 'many' }, label = 'Street lamp lights' },
+  -- the far field's terrain detail: the server's K table times M.TERRAIN_DETAIL (the 'graphics' message's lodScale)
+  terrainDetail = { kind = 'enum', default = 'normal', values = { 'low', 'normal', 'high', 'ultra', 'extreme' },
+    label = 'Terrain detail' },
+  -- how far the far buildings, the skyline and the far bridges reach (M.BUILDING_DISTANCE: buildingScale)
+  buildingDistance = { kind = 'enum', default = 'normal', values = { 'near', 'normal', 'far', 'max' },
+    label = 'Building draw distance' },
+  -- the drawn terrain block's aerial photo (px over the 1 km block; terrain.setPhotoSize, the server's photoPx):
+  -- from the next level load
+  groundPhoto = { kind = 'enum', default = '2048', values = { '1024', '2048', '4096' }, label = 'Ground photo resolution' },
+  -- the grass's reach (groundcover.lua DISTANCE)
+  grassDistance = { kind = 'enum', default = 'normal', values = { 'near', 'normal', 'far' }, label = 'Grass draw distance' },
+  -- the engine's shape detail in our level (enginepref.lua: $pref::TS::detailAdjust; 'game': the game's Mesh Quality)
+  objectDetail = { kind = 'enum', default = 'game', values = { 'game', 'low', 'normal', 'high', 'ultra', 'extreme' },
+    label = 'Object detail' },
+  -- not on the page: what the first run's detection found ("Steam Deck: Medium")
+  qualityDetected = { kind = 'string', default = '', maxLen = 120, label = 'Detected hardware' },
   rebaseDistance = { kind = 'number', default = rebase.DEFAULT_DISTANCE, min = rebase.MIN_DISTANCE,
     max = rebase.MAX_DISTANCE, label = 'Rebase distance (m)' },
   viewDistanceMode = { kind = 'enum', default = 'horizon', values = { 'fixed', 'horizon' }, label = 'View distance' },
@@ -49,8 +76,15 @@ M.SCHEMA = {
   -- grass and shrubs on the surface layers (groundcover.lua; needs the server's --surface on)
   groundCover = { kind = 'bool', default = true, label = 'Grass and shrubs' },
   groundCoverDensity = { kind = 'enum', default = 'normal', values = { 'low', 'normal', 'high' }, label = 'Grass density' },
+  -- the vegetation tiles' rocks and boulders (trees.lua groups rock, desert_rock; GitHub #5, after PR #321)
+  rocks = { kind = 'bool', default = true, label = 'Rocks' },
   -- roads near the player (roads.lua; the server's --roads on)
   roads = { kind = 'bool', default = true, label = 'Roads' },
+  -- exit, overhead and merge signs and Interstate mile markers along highways (roads.lua sign tiles; server
+  -- signstream.py, from cody196's PR #363); needs Roads
+  highwaySigns = { kind = 'bool', default = true, label = 'Highway signs' },
+  -- Earth imagery on supported vehicle dashboard screens (dashboard.lua)
+  dashboardSatellite = { kind = 'bool', default = true, label = 'Satellite on dashboard screens' },
   hudVisible = { kind = 'bool', default = false, label = 'Status HUD at level start' },
   -- the status bar at the top (statusbar.lua): street, town / state / country, loading, fps
   statusBar = { kind = 'bool', default = true, label = 'Status bar' },
@@ -73,13 +107,64 @@ M.SCHEMA = {
   -- not on the page: the newer version whose update notice the player dismissed (core.lua drawUpdateNotice)
   updateDismissed = { kind = 'string', default = '', maxLen = 40, label = 'Update notice dismissed (version)' },
 }
-M.ORDER = { 'rebaseDistance', 'viewDistanceMode', 'viewDistanceKm', 'hazeStrength', 'skyMode', 'clouds',
-  'weatherMode', 'realGravity', 'groundCover', 'groundCoverDensity', 'roads', 'hudVisible', 'statusBar',
+M.ORDER = { 'quality', 'terrainDetail', 'groundPhoto', 'trees', 'treeDistance', 'buildingDistance', 'objectDetail',
+  'grassDistance', 'nightLights', 'rebaseDistance', 'viewDistanceMode', 'viewDistanceKm', 'hazeStrength', 'skyMode', 'clouds',
+  'weatherMode', 'realGravity', 'groundCover', 'groundCoverDensity', 'rocks', 'roads', 'highwaySigns', 'dashboardSatellite',
+  'hudVisible', 'statusBar',
   'placeNamesOnline', 'creditsVisible', 'beammpOnLaunch',
   'creditsCorner', 'creditsSize', 'cacheCapGb', 'devOutlineKm', 'devMapKm' }
 
 -- Stored but not on the settings page
-M.HIDDEN = { welcomeSeen = true, updateDismissed = true }
+M.HIDDEN = { welcomeSeen = true, updateDismissed = true, qualityDetected = true }
+
+-- The quality presets: each sets these knobs at once ('high' = the defaults before presets existed, 2026-10-28). A
+-- Steam Deck on Handheld in a forest (Patapsco, 2026-10-28): low 37.0 fps, high 31.5, ultra 30.9; 'medium' (its first-run
+-- pick) thins the trees too: the same trees as 'high' gave it only 32.2. 'extreme' (the user, 2026-10-28: "an extreme
+-- quality setting that puts everything at max quality to the real horizon"): every knob at its most, never picked by
+-- the first run (M.detectQuality).
+M.PRESET_KEYS = { 'trees', 'treeDistance', 'groundCover', 'groundCoverDensity', 'grassDistance', 'rocks', 'nightLights',
+  'viewDistanceMode', 'viewDistanceKm', 'terrainDetail', 'buildingDistance', 'groundPhoto', 'objectDetail' }
+M.PRESETS = {
+  low = { trees = 'low', treeDistance = 'near', groundCover = false, groundCoverDensity = 'low', grassDistance = 'near',
+    rocks = true, nightLights = 'few', viewDistanceMode = 'fixed', viewDistanceKm = 40, terrainDetail = 'low',
+    buildingDistance = 'near', groundPhoto = '1024', objectDetail = 'game' },
+  medium = { trees = 'medium', treeDistance = 'medium', groundCover = true, groundCoverDensity = 'low',
+    grassDistance = 'normal', rocks = true, nightLights = 'few', viewDistanceMode = 'horizon', viewDistanceKm = 100,
+    terrainDetail = 'normal', buildingDistance = 'normal', groundPhoto = '2048', objectDetail = 'game' },
+  high = { trees = 'normal', treeDistance = 'normal', groundCover = true, groundCoverDensity = 'normal',
+    grassDistance = 'normal', rocks = true, nightLights = 'normal', viewDistanceMode = 'horizon', viewDistanceKm = 100,
+    terrainDetail = 'normal', buildingDistance = 'normal', groundPhoto = '2048', objectDetail = 'game' },
+  ultra = { trees = 'high', treeDistance = 'far', groundCover = true, groundCoverDensity = 'high', grassDistance = 'normal',
+    rocks = true, nightLights = 'many', viewDistanceMode = 'horizon', viewDistanceKm = 100, terrainDetail = 'high',
+    buildingDistance = 'far', groundPhoto = '2048', objectDetail = 'game' },
+  extreme = { trees = 'extreme', treeDistance = 'max', groundCover = true, groundCoverDensity = 'high',
+    grassDistance = 'far', rocks = true, nightLights = 'many', viewDistanceMode = 'horizon', viewDistanceKm = 100,
+    terrainDetail = 'extreme', buildingDistance = 'max', groundPhoto = '4096', objectDetail = 'extreme' },
+}
+M.PRESET_ORDER = { 'low', 'medium', 'high', 'ultra', 'extreme' }
+
+-- The server's knobs (core.sendGraphics, the 'graphics' message): the far field's K table times TERRAIN_DETAIL (64
+-- cells, Baltimore's first selection, 2026-10-28: 0.75 -> 0.78x the far tiles, 1.3 -> ~1.3x, 1.6 -> ~1.6x, 2 -> 2.1x;
+-- L1 splits at 288 / 384 / 499 / 614 / 768 m), the far buildings' / skyline's / far bridges' reach times
+-- BUILDING_DISTANCE (1.6 / 4.8 / 4.8 km at 1).
+M.TERRAIN_DETAIL = { low = 0.75, normal = 1.0, high = 1.3, ultra = 1.6, extreme = 2.0 }
+M.BUILDING_DISTANCE = { near = 0.6, normal = 1.0, far = 1.5, max = 2.0 }
+-- A file saved before the tree distance had its own setting: the distance its tree level had (trees.lua, before)
+M.TREE_DISTANCE_OF = { low = 'near', medium = 'medium', normal = 'normal', high = 'far', ultra = 'farther' }
+
+-- Pure: the preset a first run picks for this hardware (Engine.Platform.getGPUInfo: { name, memoryMB }) and why.
+-- A Steam Deck (its APU: "AMD Custom GPU 0405 / 0932 (RADV VANGOGH)") or a GPU with under 3 GB: medium / low.
+function M.detectQuality(gpu)
+  local name = type(gpu) == 'table' and tostring(gpu.name or '') or ''
+  local mem = type(gpu) == 'table' and tonumber(gpu.memoryMB) or nil
+  local up = name:upper()
+  if up:find('VANGOGH', 1, true) or up:find('CUSTOM GPU 0405', 1, true) or up:find('CUSTOM GPU 0932', 1, true) then
+    return 'medium', 'Steam Deck'
+  end
+  if mem and mem > 0 and mem < 3072 then return 'low', string.format('%s, %d MB', name, mem) end
+  if mem and mem > 0 and mem < 6144 then return 'medium', string.format('%s, %d MB', name, mem) end
+  return 'high', name ~= '' and name or 'this PC'
+end
 
 -- Old values that still load (and set) as their replacement, without a warning: 'auto' weather
 -- (real unless BWM_Weather was changing the weather) is Real now, which switches itself to Manual
@@ -142,13 +227,76 @@ function M.load(path)
         if val ~= nil then values[k] = val else warnings[#warnings + 1] = err end
       end
     end
+    M.fillNewKnobs(data)
   elseif ok and data ~= nil then
     warnings[#warnings + 1] = 'settings file is not an object'
   elseif not ok and data ~= nil then
     warnings[#warnings + 1] = 'settings file unreadable: ' .. tostring(data)
   end
   for _, w in ipairs(warnings) do log('W', 'beamngEarth', 'settings: ' .. w) end
+  if values.quality == 'auto' then M.resolveAuto() end
   return values, warnings
+end
+
+-- A file from before some preset knobs existed (the graphics knobs of 2026-10-28): each knob it lacks follows its
+-- quality preset (a player on Ultra gets Ultra's terrain detail), on Custom its default, the tree distance the one
+-- its tree level had then (TREE_DISTANCE_OF). Nothing for a first run (quality 'auto': resolveAuto).
+function M.fillNewKnobs(data)
+  local preset = M.PRESETS[values.quality]
+  for _, k in ipairs(M.PRESET_KEYS) do
+    if data[k] == nil then
+      if preset then values[k] = preset[k]
+      elseif k == 'treeDistance' and data.trees ~= nil then values[k] = M.TREE_DISTANCE_OF[values.trees] or values[k] end
+    end
+  end
+end
+
+-- Pure-ish: the preset whose knobs all equal the current values, or nil.
+function M.matchingPreset()
+  for _, p in ipairs(M.PRESET_ORDER) do
+    local all = true
+    for _, k in ipairs(M.PRESET_KEYS) do
+      if M.PRESETS[p][k] ~= values[k] then all = false; break end
+    end
+    if all then return p end
+  end
+  return nil
+end
+
+-- The first run (quality 'auto'): the hardware's preset, unless the player changed one of its knobs before presets
+-- existed (then 'custom', theirs kept). Saved by the caller's next save (and here, when the file can be written).
+function M.resolveAuto(gpu)
+  if gpu == nil then
+    local P = rawget(_G, 'Engine') and Engine.Platform
+    if P and P.getGPUInfo then
+      local ok, g = pcall(P.getGPUInfo)
+      if ok then gpu = g end
+    end
+  end
+  local pick, why = M.detectQuality(gpu)
+  values.qualityDetected = why .. ': ' .. pick
+  local changed = false
+  for _, k in ipairs(M.PRESET_KEYS) do
+    if values[k] ~= M.SCHEMA[k].default then changed = true end
+  end
+  if changed then
+    values.quality = M.matchingPreset() or 'custom'
+  else
+    for _, k in ipairs(M.PRESET_KEYS) do values[k] = M.PRESETS[pick][k] end
+    values.quality = pick
+  end
+  log('I', 'beamngEarth', 'settings: quality ' .. values.quality .. ' (detected ' .. values.qualityDetected .. ')')
+  if rawget(_G, 'jsonWriteFile') then M.save() end
+end
+
+-- Pick a preset: its knobs set, saved and applied. Returns { ok, settings, error }.
+function M.setQuality(p)
+  if not M.PRESETS[p] then return { ok = false, error = 'unknown preset ' .. tostring(p) } end
+  for _, k in ipairs(M.PRESET_KEYS) do values[k] = M.PRESETS[p][k] end
+  values.quality = p
+  M.save()
+  for _, k in ipairs(M.PRESET_KEYS) do M.apply(k) end
+  return { ok = true, settings = M.getAll() }
 end
 
 -- Write every value (and the version) to the file. Returns true on success.
@@ -209,6 +357,8 @@ local function applyViewDistance()
       li.visibleDistance = M.SCHEMA.viewDistanceKm.default * 1000
       if li.postApply then li:postApply() end
       appliedView = nil
+      local core = ext('beamngEarth_core')
+      if core and core.refreshHorizon then core.refreshHorizon() end    -- (the horizon's own distance at once)
     end
     return
   end
@@ -220,13 +370,39 @@ local function applyViewDistance()
   appliedView = m
 end
 
+-- The server's graphics knobs now ({ lodScale, treeScale, buildingScale, photoPx, viewM }: core.sendGraphics). photoPx: the
+-- ground photo size of the block in the level now, or of the next one (terrain.photoSize).
+function M.serverGraphics()
+  local okT, trees = pcall(require, 'beamngEarth/trees')
+  local okR, terrain = pcall(require, 'beamngEarth/terrain')
+  return {
+    lodScale = M.TERRAIN_DETAIL[values.terrainDetail] or 1.0,
+    treeScale = okT and trees.distanceScale and trees.distanceScale(values.treeDistance) or 1.0,
+    buildingScale = M.BUILDING_DISTANCE[values.buildingDistance] or 1.0,
+    photoPx = okR and terrain.photoSize and terrain.photoSize() or tonumber(values.groundPhoto),
+    -- a fixed view distance: the far field's radius at most (nothing past it is drawn); 0 = the real horizon
+    viewM = values.viewDistanceMode == 'fixed' and values.viewDistanceKm * 1000 or 0,
+  }
+end
+
+local function sendGraphics()
+  local core = ext('beamngEarth_core')
+  if core and core.sendGraphics then core.sendGraphics() end
+end
+
+local function inOurLevel()
+  local core = ext('beamngEarth_core')
+  local st = core and core._state and core._state() or nil
+  return st and st.inOurLevel or false
+end
+
 M.APPLY = {
   rebaseDistance = function(v)
     local core = ext('beamngEarth_core')
     if core and core.setRebaseDistance then core.setRebaseDistance(v) else rebase.setDistance(v) end
   end,
-  viewDistanceMode = applyViewDistance,
-  viewDistanceKm = applyViewDistance,
+  viewDistanceMode = function() applyViewDistance(); sendGraphics() end,
+  viewDistanceKm = function() applyViewDistance(); sendGraphics() end,
   skyMode = function(v)
     local sky = ext('beamngEarth_sky')
     if sky and sky.setMode and sky.getMode and sky.getMode() ~= v then sky.setMode(v) end
@@ -247,11 +423,34 @@ M.APPLY = {
     local w = ext('beamngEarth_weather')
     if w and w.setGravityEnabled and w.GRAVITY_ENABLED ~= v then w.setGravityEnabled(v) end
   end,
+  trees = function(v) require('beamngEarth/trees').setQuality(v) end,
+  treeDistance = function(v)
+    require('beamngEarth/trees').setDistance(v)
+    sendGraphics()          -- (the server's tree tiles reach as far)
+  end,
+  terrainDetail = sendGraphics,
+  buildingDistance = sendGraphics,
+  groundPhoto = function(v)
+    require('beamngEarth/terrain').setPhotoSize(tonumber(v))
+    sendGraphics()
+  end,
+  grassDistance = function(v) require('beamngEarth/groundcover').setDistance(v) end,
+  objectDetail = function(v) require('beamngEarth/enginepref').setLevel(v, inOurLevel()) end,
+  nightLights = function(v) require('beamngEarth/nightlights').setLightCount(v) end,
   groundCover = function(v) require('beamngEarth/groundcover').setEnabled(v) end,
   groundCoverDensity = function(v) require('beamngEarth/groundcover').setDensity(v) end,
+  rocks = function(v) require('beamngEarth/trees').setGroupEnabled({ 'rock', 'desert_rock' }, v) end,
+  highwaySigns = function(v)
+    local core = ext('beamngEarth_core')
+    if core and core.setHighwaySigns then core.setHighwaySigns(v) else require('beamngEarth/roads').setSignsEnabled(v) end
+  end,
   roads = function(v)
     local core = ext('beamngEarth_core')
     if core and core.setRoadsEnabled then core.setRoadsEnabled(v) else require('beamngEarth/roads').setEnabled(v) end
+  end,
+  dashboardSatellite = function(v)
+    local dashboard = ext('beamngEarth_dashboard')
+    if dashboard and dashboard.setEnabled then dashboard.setEnabled(v) end
   end,
   hudVisible = function(v)
     if M.pageExists() then ui.visible = v end
@@ -290,10 +489,17 @@ end
 function M.set(key, v)
   local val, err = M.validate(key, v)
   if val == nil then return { ok = false, error = err, value = values[key] } end
+  if key == 'quality' then
+    if M.PRESETS[val] then return M.setQuality(val) end
+    if val == 'auto' then M.resolveAuto(); M.applyAll(); return { ok = true, value = values.quality, settings = M.getAll() } end
+  end
   values[key] = val
+  local follows = false
+  for _, k in ipairs(M.PRESET_KEYS) do if k == key then follows = true end end
+  if follows then values.quality = M.matchingPreset() or 'custom' end     -- (a knob moved: Custom, or the preset it now is)
   M.save()
   M.apply(key)
-  return { ok = true, value = val }
+  return { ok = true, value = val, quality = values.quality }
 end
 
 ------------------------------------------------------------------------------------------
@@ -381,6 +587,7 @@ function M.uiSet(key, v) return M.set(key, v) end
 
 function M.uiReset()
   values = defaults()
+  M.resolveAuto()                               -- (quality 'auto': the hardware's preset again)
   M.save()
   M.applyAll()
   return M.getAll()
@@ -447,6 +654,16 @@ function M.uiPlaceGoRecent(i, lat, lon) return placesCall(places.uiGoRecent, i, 
 -- button; tiles from the server's 127.0.0.1 endpoint, server/maptiles.py, port in hello.mapPort).
 
 M.MAP_ROUTE = 'beamngEarthMap' -- index.js registers the route under this name
+M.SETTINGS_ROUTE = 'beamngEarthSettings' -- the full settings page (index.js; the pause menu's card opens it)
+
+function M.openSettings()
+  return M.navigate(M.SETTINGS_ROUTE)
+end
+
+-- The page's Back (and Esc): the menu it was opened from (the pause menu in a level, the main menu outside one)
+function M.closeSettings()
+  return M.navigate('menu')
+end
 local mapOpen = false
 
 -- The player's heading in degrees clockwise from north (the bubble's +y is north, +x east), or nil.
@@ -520,6 +737,23 @@ local function otherPlayers()
   return ok and list or nil
 end
 
+-- The map's weather + local-time badge (the player's spot): sky.lua's real local clock for the lat/lon, and the
+-- latest 'weather' message's code/temperature (weather.current(), a plain table; weather.status() is a dumps()
+-- string for the console, too slow to parse every second). nil when neither is up yet.
+local function localWeatherBadge()
+  local okS, sky = pcall(require, 'beamngEarth/sky')
+  local sst = okS and sky.status and sky.status()
+  local okW, weather = pcall(require, 'beamngEarth/weather')
+  local m = okW and weather.current and weather.current()
+  if not (sst and sst.localTime) and not m then return nil end
+  return {
+    localTime = sst and sst.localTime or nil,
+    code = m and m.code or nil,
+    tempC = m and (m.tempC or m.slTempC) or nil,
+    metric = require('beamngEarth/gps').metric(),      -- (the game's unit: the badge's °C or °F)
+  }
+end
+
 local mapPolledAt = nil    -- when the map last asked for its state (MAP_LOST_S)
 function M.uiMapState()
   mapPolledAt = os.clock()
@@ -537,6 +771,7 @@ function M.uiMapState()
     attribution = core and core.attribution and core.attribution() or '',
     creditsByArea = core and core.creditsByArea and core.creditsByArea() or nil,
     gps = require('beamngEarth/gps').status(),
+    weather = localWeatherBadge(),
   }
 end
 
@@ -657,8 +892,11 @@ function M.mapControls(on)
     bm.onChangeUiFilter = function(v, dir) mapInput('filter', v, dir) end
     local veh = rawget(_G, 'getPlayerVehicle') and getPlayerVehicle(0)
     if veh then
+      -- the pedals let go (blocked below, they would hold their last value), the steering left as it is: written
+      -- here with the direct filter and no wheel angle, a force-feedback wheel locked fully right after the map until
+      -- the car was respawned, G920 / G29 / Fanatec / Moza (GitHub #284); the car stands still without it
       pcall(veh.queueLuaCommand, veh, "input.event('throttle', 0, 2) input.event('brake', 0, 2) "
-        .. "input.event('steering', 0, 2) input.event('clutch', 0, 2)")
+        .. "input.event('clutch', 0, 2)")
     end
     if filter and filter.createActionTemplate then
       pcall(function()

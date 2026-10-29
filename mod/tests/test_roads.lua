@@ -156,6 +156,24 @@ T.check(kinds['/t/walks_2_6_6.cdae'] == 'None' and kinds['/t/walkcol_2_6_6.cdae'
 roads.onDrop({ anchorId = 2, key = '6_6' })
 roads.update(gov, 2)
 T.check(#statics() == 0, 'walkcol dropped with its tile')
+-- the same for a railway track's lean collider (railcol, PR #41); without one the drawn track collides as before
+files['/t/rc.json'] = '{ chunks = { }, rail = { shape = "/t/rail_2_6_6.cdae", pos = { 0, 0, 0 } }, ' ..
+  'railcol = { shape = "/t/railcol_2_6_6.cdae", pos = { 0, 0, 0 } } }'
+roads.onTile({ anchorId = 2, key = '6_6', path = '/t/rc.json', n = 0 }, 2)
+roads.update(gov, 2)
+kinds = {}
+for _, o in ipairs(statics()) do kinds[o.fields.shapeName] = o.fields.collisionType end
+T.check(kinds['/t/rail_2_6_6.cdae'] == 'None' and kinds['/t/railcol_2_6_6.cdae'] == 'Collision Mesh',
+  'railcol collides, the drawn track only renders')
+roads.onDrop({ anchorId = 2, key = '6_6' })
+roads.update(gov, 2)
+T.check(#statics() == 0, 'railcol dropped with its tile')
+files['/t/r.json'] = '{ chunks = { }, rail = { shape = "/t/rail_2_6_6.cdae", pos = { 0, 0, 0 } } }'
+roads.onTile({ anchorId = 2, key = '6_6', path = '/t/r.json', n = 0 }, 2)
+roads.update(gov, 2)
+T.check(#statics() == 1 and statics()[1].fields.collisionType == 'Visible Mesh Final', 'no railcol: the track collides')
+roads.onDrop({ anchorId = 2, key = '6_6' })
+roads.update(gov, 2)
 
 -- pooled shape files (server/matslots.py): the slot paths replace the tile's own files; a slot is reported gone once
 -- its tile is dropped and its object deleted (one the tile cannot use: at once)
@@ -219,12 +237,9 @@ getPlayerVehicle = function() return car end
 roads.onTile({ anchorId = 2, key = '0_0', path = '/t/h.json', n = 0 }, 2)
 roads.update(gov, 2)
 T.check(#statics() == 0, 'not made with the car on it')
-car.pos = vec3(122, 105, 0.5)          -- within PLAYER_R of the box
+car.pos = vec3(120.5, 105, 0.5)        -- just past its box (the box's own margin covers the curb)
 roads.update(gov, 2)
-T.check(#statics() == 0, 'still held next to it')
-car.pos = vec3(200, 105, 0.5)
-roads.update(gov, 2)
-T.check(#statics() == 1, 'made once the car is clear')
+T.check(#statics() == 1, 'made with the car beside it (only the car over a sidewalk holds it)')
 -- made, then the car drives into it before collision is rebuilt: removed, made again once clear
 roads.onDrop({ anchorId = 2, key = '0_0' })
 roads.update(gov, 2)
@@ -400,4 +415,36 @@ do
     'buildings and sidewalks: BLD_LEAD_S of driving; decks the full reach')
 end
 
+-- the skyline: a 1 km square is covered once all 16 of its far tiles are here (no hole while they arrive)
+do
+  local seen = {}
+  T.check(not roads.skyCovered(seen, 1, 0, 0), 'skyCovered: nothing here')
+  for i = 0, 3 do for j = 0, 3 do if not (i == 3 and j == 3) then seen['1:' .. i .. '_' .. j] = true end end end
+  T.check(not roads.skyCovered(seen, 1, 0, 0), 'skyCovered: 15 of 16: still shown')
+  seen['1:3_3'] = true
+  T.check(roads.skyCovered(seen, 1, 0, 0), 'skyCovered: all 16: hidden')
+  T.check(not roads.skyCovered(seen, 2, 0, 0), 'skyCovered: another anchor\'s')
+  local s2 = {}
+  for i = -4, -1 do for j = 4, 7 do s2['1:' .. i .. '_' .. j] = true end end
+  T.check(roads.skyCovered(s2, 1, -1, 1), 'skyCovered: negative squares')
+end
+-- the opaque road surfaces: drawn opaque and casting no sun shadow, one reload each (PR #41)
+do
+  roads.reset()
+  local made = {}
+  for _, name in ipairs({ 'road_asphalt_2lane', 'm_gm_concrete_plain', 'curbs' }) do
+    local m = createObject('Material'); m:registerObject(name); m:setField('translucent', 0, '1'); made[name] = m
+  end
+  S.calls.reload_Material = 0
+  files['/t/mat.json'] = '{ chunks = { ' .. chunk(0) .. ' } }'
+  roads.onTile({ anchorId = 7, key = '0_0', path = '/t/mat.json', n = 1 }, 7)
+  roads.update(gov, 7)
+  local a, c, k = made.road_asphalt_2lane, made.m_gm_concrete_plain, made.curbs
+  T.check(a:getField('translucent') == '0' and a:getField('castShadows') == '0', 'asphalt: opaque, no shadow')
+  T.check(c:getField('castShadows') == '0' and c:getField('translucent') == '1', 'concrete streets: no shadow')
+  T.check(k:getField('castShadows') == nil, 'the curbs keep their shadow')
+  T.check(S.calls.reload_Material == 2, 'one reload a changed material')
+  for _, m in pairs(made) do m:delete() end
+  roads.reset()
+end
 T.done('test_roads')

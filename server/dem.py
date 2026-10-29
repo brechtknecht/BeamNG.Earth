@@ -37,6 +37,8 @@ from PIL import Image
 import cache as cachemod
 import dsmground
 import fast
+import hrdem as hrdemmod
+import lidarbc as lidarbcmod
 import netfetch
 import polardem
 import staging
@@ -60,8 +62,9 @@ PREFETCH_WORKERS = int(os.environ.get("BNGE_DEM_PREFETCH_PAR", "8"))
 MIRROR_MB = 1024
 MIRROR_PRUNE_S = 120.0  # the mirror pruned at most this often per process (each prune walks it all)
 MIRROR_MAX_AGE_S = 30 * 86400
-DECODED_VERSION = 2          # 2: tiles past the lidar's depth upsampled from its deepest tile, not z12; its holes
-                             # filled (fill_holes)
+DECODED_VERSION = 4          # 2: tiles past the lidar's depth upsampled from its deepest tile, not z12; its holes
+                             # filled (fill_holes); 3: Canada's HRDEM lidar (hrdem.py) from z13 down; 4: LidarBC,
+                             # and z12 / z13 shifted to its ground (BIAS_*)
 MAX_ZOOM = 15               # AWS stops at z15 (the far field's zooms: zoom_for's default cap)
 # The near terrain and the road profiles read Mapterhorn's lidar one zoom deeper where it has it (the user, 2026-10-21:
 # "the terrain data gets smoothed ... sharper terrain features get lost": z16 is ~0.8 m a pixel at 48 N, z15 ~1.6 m, the
@@ -70,6 +73,36 @@ FINE_ZOOM = int(os.environ.get("BNE_DEM_ZOOM", "16"))
 GLOBAL_ZOOM = 12            # Mapterhorn is complete on land up to here
 STAND_IN_MIN_ZOOM = 8       # sample_local: the coarsest ancestor a missing tile comes from
 LOCAL_WAIT_S = 0.1          # ... and how long it waits for one already being loaded (from disk: a moment)
+HRDEM = os.environ.get("BNE_HRDEM", "1") != "0"
+# British Columbia's own lidar (lidarbc.py): opt-in. Its 1 m files have no overviews and are read in full-width rows:
+# ~15 MB a square km of near terrain, and a first visit on Vancouver Island took ~60 s longer to its roads (four
+# fresh towns, 2026-10-28: all 36 road tiles at 85-88 s against 23-26 s). HRDEM (its overviews) stays on.
+LIDARBC = HRDEM and os.environ.get("BNE_LIDARBC", "0") == "1"
+# HRDEM read whole for the near terrain (z15 and deeper, 2 m): opt-in too (2026-10-28, four fresh Vancouver Island
+# towns: all road tiles at 33-53 s against 20-22 s without, 61-72 MB a place). Its coarse overview still lines the
+# far tiles up with the lidar ground (_hrdem_bias: a few MB).
+HRDEM_NEAR = HRDEM and os.environ.get("BNE_HRDEM_NEAR", "0") == "1"
+HRDEM_FEATHER_M = 60.0      # m over which HRDEM's edge blends into Mapterhorn's heights
+HRDEM_FEATHER_MAX_PX = 48
+# The distant terrain (z12 / z13: the far field's L2 / L3 rings, 1-4 km out): reading BC's 1 m lidar whole for it would
+# cost ~40 MB a tile, but where Mapterhorn has no lidar its forests stand ~5-18 m above the ground (a quarter of the
+# LidarBC areas sampled, 2026-10-23: Carmanah +15 m), a step against the lidar of the rings inside. So a sparse grid
+# of lidar points (every BIAS_STEP_M along the files' own rows, read through small cache blocks), binned on a
+# BIAS_GRID x BIAS_GRID grid
+# measures Mapterhorn's offset there, smoothed over BIAS_SMOOTH grid cells, and the tile is shifted by it: Mapterhorn's
+# shape at the lidar's level, fading out where the lidar ends.
+BIAS_ZOOMS = (12, 13, 14)
+# The lidar itself (HRDEM, LidarBC) only from this zoom on: the near terrain (z15: ~1.6 m pixels at 49 N, the
+# terrain's 2 m lattice). Read whole, the far rings' z13 / z14 tiles cost ~10 MB each (2026-10-28, Port Alberni: 440 MB
+# of lidar for one first visit, against Overture's 84 MB); there HRDEM's coarse overview shifts Mapterhorn instead.
+FINE_MIN_ZOOM = 15
+HRDEM_BIAS_PX = 64          # the far tile's grid the HRDEM overview is read on ...
+HRDEM_BIAS_M = 32.0         # ... from the overview with pixels this size (a 16 km file tile serves a whole region)
+BIAS_GRID = 32
+BIAS_SMOOTH = 2.0           # grid cells (Gaussian sigma)
+BIAS_BLOCK = 16 * 1024
+BIAS_STEP_M = 64.0          # m between the lidar rows sampled (a point every half of it along them)
+BIAS_COARSE_M = 4.0         # m: the older tiled flights' overviews are good enough for a level
 GROUND_MARGIN = 96          # px of the neighbouring z12 tiles the ground filter sees around a tile
 MAX_LAT = 85.0511287798     # Web Mercator limit
 MAX_TILES_PER_SAMPLE = 1024
@@ -163,6 +196,25 @@ def _resize(a, size):
     return np.asarray(Image.fromarray(a, mode="F").resize((size, size), Image.BILINEAR))
 
 
+def _tile_xy(lat, lon, z):
+    """Web-Mercator tile (x, y) holding (lat, lon) at zoom z."""
+    n = 2 ** z
+    x = int((lon + 180.0) / 360.0 * n) % n
+    y = int((1.0 - math.asinh(math.tan(math.radians(max(-MAX_LAT, min(MAX_LAT, lat))))) / math.pi) / 2.0 * n)
+    return x, max(0, min(n - 1, y))
+
+
+def _gauss2(a, sigma):
+    """A separable Gaussian blur of a small 2-D grid (edges held), pure numpy."""
+    r = max(1, int(round(3 * sigma)))
+    k = np.exp(-0.5 * (np.arange(-r, r + 1) / sigma) ** 2)
+    k /= k.sum()
+    p = np.pad(a, ((r, r), (0, 0)), mode="edge")
+    a = sum(k[i] * p[i:i + a.shape[0]] for i in range(2 * r + 1))
+    p = np.pad(a, ((0, 0), (r, r)), mode="edge")
+    return sum(k[i] * p[:, i:i + a.shape[1]] for i in range(2 * r + 1))
+
+
 class Dem:
     disk = cachemod.NONE    # the server's cache.Cache (last use per file, the size cap); set by earthd
     ground_filter = True    # surface-model areas: buildings out, deeper zooms from that ground (see above)
@@ -192,6 +244,159 @@ class Dem:
         # (z, x, y) -> the provider that served the tile ("mapterhorn" / "aws-terrarium"; None: no
         # data, zeros), for the data credits (credits.py). A few bytes per tile ever loaded.
         self.served = {}
+        self.hrdem = hrdemmod.Hrdem(os.path.join(cache_dir, "hrdem"), self.fetcher) if HRDEM else None
+        self.lidarbc = lidarbcmod.LidarBC(os.path.join(cache_dir, "lidarbc"), self.fetcher) if LIDARBC else None
+        self.lidarbc_served = set()     # tile keys with LidarBC heights in them
+        self.lidarbc_sparse = (lidarbcmod.LidarBC(os.path.join(cache_dir, "lidarbc-sparse"), self.fetcher,
+                                                  block=BIAS_BLOCK) if LIDARBC else None)
+        self.hrdem_served = set()       # tile keys with HRDEM heights in them (the data credits)
+
+    def _canada(self, key, a):
+        """Tile key's heights a with Canada's lidar terrain (hrdem.py) put in where it has data (z13 and deeper)."""
+        z, x, y = key
+        if a is None or z < GLOBAL_ZOOM:
+            return a
+        if z < FINE_MIN_ZOOM:
+            return self._bc_bias(key, self._hrdem_bias(key, a))
+        return self._canada_fine(key, a)
+
+    def _hrdem_bias(self, key, a):
+        """Distant tile key's heights a shifted to HRDEM's ground (read from a coarse overview) where Mapterhorn's sit
+        off it: its forests and drawn-out coarse model, at the lidar's level, for a few hundred kB a region."""
+        z, x, y = key
+        if self.hrdem is None or z not in BIAS_ZOOMS or not hrdemmod.covers(z, x, y):
+            return a
+        try:
+            got = self.hrdem.tile(z, x, y, size=HRDEM_BIAS_PX, min_px=HRDEM_BIAS_M)
+        except (netfetch.FetchError, OSError, ValueError) as e:
+            self._count("hrdem-bias:error")
+            self._partial()
+            log.debug("hrdem bias %s: %s", key, e)
+            return a
+        if got is None:
+            return a
+        h, ok = got
+        lat, lon = hrdemmod.tile_lat_lon(z, x, y, HRDEM_BIAS_PX)
+        out = self._shift_to(key, a, lat[ok], lon[ok], h[ok])
+        if out is not a:
+            self._count("hrdem-bias:tile")
+            with self._lock:
+                self.hrdem_served.add(key)
+        return out
+
+    def _bc_bias(self, key, a):
+        """Distant tile key's heights a shifted to BC's lidar ground where Mapterhorn's sit off it (BIAS_* above)."""
+        z, x, y = key
+        lb = self.lidarbc_sparse
+        if lb is None or z not in BIAS_ZOOMS:
+            return a
+        n = 2 ** z
+        lat_of = lambda yy: math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * yy / n))))     # noqa: E731
+        box = (lat_of(y + 1), x / n * 360.0 - 180.0, lat_of(y), (x + 1) / n * 360.0 - 180.0)
+        s_, w_, n_, e_ = lb._index()[4]
+        if box[0] > n_ or box[2] < s_ or box[1] > e_ or box[3] < w_:
+            return a
+        try:
+            plat, plon, ph = lb.sparse(box, BIAS_STEP_M, coarse_m=BIAS_COARSE_M)
+        except (netfetch.FetchError, OSError, ValueError) as e:
+            self._count("lidarbc-bias:error")
+            self._partial()
+            log.debug("lidarbc bias %s: %s", key, e)
+            return a
+        out = self._shift_to(key, a, plat, plon, ph)
+        if out is not a:
+            self._count("lidarbc-bias:tile")
+        return out
+
+    def _shift_to(self, key, a, plat, plon, ph):
+        """Tile key's heights a shifted by the smoothed offset between them and ground points (plat, plon, ph): a
+        new array, or a itself where there is too little to go on or the shift is under a quarter metre."""
+        z, x, y = key
+        n = 2 ** z
+        if len(ph) < 16:
+            return a
+        # the tile's own heights at the lidar points (bilinear on its pixel grid)
+        fx = ((plon + 180.0) / 360.0 * n - x) * TILE - 0.5
+        fy = ((1 - np.arcsinh(np.tan(np.radians(plat))) / math.pi) / 2 * n - y) * TILE - 0.5
+        x0_ = np.clip(np.floor(fx).astype(np.int64), 0, TILE - 2)
+        y0_ = np.clip(np.floor(fy).astype(np.int64), 0, TILE - 2)
+        u = np.clip(fx - x0_, 0, 1)
+        v = np.clip(fy - y0_, 0, 1)
+        base = ((a[y0_, x0_] * (1 - u) + a[y0_, x0_ + 1] * u) * (1 - v)
+                + (a[y0_ + 1, x0_] * (1 - u) + a[y0_ + 1, x0_ + 1] * u) * v)
+        keep = (a[y0_, x0_] != 0.0) & (a[y0_ + 1, x0_ + 1] != 0.0)          # not the sea
+        # binned on the BIAS_GRID grid: the mean offset per cell, then smoothed
+        g = BIAS_GRID
+        gi = np.clip(((fy + 0.5) / TILE * g).astype(np.int64), 0, g - 1)
+        gj = np.clip(((fx + 0.5) / TILE * g).astype(np.int64), 0, g - 1)
+        d = np.zeros((g, g))
+        wgt = np.zeros((g, g))
+        np.add.at(d, (gi[keep], gj[keep]), (base - ph)[keep])
+        np.add.at(wgt, (gi[keep], gj[keep]), 1.0)
+        d = np.where(wgt > 0, d / np.maximum(wgt, 1), 0.0)
+        wgt = (wgt > 0).astype(np.float64)
+        if wgt.sum() < 4:
+            return a
+        sd, sw = _gauss2(d * wgt, BIAS_SMOOTH), _gauss2(wgt, BIAS_SMOOTH)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            off = np.where(sw > 1e-6, sd / sw, 0.0) * np.clip(sw / max(sw.max(), 1e-6) * 2.0, 0.0, 1.0)
+        # the offset field on the tile's pixels (bilinear between the grid cells' centres)
+        pix = (np.arange(TILE) + 0.5) / TILE * g - 0.5
+        i0 = np.clip(np.floor(pix).astype(np.int64), 0, g - 2)
+        f = np.clip(pix - i0, 0.0, 1.0)
+        o_r = off[i0] * (1 - f)[:, None] + off[i0 + 1] * f[:, None]
+        field = o_r[:, i0] * (1 - f)[None, :] + o_r[:, i0 + 1] * f[None, :]
+        if np.abs(field).max() < 0.25:
+            return a
+        out = (a - field).astype(np.float32)
+        out[a == 0.0] = 0.0                          # the sea stays the sea
+        return out
+
+    def _canada_fine(self, key, a):
+        z, x, y = key
+        h = ok = None
+        used = []
+        near_hrdem = self.hrdem if getattr(self, "hrdem_near", HRDEM_NEAR) else None
+        for name, src in (("lidarbc", self.lidarbc), ("hrdem", near_hrdem)):
+            if src is None or (ok is not None and ok.all()):
+                continue
+            if name == "lidarbc" and not src.covers(z, x, y):
+                continue
+            if name == "hrdem" and not hrdemmod.covers(z, x, y):
+                continue
+            try:
+                got = src.tile(z, x, y)
+            except (netfetch.FetchError, OSError, ValueError) as e:
+                self._count(name + ":error")
+                self._partial()                 # (not mirrored: asked again next time)
+                log.debug("%s %s: %s", name, key, e)
+                continue
+            if got is None:
+                continue
+            gh, gok = got
+            if h is None:
+                h, ok = gh.copy(), gok.copy()
+            else:
+                fill = gok & ~ok
+                h[fill] = gh[fill]
+                ok |= fill
+            used.append(name)
+        if h is None:
+            return a
+        sea = a == 0.0                      # Mapterhorn's sea reads exactly 0: it stays the sea
+        ok = ok & ~sea
+        if not ok.any():
+            return a
+        n = 2 ** z
+        lat = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * (y + 0.5) / n))))
+        px = 40075016.686 * math.cos(math.radians(lat)) / n / TILE
+        w = hrdemmod.feather(ok, min(HRDEM_FEATHER_MAX_PX, max(2, round(HRDEM_FEATHER_M / px))))
+        for name in used:
+            self._count(name + ":tile")
+        with self._lock:
+            for name in used:
+                (self.lidarbc_served if name == "lidarbc" else self.hrdem_served).add(key)
+        return (a * (1.0 - w) + h * w).astype(np.float32)
 
     def polar(self):
         """The polar caps' DEM (made on first use)."""
@@ -251,6 +456,23 @@ class Dem:
                 log.debug("dem: Mapterhorn coverage: %s: %s", type(e).__name__, e)
                 c["at"], c["failed"] = now, True
             return c["index"]
+
+    def coarse_at(self, lat, lon):
+        """Is the elevation at (lat, lon) only the coarse global model (Mapterhorn's file list has nothing deeper than
+        GLOBAL_ZOOM under its z6 tile: no lidar, ~30 m Copernicus and the like)? False when unknown (no list yet) or
+        where the opt-in Canadian lidar reads. grading.ease_coarse (GitHub #414)."""
+        idx = self._coverage()
+        if idx is None:
+            return False
+        n = 2 ** COVERAGE_ZOOM
+        lat = max(-MAX_LAT, min(MAX_LAT, float(lat)))
+        x = int((float(lon) + 180.0) / 360.0 * n) % n
+        y = int((1.0 - math.asinh(math.tan(math.radians(lat))) / math.pi) / 2.0 * n)
+        if idx.get((x, max(0, min(n - 1, y))), GLOBAL_ZOOM) > GLOBAL_ZOOM:
+            return False
+        if (self.lidarbc is not None or HRDEM_NEAR) and hrdemmod.covers(GLOBAL_ZOOM, *_tile_xy(lat, lon, GLOBAL_ZOOM)):
+            return False
+        return True
 
     def _listed(self, z, x, y):
         """False when Mapterhorn's file list says it has no tile (z, x, y) (z > GLOBAL_ZOOM); True otherwise."""
@@ -534,6 +756,9 @@ class Dem:
         return a
 
     def _make_tile(self, key):
+        return self._canada(key, self._make_tile0(key))
+
+    def _make_tile0(self, key):
         z, x, y = key
         if z > MAX_ZOOM:                # (most places have no z16: its z15 parent asked alongside)
             self._ahead([(MAX_ZOOM, x >> (z - MAX_ZOOM), y >> (z - MAX_ZOOM))])
@@ -895,20 +1120,18 @@ class Dem:
                 sub[m] = self.sample(lat[m], lon[m], zoom, progress, tiles_fn)
             out[valid] = sub
             return out.reshape(shape)
-        keys = {(tx, ty): (zoom, tx % n, ty) for ty in range(ty0, ty1 + 1) for tx in range(tx0, tx1 + 1)}
-        got = (tiles_fn or self.tiles)(keys.values(), progress)
+        keys = [(zoom, tx % n, ty) for ty in range(ty0, ty1 + 1) for tx in range(tx0, tx1 + 1)]     # (row-major)
+        got = (tiles_fn or self.tiles)(keys, progress)
         fx -= tx0 * TILE
         fy -= ty0 * TILE
         if MOSAIC_FREE:
-            fast.require(77, "bilinear_tiles")
-            # (the tiles as they are, row by row: copying them into one mosaic was most of a small call's time,
-            # 3 ms for a road profile's 500 points over 1.5 km, 2026-10-26; the same pixels and sums)
-            out[valid] = fast._ef.bilinear_tiles([got[keys[(tx, ty)]] for ty in range(ty0, ty1 + 1)
-                                                  for tx in range(tx0, tx1 + 1)], nx, ny, fx, fy)
+            # (sampled from the tiles in place: a mosaic of them copied on every call cost ~2 s per 16 city road tiles)
+            fast.require(76, "bilinear_tiles")
+            out[valid] = fast._ef.bilinear_tiles([np.asarray(got[k], np.float32) for k in keys], nx, TILE, fx, fy)
             return out.reshape(shape)
         mosaic = np.empty((ny * TILE, nx * TILE), np.float32)
-        for (tx, ty), k in keys.items():
-            c, r = (tx - tx0) * TILE, (ty - ty0) * TILE
+        for i, k in enumerate(keys):
+            r, c = (i // nx) * TILE, (i % nx) * TILE
             mosaic[r:r + TILE, c:c + TILE] = got[k]
         fast.require(55, "bilinear_grid")
         out[valid] = fast._ef.bilinear_grid(mosaic, fx, fy)

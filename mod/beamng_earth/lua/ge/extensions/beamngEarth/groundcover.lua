@@ -72,6 +72,11 @@ M.enabled = true
 -- rebuild frame grows with it where tools/gcpatch is not loaded
 M.DENSITY = { low = 0.5, normal = 1.0, high = 2.0 }
 M.density = 1.0
+-- draw distance factor (the settings page's grassDistance, 2026-10-28): every definition's radius and dissolveRadius
+-- times it, its element count times its square (the same density on the larger disc: the rebuild frame grows with it)
+M.DISTANCE = { near = 0.7, normal = 1.0, far = 1.5 }
+M.distance = 1.0
+M.RADIUS_FIELDS = { radius = true, dissolveRadius = true }
 
 -- Spread the grass rebuild after a block SWAP (follow moves) over this many frames after the swap's (0: the same frame,
 -- as before). Felix's 1-hour Windows drive on 55b89f3 (2026-10-26, no tools/gcpatch there): the swap's frame was
@@ -128,12 +133,14 @@ local function readDefs(source)
 end
 
 -- Pure: the setField calls (name, index, value) that recreate a stock definition on `layer`, its
--- element count scaled by `share`.
-function M.fieldsFor(def, layer, share)
+-- element count scaled by `share`, its radii by `dist` (default 1).
+function M.fieldsFor(def, layer, share, dist)
   local calls = {}
+  dist = dist or 1
   for k, v in pairs(def) do
     if not SKIP[k] and v ~= jsonNull then
       if k == 'maxElements' then v = math.max(1, math.floor((tonumber(v) or 0) * share + 0.5)) end
+      if M.RADIUS_FIELDS[k] and dist ~= 1 and tonumber(v) then v = tonumber(v) * dist end
       calls[#calls + 1] = { k, 0, fieldValue(v) }
     end
   end
@@ -227,11 +234,14 @@ function M.ensure()
         if old then old:delete() end
         do
           local gc = createObject('GroundCover')
-          for _, c in ipairs(M.fieldsFor(def, d.layer, d.share * M.density)) do
+          local dist = M.distance
+          for _, c in ipairs(M.fieldsFor(def, d.layer, d.share * M.density * dist * dist, dist)) do
             gc:setField(c[1], c[2], c[3])
             if c[1] == 'maxElements' then weights[name] = tonumber(c[3]) end
           end
-          for k, v in pairs(d.fields or {}) do gc:setField(k, 0, tostring(v)) end
+          for k, v in pairs(d.fields or {}) do
+            gc:setField(k, 0, tostring(M.RADIUS_FIELDS[k] and tonumber(v) and tonumber(v) * dist or v))
+          end
           for _, f in ipairs(M.PLACEMENT) do gc:setField(f[1], 0, f[2]) end
           gc.canSave = false
           gc:registerObject(name)
@@ -322,6 +332,16 @@ function M.setDensity(v)
   return true
 end
 
+-- Draw distance (the settings page): 'near' / 'normal' / 'far' or a factor; existing objects are made again with it.
+function M.setDistance(v)
+  local f = M.DISTANCE[v] or tonumber(v)
+  if not f or f <= 0 then return false end
+  if f == M.distance then return true end
+  M.distance = f
+  if #created > 0 then M.rebuild() end
+  return true
+end
+
 -- The level ended (its objects are gone with it, the stock materials loaded for it too: a level started again in
 -- the same game session found no m_grass_* / wca_groundcover and drew no grass, 2026-10-19).
 function M.reset()
@@ -343,7 +363,7 @@ function M.rebuild()
 end
 
 function M.status()
-  return { enabled = M.enabled, density = M.density, objects = #created, materialsLoaded = next(loadedMaterials) ~= nil, error = lastError,
+  return { enabled = M.enabled, density = M.density, distance = M.distance, objects = #created, materialsLoaded = next(loadedMaterials) ~= nil, error = lastError,
     spread = M.SPREAD }
 end
 

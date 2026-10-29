@@ -36,9 +36,10 @@ class BridgeLiftsTest(unittest.TestCase):
         ground = [np.array([[-12.0, -500], [-12, 500]]), np.array([[12.0, 500], [12, -500]])]
         out = grading.bridge_lifts(line, [line], ground, lambda xy: np.full(len(xy), FLAT))
         self.assertEqual(len(out), 2)
+        clear = roads.deck_road_clear(roads.deck_depth(roads.geom_span([line])))     # (its span's deck depth)
         for _xy, lift in out:
-            self.assertGreaterEqual(lift, roads.DECK_ROAD_CLEAR)
-            self.assertLessEqual(lift, roads.DECK_ROAD_CLEAR + grading.APPROACH_MARGIN_M + 1e-9)
+            self.assertGreaterEqual(lift, clear)
+            self.assertLessEqual(lift, clear + grading.APPROACH_MARGIN_M + 1e-9)
 
     def test_nothing_under_nothing_raised(self):
         line = np.c_[np.linspace(-35, 35, 36), np.zeros(36)]
@@ -61,6 +62,30 @@ class BridgeLiftsTest(unittest.TestCase):
         out = grading.bridge_lifts(line, [line, nxt], under, lambda xy: np.full(len(xy), FLAT))
         self.assertEqual(len(out), 1)
         self.assertAlmostEqual(float(out[0][0][0]), 0.0)
+
+    def test_short_part_of_a_chain_raises_its_free_end(self):
+        # (GitHub #306, BR-343 at Teresina: the deck carried 5 m onto the road joined at its end; that short part no
+        # road crosses under must still raise its free end for the carriageways under the rest of the chain, or the
+        # whole deck sat ~4.5 m low)
+        deck = np.c_[np.linspace(0, 34, 18), np.zeros(18)]
+        stub = np.c_[np.linspace(-5, 0, 3), np.zeros(3)]            # joined at x = 0, free at x = -5
+        under = [np.array([[8.0, -50], [8, 50]]), np.array([[14.0, 50], [14, -50]])]
+        out = grading.bridge_lifts(stub, [deck, stub], under, lambda xy: np.full(len(xy), FLAT), chain=[deck])
+        self.assertEqual(len(out), 1)
+        self.assertAlmostEqual(float(out[0][0][0]), -5.0)
+        self.assertGreaterEqual(out[0][1], roads.deck_road_clear(roads.deck_depth(roads.geom_span([stub, deck]))))
+        # alone (no chain), a short part is no abutment of a span
+        self.assertEqual(grading.bridge_lifts(stub, [stub], under, lambda xy: np.full(len(xy), FLAT)), [])
+
+    def test_railway_by_the_end_still_counts(self):
+        # (a track 3 m from an abutment is still crossed over: a road deck never meets a railway at grade, GitHub #324)
+        line = np.c_[np.linspace(0, 70, 36), np.zeros(36)]
+        track = [np.array([[3.0, -50], [3, 50]])]
+        out = grading.bridge_lifts(line, [line], [], lambda xy: np.full(len(xy), FLAT), rail_lines=track)
+        self.assertEqual(len(out), 2)
+        near = [lift for end, lift in out if end[0] < 1][0]
+        clear = roads.deck_road_clear(roads.deck_depth(roads.geom_span([line])))     # (its depth from its span)
+        self.assertAlmostEqual(near, clear + grading.APPROACH_MARGIN_M, places=6)
 
     def test_long_viaduct_not_raised(self):
         line = np.c_[np.linspace(-400, 400, 201), np.zeros(201)]
@@ -137,8 +162,9 @@ class OverpassIntegrationTest(unittest.TestCase):
         before, _ = self.deck_over_lanes(False)
         self.assertLess(before.max(), 4.0, "the bug: the deck low over the motorway")
         after, grade = self.deck_over_lanes(True)
-        self.assertGreaterEqual(after.min(), roads.DECK_ROAD_CLEAR - 0.05, after)
-        under = after.min() - 1.2 - 1.0     # (roadmesh DECK_DEPTH + GIRDER_D)
+        depth = roads.deck_depth(roads.geom_span([np.c_[np.linspace(-35, 35, 36), np.zeros(36)]]))
+        self.assertGreaterEqual(after.min(), roads.deck_road_clear(depth) - 0.05, after)
+        under = after.min() - depth     # (the deck's slab and girders, from its span)
         self.assertGreater(under, 4.9, "16 ft headroom under the girders")
         self.assertLessEqual(grade, grading.APPROACH_GRADE * 1.05)
         self.assertLess(np.abs(self.lanes).max(), 0.2, "the motorway is not raised")

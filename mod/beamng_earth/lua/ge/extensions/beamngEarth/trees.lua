@@ -22,9 +22,12 @@ M.TILE_CAP = { { 300, 6000 }, { 700, 2400 }, { 1500, 900 }, { 1e9, 400 } }
 -- with a door on every house out to 300 m): the tile distance (m) beyond which a group is not shown
 -- rocks only over the fine ground (farfield.NEAR_RADII: L0 within 400 m): beyond it the coarser tiles round off the
 -- ridges and a rock placed on the real ground floated over the drawn one (Stelvio pass, the user's report 2026-10-17)
-M.GROUP_MAX_M = { shrub = 250, desert_shrub = 250, rock = 400, desert_rock = 400, cliff = 1500, door = 120, hydrant = 200, bin = 200, bench = 200, polelamp = 400,
+M.GROUP_MAX_M = { shrub = 250, desert_shrub = 250, rock = 400, desert_rock = 400, cliff = 1500, pylon = 1500, gantry = 800, sub_breaker = 400, sub_mast = 1000, sub_support = 300,
+  sub_transformer = 500, sub_fence = 200, lamplens = 800, lampglow = 6000, rrcross = 300, rrcross_eu = 300, rrflash = 400,
+  rrflash_eu = 400, rrgate = 400, rrgate_l = 400, rrgate_eu = 400, rrgate_eu_l = 400, door = 120, hydrant = 200, bin = 200, bench = 200, polelamp = 400,
   stop = 300, giveway = 300, signal = 500, fence = 150, wallsign_logistics = 800, wallsign_rentabox = 800, wallsign_lemon = 800, wallsign_turboburger = 500,
-  speed30 = 300, speed40 = 300, speed50 = 300, speed60 = 300, speed70 = 300 }
+  speed30 = 300, speed40 = 300, speed50 = 300, speed60 = 300, speed70 = 300, guardrail = 4000, guardrail_start = 4000, guardrail_end = 4000,
+  guardrail_back = 4000, guardrail_back_start = 4000, guardrail_back_end = 4000 }
 M.FOREST_NAME = 'bngEarthForest'      -- a prefix: small Forests from a pool ('bngEarthForest_<n>')
 -- A small Forest per tile, from a pool (2026-10-15, 100 mph drives: one shared Forest with ~240k items made and ~220k
 -- removed over a session made frames with any tree change cost ~100 ms in the engine's tick, and a fresh game ran the
@@ -61,13 +64,26 @@ M.CELL_HYST_M = 16      -- a solid cell stays so this much farther out (the head
 -- within 12 m at 307 km/h were not in the collision yet).
 M.URGENT_S = 6
 M.URGENT_MIN_M = 60
-M.NO_COLLIDE = { shrub = true, desert_shrub = true, door = true, wallsign_logistics = true, wallsign_rentabox = true,
+M.NO_COLLIDE = { shrub = true, desert_shrub = true, door = true, lamplens = true, lampglow = true, wallsign_logistics = true, wallsign_rentabox = true,
   wallsign_lemon = true, wallsign_turboburger = true }
 -- The 100 mph stutter (2026-10-15 probes): a frame that adds or removes Forest items costs the engine's tick ~0.5 us
 -- for every item in the level of each SHAPE touched (whatever its item type or Forest), so a frame making 300 items of
 -- ~20 shapes among ~130k items cost ~100 ms. A frame touches shapes whose items add up to SHAPE_ITEMS_PER_FRAME at most
 -- (at least one shape), and bushes (half of all items, one shape alone 34k) show near the player only.
 M.SHAPE_ITEMS_PER_FRAME = 4000
+-- A tree frame's Lua time (checked after every item made or removed, and every CHECK_ROWS rows looked at): the item
+-- budget alone let frames run 30-180 ms when their items' shapes loaded for the first time or new Forests were made
+-- (2026-10-26, a Fells Point drive: 119 tree frames of 8 ms or more, 24.8 ms on average, two thirds of it
+-- making Forests). More while the world loads (core: the governor's loading mode, a teleport or the car standing), none
+-- in the governor's heavy frames.
+M.FRAME_MS = 4.0
+M.LOADING_FRAME_MS = 12.0
+local CHECK_ROWS = 256
+-- Registering a new Forest costs ~9 ms (in-game 2026-10-26: 8-10 ms each, named or not, whatever its data file), and
+-- the tiles that came at once made several in one frame: FORESTS_PER_FRAME at most, and POOL_SPARE kept ready in the
+-- pool, made one in a tree frame that changes no item.
+M.FORESTS_PER_FRAME = 1
+M.POOL_SPARE = 4
 -- The engine tells shapes apart by their path, so a tile's items use one of SHAPE_VARIANTS spellings of each shape's
 -- path ('dir/./name', 'dir/././name', ...: the same file, a shape of its own), which splits the big populations (one
 -- beech ~7.7k items: a frame touching it cost ~4-9 ms). A variant's first items cost one ~12 ms frame (its load).
@@ -184,7 +200,7 @@ M.CATALOG = {
     { '/art/shapes/common/building_architect_modules/doors/R_HS_A_DR_01_100x210', 2.2 },
     { '/art/shapes/common/building_architect_modules/doors/R_HS_B_DR_03_100x210', 2.2 },
   },
-  signal = { { '/art/shapes/objects/s_trafficlight_boom_sn', 9.4 } },
+  signal = { { '/art/shapes/objects/s_trafficlight_boom_sn', 9.4 } },      -- (setup: M.STATIC_SIGNAL)
   stop = { { '/levels/east_coast_usa/art/shapes/signs_usa/sign_stop', 3.0 } },
   giveway = { { '/art/shapes/garage_and_dealership/Clutter/italy_traf_sign_give_way', 3.0 } },
   -- a low wooden yard fence, 5.4 m along its x (server buildings._front_fence)
@@ -206,12 +222,61 @@ M.CATALOG = {
   polelamp = { { ECA .. 'buildings/electrical_pole_lamp', 1.1 } },
   streetlight = { { '/art/shapes/garage_and_dealership/Clutter/eca_lamppost', 9.0 } },
   pole = { { '/levels/automation_test_track/art/shapes/objects/s_powerpole_3wire', 9.2 } },
+  -- high-voltage lines' towers (server powerlines.py): the stock lattice tower (West Coast USA's is the same shape)
+  pylon = { { '/levels/automation_test_track/art/shapes/objects/pylon', 35.8 } },
+  -- substations (server powerlines.py): West Coast USA's switchgear (its yard's parts), the gantries the lines end at,
+  -- the chain-link fence around them (2.04 m panels)
+  gantry = { { WCA .. 'objects/substation_truss', 12.73 } },
+  sub_breaker = { { WCA .. 'objects/substation_circuitbreaker', 5.48 } },
+  sub_mast = { { WCA .. 'objects/substation_lightning', 25.29 } },
+  sub_support = { { WCA .. 'objects/substation_support', 4.94 } },
+  sub_transformer = { { WCA .. 'objects/substation_transformer', 6.18 } },
+  sub_fence = { { WCA .. 'objects/s_chainlink_old', 1.76 } },
+  -- the street lamps' lenses (furniture.py G_LENS; lit at night: nightlights.lua)
+  lamplens = { { '/levels/beamng_earth/art/shapes/beamngEarth/bne_lamp_lens', 1.0 } },
+  lampglow = { { '/levels/beamng_earth/art/shapes/beamngEarth/bne_lamp_glow', 1.0 } },
+  -- level crossings' equipment (server railways.crossing_props; tools/build_rail_crossing_props.py): a crossbuck or a
+  -- St Andrew's cross on its post, a mast with lamps, a gate (its arm raised; _l mirrored for left-hand traffic)
+  rrcross = { { '/levels/beamng_earth/art/shapes/beamngEarth/bne_rr_crossbuck', 3.263 } }, rrcross_eu = { { '/levels/beamng_earth/art/shapes/beamngEarth/bne_rr_cross_eu', 3.263 } },
+  rrflash = { { '/levels/beamng_earth/art/shapes/beamngEarth/bne_rr_flasher', 4.7 } }, rrflash_eu = { { '/levels/beamng_earth/art/shapes/beamngEarth/bne_rr_flasher_eu', 4.7 } },
+  rrgate = { { '/levels/beamng_earth/art/shapes/beamngEarth/bne_rr_gate', 8.25 } }, rrgate_l = { { '/levels/beamng_earth/art/shapes/beamngEarth/bne_rr_gate_l', 8.25 } },
+  rrgate_eu = { { '/levels/beamng_earth/art/shapes/beamngEarth/bne_rr_gate_eu', 8.25 } }, rrgate_eu_l = { { '/levels/beamng_earth/art/shapes/beamngEarth/bne_rr_gate_eu_l', 8.25 } },
   tropical = {
     { JRI .. 'trees/bush_tropical_1/tro_bush_huge', 5.5 }, { JRI .. 'trees/bush_tropical_2/tro_bush_2_small', 6.1 },
     { JRI .. 'trees/trees_tropical_2/tro_tree_2_filler', 20.2 }, { JRI .. 'trees/trees_tropical_1/tro_tree_1_huge', 20.6 },
     { JRI .. 'trees/trees_tropical_1/tro_tree_1_filler', 33.0 },
   },
 }
+-- Italy's authored three-metre crash barrier and two end treatments. The back-facing variants reuse
+-- the same mesh with its longitudinal/lateral axes reversed; the caps are swapped to flare outwards.
+M.CATALOG.guardrail = { { '/art/shapes/objects/italy_guardrails_basic', 0.9 } }
+M.CATALOG.guardrail_start = { { '/art/shapes/objects/italy_guardrails_basic_end_cw', 0.9 } }
+M.CATALOG.guardrail_end = { { '/art/shapes/objects/italy_guardrails_basic_end_ccw', 0.9 } }
+M.CATALOG.guardrail_back = { { '/art/shapes/objects/italy_guardrails_basic', 0.9 } }
+M.CATALOG.guardrail_back_start = { { '/art/shapes/objects/italy_guardrails_basic_end_ccw', 0.9 } }
+M.CATALOG.guardrail_back_end = { { '/art/shapes/objects/italy_guardrails_basic_end_cw', 0.9 } }
+-- Collision is enabled only inside M.SOLID_M by the common Forest-item path; farther rails stay render-only.
+M.GROUP_MAX_M.guardrail = 4000
+M.GROUP_MAX_M.guardrail_start = 4000
+M.GROUP_MAX_M.guardrail_end = 4000
+M.GROUP_MAX_M.guardrail_back = 4000
+M.GROUP_MAX_M.guardrail_back_start = 4000
+M.GROUP_MAX_M.guardrail_back_end = 4000
+-- Median barriers (server medians.py) and mapped jersey / cable barriers (guardrails.py), in the same rows: the stock
+-- 3 m jersey barrier (it runs along its y axis: the rows' basis says so) and its sloped end; the mod's cable barrier
+-- (tools/build_median_props.py: four ropes and a post every 3 m).
+M.CATALOG.jersey = { { '/art/shapes/objects/jerseybarrier_3m', 0.88 } }
+M.CATALOG.jersey_end = { { '/art/shapes/objects/jerseybarrier_end', 0.88 } }
+M.CATALOG.cable = { { '/levels/beamng_earth/art/shapes/beamngEarth/bne_cable_barrier', 1.0 } }
+M.GROUP_MAX_M.jersey = 4000
+M.GROUP_MAX_M.jersey_end = 4000
+M.GROUP_MAX_M.cable = 1500
+-- Pure: whether a group is a road barrier's (guard rails, jersey and cable barriers): continuous runs, not thinned
+-- below the tile cap.
+function M.isBarrier(g)
+  return g ~= nil and (g:sub(1, 9) == 'guardrail' or g:sub(1, 6) == 'jersey' or g == 'cable')
+end
+
 -- the Vienna Convention's round km/h signs: their shapes and how far out they show (CATALOG, GROUP_MAX_M)
 vienna.install(M)
 local MATERIALS = {
@@ -232,31 +297,11 @@ local MATERIALS = {
 }
 
 local stopwatch = require('beamngEarth/stopwatch')
-local tiles = {}        -- key "a:tx_ty" -> { anchor, cx, cy, flat, n, made = { i -> item }, shown = rank }
-
--- A tile's rows (the server's [group, x, y, z, yaw, -, height, rank] each) kept packed: ROW_N numbers per row in one
--- flat array, their defaults filled in (row i's k-th at flat[(i - 1) * ROW_N + k]). As a table each, the ~1M rows of
--- ~150 tiles made the game's Lua heap 260-273 MB, and its garbage collector walked every one of them: LuaGC hitches of
--- 90-273 ms at 200 mph (Felix's drive, 2026-10-26, "tree tiles 140 pending").
-local ROW_N = 8
-local ROW_DEFAULT = { 0, 0, 0, 0, 0, 0, 10, 0 }
-local okNew, tableNew = pcall(require, 'table.new')
-if not okNew then tableNew = function() return {} end end
-
-local function pack(rows)
-  local n = #rows
-  local flat = tableNew(n * ROW_N, 0)
-  local j = 0
-  for i = 1, n do
-    local row = rows[i]
-    for k = 1, ROW_N do flat[j + k] = type(row) == 'table' and tonumber(row[k]) or ROW_DEFAULT[k] end
-    j = j + ROW_N
-  end
-  return flat, n
-end
-M._pack = pack
-local WEAK = { __mode = 'v' }
+M.clock = stopwatch.new      -- the tree frame's clock (FRAME_MS; tests: their own)
+local tiles = {}        -- key "a:tx_ty" -> { anchor, cx, cy, f (flat items), s (stride), n, made = { i -> item }, shown }
 local foci = {}         -- other vehicles' collision foci { x, y, r, trees } (M.setFoci, collisionfoci.lua)
+local dirty = true      -- a tree pass has work (M.update: a pass with none is skipped)
+local lastPass = nil    -- { anchor, x, y, vx, vy, clock } of the last full pass (M.update)
 local ghostSince = nil               -- since the last rebase that left ghost tiles (M.transform)
 local types = {}        -- "shape" / "shape#n" (not solid) -> TSForestItemData
 local pop = {}          -- shape -> its items in the level
@@ -274,14 +319,105 @@ M.unknownGroups = {}      -- groups seen without a CATALOG entry (logged once ea
 
 local pool = {}          -- ids of empty Forests to reuse
 local forestCount = 0
+local newForests = 0     -- Forests made this tree frame (FORESTS_PER_FRAME)
 M.forests = 0
+
+-- Groups the player turned off (settings: Rocks off, GitHub #5): not shown, removed where made. (After
+-- MihneaTeodorStoica's PR #321.)
+-- (lampglow: the lamps' far glow, night only: nightlights.lua turns it on after dusk)
+M.groupOff = { lampglow = true }
+-- The settings' tree density (settings.lua 'trees', the quality presets): scales of the rings' ranks (how many of a
+-- tile's items show at a distance) and of the tiles' item caps; and the tree draw distance (settings 'treeDistance',
+-- split from the density 2026-10-28, the user: "give player much more control in the graphics settings"): the rings'
+-- and caps' distances, and the server's tree tile reach (core.sendGraphics treeScale: vegetation.SEND_M times it;
+-- GHOST_FAR_M follows). 'normal': the defaults above. (Before the split 'trees' also set the distance: low 0.75,
+-- medium 0.9, high 1.3, ultra 1.6; settings.lua migrates a saved level so.)
+M.QUALITY_LEVELS = {
+  low = { rank = 0.5, cap = 0.5 },
+  medium = { rank = 0.7, cap = 0.7 },
+  normal = { rank = 1.0, cap = 1.0 },
+  high = { rank = 1.35, cap = 1.5 },
+  ultra = { rank = 1.7, cap = 2.2 },
+  extreme = { rank = 2.5, cap = 2.5 },      -- (rank 2.5: every item the server sends out to ~700 m x distance)
+}
+M.DISTANCES = { near = 0.75, medium = 0.9, normal = 1.0, far = 1.3, farther = 1.6, max = 2.2 }
+M.TILE_SEND_M, M.TILE_DROP_M = 1280, 1536     -- the server's vegetation SEND_M / DROP_M at distance 1
+local BASE_RINGS, BASE_CAP = nil, nil   -- (the defaults, copied at the first setQuality / setDistance)
+M.quality = 'normal'
+M.distance = 'normal'
+
+-- Pure: the rings and caps of a density level and a distance level from the base ones.
+function M.scaledRings(level, rings, caps, distance)
+  local q = M.QUALITY_LEVELS[level] or M.QUALITY_LEVELS.normal
+  local d = M.DISTANCES[distance or 'normal'] or 1.0
+  local r, c = {}, {}
+  for i, v in ipairs(rings) do
+    r[i] = { v[1] >= 1e8 and v[1] or math.floor(v[1] * d + 0.5), math.min(1.0, v[2] * q.rank) }
+  end
+  for i, v in ipairs(caps) do
+    c[i] = { v[1] >= 1e8 and v[1] or math.floor(v[1] * d + 0.5), math.floor(v[2] * q.cap + 0.5) }
+  end
+  return r, c
+end
+
+-- The server's tree tile reach factor for a distance level (core.sendGraphics treeScale).
+function M.distanceScale(distance) return M.DISTANCES[distance or M.distance] or 1.0 end
+
+local function rescale()
+  if not BASE_RINGS then
+    BASE_RINGS, BASE_CAP = {}, {}
+    for i, v in ipairs(M.RINGS) do BASE_RINGS[i] = { v[1], v[2] } end
+    for i, v in ipairs(M.TILE_CAP) do BASE_CAP[i] = { v[1], v[2] } end
+  end
+  M.RINGS, M.TILE_CAP = M.scaledRings(M.quality, BASE_RINGS, BASE_CAP, M.distance)
+  M.GHOST_FAR_M = math.floor(M.TILE_SEND_M * M.distanceScale() + 0.5) + (M.TILE_DROP_M - M.TILE_SEND_M)
+  M.refresh()
+end
+
+function M.setQuality(level)
+  if not M.QUALITY_LEVELS[level] or level == M.quality then return false end
+  M.quality = level
+  rescale()
+  return true
+end
+
+function M.setDistance(level)
+  if not M.DISTANCES[level] or level == M.distance then return false end
+  M.distance = level
+  rescale()
+  return true
+end
+
+function M.setGroupEnabled(groups, on)
+  local changed = false
+  for _, g in ipairs(groups) do
+    if (M.groupOff[g] == true) == (on == true) then M.groupOff[g] = (not on) or nil; changed = true end
+  end
+  if changed then
+    M.refresh()
+    -- (their colliding items near the car: a collision rebuild once they are gone)
+    local ok, roads = pcall(require, 'beamngEarth/roads')
+    if ok and roads.requestCollision then roads.requestCollision() end
+  end
+  return changed
+end
 
 -- Pure: the n-th pool Forest's name.
 function M.forestName(n)
   return M.FOREST_NAME .. '_' .. tostring(n)
 end
 
--- The tile's Forest: its own, else one from the pool, else a new one.
+local function newForest()
+  forestCount = forestCount + 1
+  newForests = newForests + 1
+  local f = createObject('Forest')
+  f:registerObject(M.forestName(forestCount))
+  if scenetree.MissionGroup then scenetree.MissionGroup:addObject(f) end
+  M.forests = forestCount
+  return f
+end
+
+-- The tile's Forest: its own, else one from the pool, else a new one; nil when this frame made its new ones already.
 local function forest(t)
   local f = t.forestId and scenetree.findObjectById(t.forestId)
   while not f and #pool > 0 do
@@ -289,11 +425,8 @@ local function forest(t)
     if f then f:setPosRot(0, 0, 0, 0, 0, 0, 1) end       -- a ghost's (M.transform) had the rebase's transform
   end
   if not f then
-    forestCount = forestCount + 1
-    f = createObject('Forest')
-    f:registerObject(M.forestName(forestCount))
-    if scenetree.MissionGroup then scenetree.MissionGroup:addObject(f) end
-    M.forests = forestCount
+    if newForests >= M.FORESTS_PER_FRAME then return nil end
+    f = newForest()
   end
   t.forestId = f:getID()
   return f
@@ -305,11 +438,45 @@ local function releaseForest(t)
   t.forestId = nil
 end
 
+-- The stock boom's lamps (instanced_trafficlight) light by the object's instance colour, and a forest item has none:
+-- every lamp glowed at once (GitHub #415). The static booms (the ones no switchable head of navgraph.lua stands in
+-- for) use a copy of the shape whose lamps are dark lenses: written once into the user folder from the game's own
+-- file, its lamp material renamed (STATIC_SIGNAL_MAT, unlit).
+M.SIGNAL_STOCK = '/art/shapes/objects/s_trafficlight_boom_sn'
+M.STATIC_SIGNAL = '/temp/beamngEarth/shapes/s_trafficlight_boom_static_v1'
+M.STATIC_SIGNAL_MAT = 'bne_trafficlight_static'
+function M.staticSignalDae(dae)      -- pure: the stock dae's text with its lamp material renamed (nil: not found)
+  if type(dae) ~= 'string' or not dae:find('instanced_trafficlight', 1, true) then return nil end
+  return (dae:gsub('instanced_trafficlight', M.STATIC_SIGNAL_MAT))
+end
+function M.staticSignalMaterial()
+  return { [M.STATIC_SIGNAL_MAT] = { name = M.STATIC_SIGNAL_MAT, mapTo = M.STATIC_SIGNAL_MAT, class = 'Material',
+    version = 1.5, Stages = { { baseColorMap = '/assets/materials/utility/trafficLight/instanced_trafficlight_lights.png',
+      baseColorFactor = { 0.06, 0.06, 0.06, 1 }, roughnessFactor = 0.6, vertColor = true }, {}, {}, {} },
+    translucent = true, translucentBlendOp = 'Add', castShadows = false } }
+end
+local function staticSignal()
+  local dae, mat = M.STATIC_SIGNAL .. '.dae', M.STATIC_SIGNAL .. '.materials.json'
+  if not FS:fileExists(dae) then
+    local text = M.staticSignalDae(readFile(M.SIGNAL_STOCK .. '.dae'))
+    if not text then return false end
+    writeFile(dae, text)
+  end
+  if not FS:fileExists(mat) then writeFile(mat, jsonEncode(M.staticSignalMaterial())) end
+  loadJsonMaterialsFile(mat)
+  return FS:fileExists(dae)
+end
+
 local function setup()
   if ready then return true end
   for _, m in ipairs(MATERIALS) do
     local p = m .. '/main.materials.json'
     if not FS or FS:fileExists(p) then pcall(loadJsonMaterialsFile, p) end
+  end
+  if FS and readFile and writeFile then
+    local ok, made = pcall(staticSignal)
+    if ok and made then M.CATALOG.signal[1][1] = M.STATIC_SIGNAL
+    else log('W', 'beamngEarth.trees', 'static signal shape: ' .. tostring(made)) end
   end
   ready = true
   return true
@@ -344,28 +511,25 @@ local function itemType(shape, solid)
 end
 
 -- The variant of a group for an item of height h: those within 0.8 .. 1.25 of it (else 0.6 .. 1.6), picked by the
--- item's rank; else the nearest. Returns shape, scale. (No tables made: a call for every row of every new tile.)
-local RANGES = { { 0.8, 1.25 }, { 0.6, 1.6 } }
-local cands = {}
+-- item's rank; else the nearest. Returns shape, scale.
 function M.pick(group, h, rank)
   local list = M.CATALOG[group] or M.CATALOG.deciduous
-  local nc = 0
-  for _, range in ipairs(RANGES) do      -- near its size first, then wider
+  local cands = {}
+  for _, range in ipairs({ { 0.8, 1.25 }, { 0.6, 1.6 } }) do      -- near its size first, then wider
     for _, v in ipairs(list) do
-      if v[2] >= h * range[1] and v[2] <= h * range[2] then nc = nc + 1; cands[nc] = v end
+      if v[2] >= h * range[1] and v[2] <= h * range[2] then cands[#cands + 1] = v end
     end
-    if nc > 0 then break end
+    if #cands > 0 then break end
   end
-  local v
-  if nc == 0 then
-    local bd
-    for _, c in ipairs(list) do
-      local d = math.abs(math.log(c[2] / math.max(h, 0.1)))
-      if not bd or d < bd then v, bd = c, d end
+  if #cands == 0 then
+    local best, bd
+    for _, v in ipairs(list) do
+      local d = math.abs(math.log(v[2] / math.max(h, 0.1)))
+      if not bd or d < bd then best, bd = v, d end
     end
-  else
-    v = cands[math.floor(rank * 7919) % nc + 1]
+    cands = { best }
   end
+  local v = cands[math.floor(rank * 7919) % #cands + 1]
   return v[1], math.max(0.3, math.min(2.5, h / v[2]))
 end
 
@@ -373,18 +537,45 @@ local GROUPS = { 'deciduous', 'conifer', 'shrub', 'rock' }
 local releaseGhosts
 local groupBand
 
+-- A tile's items are one flat array of numbers, STRIDE numbers an item: { group, x, y, z, yaw, scale, height, rank, ... }
+-- (server vegetation.tile_items; scale unused: M.pick scales by height). They were a table per item, and a forest holds
+-- ~300k (Bodø, GitHub #66: 1.66 M before the tile cap): every garbage collection walks each one, and freeing a place's
+-- items held a frame. In-game 2026-10-26, Green Ridge, Maryland (311k items in 138 tiles; same items placed): Lua heap
+-- 176 -> 149 MB, a full collection 92-96 -> 76-78 ms, the longest garbage collection frame of a teleport away
+-- 148-152 -> 37-38 ms. A server that knows the mod reads it (hello.vegFlat) sends the array itself ('flat'), kept as
+-- decoded; rows ({ item }, ...: an older server's vegetation tiles, roads.py's street furniture) are packed into one
+-- (M.flatten).
+M.STRIDE = 8
+local F_GROUP, F_X, F_Y, F_Z, F_YAW, F_SCALE, F_HEIGHT, F_RANK = 1, 2, 3, 4, 5, 6, 7, 8      -- (offsets in an item)
+local HIDDEN = { 0, 0, 0, 0, 0, 1, 10, 2 }     -- an item never shown (rank 2): what a broken row becomes
+local newTable = (function()
+  local ok, f = pcall(require, 'table.new')
+  return ok and f or function() return {} end
+end)()
+
+-- Pure: rows packed into a flat array (STRIDE numbers a row). A missing yaw, scale, height or rank is 0, 1, 10, 0 (as
+-- the rows were read); a row that is not a table or has no position is never shown (HIDDEN).
+function M.flatten(rows, stride)
+  local n, s = type(rows) == 'table' and #rows or 0, math.floor(tonumber(stride) or M.STRIDE)
+  if s < M.STRIDE then s = M.STRIDE end
+  local f = newTable(n * s, 0)
+  for i = 1, n do
+    local r, b = rows[i], (i - 1) * s
+    if type(r) ~= 'table' or not (r[F_X] and r[F_Y] and r[F_Z]) then r = HIDDEN end
+    f[b + F_GROUP], f[b + F_X], f[b + F_Y], f[b + F_Z] = r[F_GROUP] or 0, r[F_X], r[F_Y], r[F_Z]
+    f[b + F_YAW], f[b + F_SCALE], f[b + F_HEIGHT], f[b + F_RANK] = r[F_YAW] or 0, r[F_SCALE] or 1, r[F_HEIGHT] or 10,
+      r[F_RANK] or 0
+    if s > M.STRIDE and type(r) == 'table' then
+      for j = M.STRIDE + 1, s do f[b + j] = type(r[j]) == 'number' and r[j] or 0 end
+    end
+  end
+  return f
+end
+
 -- Pure: the variant v's spelling of a shape path (0: itself).
-local spelled = {}       -- shape -> { v -> its spelling } (no new string a row)
 function M.variant(shape, v)
   if not v or v <= 0 then return shape end
-  local c = spelled[shape]
-  if not c then c = {}; spelled[shape] = c end
-  local sp = c[v]
-  if not sp then
-    sp = shape:gsub('/([^/]+)$', '/' .. string.rep('./', v) .. '%1')
-    c[v] = sp
-  end
-  return sp
+  return (shape:gsub('/([^/]+)$', '/' .. string.rep('./', v) .. '%1'))
 end
 
 -- Pure: a tile's shape variant from its key ("a:tx_ty" / "a:ptx_ty"): neighbours differ.
@@ -394,21 +585,27 @@ function M.tileVariant(key)
   return (tonumber(tx) * 3 + tonumber(ty) * 5) % math.max(M.SHAPE_VARIANTS, 1)
 end
 
+-- M.variant's spellings, made once (a gsub an item was ~16 % of the tree work's own Lua time, an offline drive)
+local spellings = {}    -- shape -> { variant -> its spelling }
+local function spelled(shape, v)
+  local byV = spellings[shape]
+  if not byV then byV = {}; spellings[shape] = byV end
+  local s = byV[v]
+  if not s then s = M.variant(shape, v); byV[v] = s end
+  return s
+end
+
 -- The shape (the tile's variant) and scale of a tile's row i (cached: M.pick makes tables).
 local function shapeOf(t, i)
   local s = t.shapes[i]
   if s then return s, t.scales[i] end
-  local sc
-  local f, j = t.flat, (i - 1) * ROW_N
-  s, sc = M.pick((t.groups or GROUPS)[f[j + 1] + 1] or 'deciduous', f[j + 7], f[j + 8])
-  s = M.variant(s, t.variant)
+  local f, b, sc = t.f, (i - 1) * t.s, nil
+  s, sc = M.pick((t.groups or GROUPS)[f[b + F_GROUP] + 1] or 'deciduous', f[b + F_HEIGHT], f[b + F_RANK])
+  s = spelled(s, t.variant)
   t.shapes[i], t.scales[i] = s, sc
   return s, sc
 end
 
--- group: a sign's group (vienna_convention_speed_signs.lua) also makes a second item at the same spot and scale, its
--- body, and takes the collision. Only the first shape is counted in pop (allow's budget): the body is shared by every
--- sign, spelled in the tile's variant like the rest, so its population is split.
 -- Pure: a shape's plain path (M.variant's spellings undone).
 function M.baseOf(shape)
   local b, n = shape, 1
@@ -521,20 +718,42 @@ local function warmStep(player, frame)
   end
 end
 
-local function makeItem(fd, f, j, shape, sc, solid, group, variant)
+-- group: a sign's group (vienna_convention_speed_signs.lua) also makes a second item at the same spot and scale, its
+-- body, and takes the collision. Only the first shape is counted in pop (allow's budget): the body is shared by every
+-- sign, spelled in the tile's variant like the rest, so its population is split.
+-- One matrix and two vectors for every item made (from Madderose's PR #41): createNewItem copies the transform into
+-- the item, as the stock foliage scatter tool relies on (editor/toolUtilities/foliageScatter.lua reuses its pose and
+-- vectors for every item it plants). A new MatrixF and two to five vec3 an item were garbage for the Lua collector,
+-- thousands a second while a forest loads. Every item sets the whole rotation and the position: nothing of the item
+-- before stays.
+local itemMat, itemVec, itemPos = nil, nil, nil
+local function makeItem(fd, t, i, shape, sc, solid, group, variant)
   local d = itemType(shape, vienna.faceSolid(group, solid))
   if not d then M.errors = M.errors + 1; return nil end
-  local m = MatrixF(true)
+  if not itemMat then itemMat, itemVec, itemPos = MatrixF(true), vec3(0, 0, 0), vec3(0, 0, 0) end
+  local m = itemMat
   -- setFromEuler turns clockwise (the engine's headings): a row's yaw (counter-clockwise from +x, the server's) is
   -- given negated. Positive, every prop was mirrored about the x axis: doors on north-south walls backwards, on
   -- diagonal walls askew, benches and lamps turned (read back in-game 2026-10-17: rows at 141.6 rendered at -141.6)
-  m:setFromEuler(vec3(0, 0, -math.rad(f[j + 5])))
-  m:setPosition(vec3(f[j + 2], f[j + 3], f[j + 4]))
-  local ok, it = pcall(fd.createNewItem, fd, d, m, sc)   -- no closure: one per item kept LuaJIT from compiling
+  local f, b = t.f, (i - 1) * t.s
+  itemPos:set(f[b + F_X], f[b + F_Y], f[b + F_Z])
+  if t.s >= 17 and type(f[b + 17]) == 'number' then
+    -- Guardrails carry their orthonormal world-space basis; local X follows the road chord.
+    itemVec:set(f[b + 9], f[b + 10], f[b + 11]); m:setColumn(0, itemVec)
+    itemVec:set(f[b + 12], f[b + 13], f[b + 14]); m:setColumn(1, itemVec)
+    itemVec:set(f[b + 15], f[b + 16], f[b + 17]); m:setColumn(2, itemVec)
+    m:setPosition(itemPos)
+  else
+    -- Existing props use a flat yaw (counter-clockwise in server coordinates).
+    itemVec:set(0, 0, -math.rad(f[b + F_YAW]))
+    m:setFromEuler(itemVec)
+    m:setPosition(itemPos)
+  end
+  local ok, it = pcall(function() return fd:createNewItem(d, m, sc) end)
   if not ok then M.errors = M.errors + 1; return nil end
   local body = vienna.body(group)
   if body then
-    local pair = vienna.addBody(fd, it, M.variant(body, variant), m, sc, solid, itemType)
+    local pair = vienna.addBody(fd, it, spelled(body, variant), m, sc, solid, itemType)
     if pair then it = pair else M.errors = M.errors + 1 end
   end
   M.made = M.made + 1
@@ -544,7 +763,7 @@ local function makeItem(fd, f, j, shape, sc, solid, group, variant)
 end
 
 local function removeItem(fd, it, shape)
-  if not vienna.remove(fd, it) then pcall(fd.removeItem, fd, it) end
+  if not vienna.remove(fd, it) then pcall(function() fd:removeItem(it) end) end
   M.removed = M.removed + 1
   if shape then pop[shape] = math.max((pop[shape] or 1) - 1, 0) end
 end
@@ -560,49 +779,61 @@ local function allow(shape)
   return true
 end
 
--- A 'veg_tile' message: { anchorId, key, path, n }.
-function M.onTile(msg, currentAnchor)
-  if msg.anchorId ~= currentAnchor or type(msg.path) ~= 'string' then return end
-  -- the file's JSON in the message (server staging.inline_json: Windows' first read of a file the server just wrote took
-  -- up to 0.5 s in the frame), else the file
-  local ok, data = true, msg.data
-  if type(data) ~= 'table' then ok, data = pcall(jsonDecode, readFile(msg.path) or '') end
-  if not ok or type(data) ~= 'table' or type(data.items) ~= 'table' then
-    M.errors = M.errors + 1
-    return
-  end
-  M.onRows(msg.anchorId, msg.key, data.items, data.groups)
-end
-
--- Rows of a tile from elsewhere (a road tile's street furniture: roads.lua, key "p<tx>_<ty>").
-function M.onRows(anchorId, tileKey, rows, groups)
+-- A tile's items as a flat array (STRIDE numbers each, or more: stride), shown from the next update on.
+local function addTile(anchorId, tileKey, flat, stride, groups)
   local key = anchorId .. ':' .. tostring(tileKey)
   local old = tiles[key]
   local tx, ty = tostring(tileKey):match('(%-?%d+)_(%-?%d+)$')
-  rows = type(rows) == 'table' and rows or {}
-  local same = old and old.src[1] == rows      -- (the same rows again: a road tile's props sent once more)
-  local flat, n
-  if same then flat, n = old.flat, old.n else flat, n = pack(rows) end
-  local t = { anchor = anchorId, flat = flat, n = n, src = setmetatable({ rows }, WEAK),
+  -- (the shape cache is the items': every message brings items of its own)
+  local t = { anchor = anchorId, f = flat, s = stride, n = math.floor(#flat / stride),
     groups = type(groups) == 'table' and groups or nil,
     made = old and old.made or {}, solid = old and old.solid or {}, near = old and old.near,
-    shapes = same and old.shapes or {}, scales = same and old.scales or {},
+    shapes = {}, scales = {},
     madeShape = old and old.madeShape or {}, shown = old and old.shown or 0, forestId = old and old.forestId or nil,
     variant = M.tileVariant(key), cx = (tonumber(tx) or 0) * 256 + 128, cy = (tonumber(ty) or 0) * 256 + 128, drop = false }
   tiles[key] = t
+  dirty = true
   queueWarm(t.groups or GROUPS)
+end
+
+-- A 'veg_tile' message: { anchorId, key, path, n }. Returns the tile's data (its ambience: ambience.lua).
+function M.onTile(msg, currentAnchor)
+  if msg.anchorId ~= currentAnchor or type(msg.path) ~= 'string' then return end
+  -- the file's JSON in the message (server staging.inline_json: Windows' first read of a file the server just wrote took
+  -- up to 0.5 s in the frame), else the file: { groups, stride, flat } (hello.vegFlat), or { groups, items } (rows)
+  local ok, data = true, msg.data
+  if type(data) ~= 'table' then ok, data = pcall(jsonDecode, readFile(msg.path) or '') end
+  local stride = type(data) == 'table' and tonumber(data.stride)
+  if ok and type(data) == 'table' and type(data.flat) == 'table' and stride and stride >= M.STRIDE
+      and stride == math.floor(stride) then
+    addTile(msg.anchorId, msg.key, data.flat, stride, data.groups)
+  elseif ok and type(data) == 'table' and type(data.items) == 'table' then
+    M.onRows(msg.anchorId, msg.key, data.items, data.groups)
+  else
+    M.errors = M.errors + 1
+    return
+  end
+  return data
+end
+
+-- Rows of a tile ({ { group, x, y, z, yaw, scale, height, rank }, ... }): an older server's vegetation tile, a road
+-- tile's street furniture (roads.lua, key "p<tx>_<ty>").
+function M.onRows(anchorId, tileKey, rows, groups, stride)
+  stride = math.floor(tonumber(stride) or M.STRIDE)
+  if stride < M.STRIDE then stride = M.STRIDE end
+  addTile(anchorId, tileKey, M.flatten(rows, stride), stride, groups)
 end
 
 -- The tile "anchorId:key" goes (roads.lua's furniture).
 function M.dropKey(key)
   local t = tiles[key]
-  if t then t.drop = true end
+  if t then t.drop = true; dirty = true end
 end
 
 -- A 'veg_drop' message: the tile's items go.
 function M.onDrop(msg)
   local t = tiles[msg.anchorId .. ':' .. tostring(msg.key)]
-  if t then t.drop = true end
+  if t then t.drop = true; dirty = true end
 end
 
 local function threshold(d)
@@ -616,13 +847,13 @@ end
 -- of its rows' ranks: exact whatever share of the area's items the server sent, vegetation.TILE_ROWS_MAX).
 local function tileThreshold(d, t)
   local want = threshold(d)
-  local n, f = t.n or 0, t.flat
+  local n = t.n or 0
   for _, r in ipairs(M.TILE_CAP) do
     if d <= r[1] then
       if n <= r[2] then return want end
       if not t.ranks then
-        local rk = {}
-        for i = 1, n do rk[i] = f[(i - 1) * ROW_N + 8] end
+        local rk, f, s = newTable(n, 0), t.f, t.s
+        for i = 1, n do rk[i] = f[(i - 1) * s + F_RANK] end
         table.sort(rk)
         t.ranks = rk
       end
@@ -682,11 +913,11 @@ local function cellRows(t)
   local n = math.floor(256 / M.CELL_M)
   local x0, y0 = t.cx - 128, t.cy - 128
   t.cells, t.cellRows = {}, {}
-  local f = t.flat
+  local f, s = t.f, t.s
   for i = 1, t.n do
-    local j = (i - 1) * ROW_N
-    local ci = math.max(0, math.min(n - 1, math.floor((f[j + 2] - x0) / M.CELL_M)))
-    local cj = math.max(0, math.min(n - 1, math.floor((f[j + 3] - y0) / M.CELL_M)))
+    local b = (i - 1) * s
+    local ci = math.max(0, math.min(n - 1, math.floor((f[b + F_X] - x0) / M.CELL_M)))
+    local cj = math.max(0, math.min(n - 1, math.floor((f[b + F_Y] - y0) / M.CELL_M)))
     local c = cj * n + ci + 1
     t.cells[i] = c
     local l = t.cellRows[c]
@@ -743,11 +974,13 @@ function M.changedRows(t, old, new, extra, car)
   return out
 end
 
+
 -- M.suppress(group, x, y) -> true hides that item (set by navgraph.lua); M.refresh() re-runs every tile's rows
 -- after it changes.
 M.suppress = nil
 function M.refresh()
-  for _, t in pairs(tiles) do t.pending = true end
+  for _, t in pairs(tiles) do t.pending, t.scan, t.pendingRows = true, nil, nil end    -- (every row again: an interrupted pass too)
+  dirty = true
 end
 
 -- Which of the capped groups a tile at distance d still shows (changes re-run its rows).
@@ -789,7 +1022,7 @@ function M.transform(xf, geodesy)
       any = true
     end
   end
-  if any then ghostSince = stopwatch.new() end
+  if any then ghostSince = stopwatch.new(); dirty = true end
 end
 
 -- Ghost tiles whose square the current anchor's filled tiles cover go (emptied by update's first loop).
@@ -812,7 +1045,7 @@ releaseGhosts = function(anchorId, player)
       if not ok and player and ghostSince() > M.GHOST_FAR_WAIT_S * 1000 then     -- (roads.lua GHOST_FAR_WAIT_S)
         local dx = math.max(math.abs(player.x - t.cx) - 128, 0)
         local dy = math.max(math.abs(player.y - t.cy) - 128, 0)
-        ok = math.max(dx, dy) > M.GHOST_FAR_M
+        ok = dx * dx + dy * dy > M.GHOST_FAR_M * M.GHOST_FAR_M      -- (a disc, as the server's drop: roads.tiles_near)
       end
       if not ok then
         ok = true
@@ -828,77 +1061,65 @@ releaseGhosts = function(anchorId, player)
   if not left then ghostSince = nil end
 end
 
--- Rows put back because their shape could not change this frame (allow) wait by shape: t.wait (shape -> rows), t.waiting
--- (row -> true). A frame looks at a shape's rows again only once allow lets it touch that shape, not at each row every
--- frame (the replay, 2026-10-26, A13 at 307 km/h: 14 M rows looked at for 0.68 M items made or removed, 6 M of them
--- only put back, again and again).
-local function wait(t, i, sh)
-  local w, ws = t.wait, t.waiting
-  if not w then w, ws = {}, {}; t.wait, t.waiting = w, ws end
-  if ws[i] then return end
-  local l = w[sh]
-  if not l then l = {}; w[sh] = l end
-  l[#l + 1] = i
-  ws[i] = true
-end
-
--- The waiting rows whose shape this frame may touch (taken out of t.wait), or nil.
-local function unwait(t)
-  local w = t.wait
-  if not w then return nil end
-  local out = nil
-  for sh, l in pairs(w) do
-    if allow(sh) then
-      out = out or {}
-      local ws = t.waiting
-      for q = 1, #l do out[#out + 1] = l[q]; ws[l[q]] = nil end
-      w[sh] = nil
-    end
-  end
-  return out
-end
-
 -- Every frame: tiles of other anchors and dropped ones emptied, the others filled / thinned to their
 -- distance's rank, M.PER_FRAME items at most.
 -- Tree work every EVERY_N-th frame, N times the items: a frame with any Forest change costs the engine's tick a few
 -- ms whatever the count (2026-10-15, 100 mph forest drive: tick 3.5 -> 1.65 ms a frame on average, 50 -> 54 fps)
 M.EVERY_N = 3
--- ... and at most WORK_MS of wall time in a work frame (looked at every 32 rows; 0 = no cap): its 750 items at the
--- ~19 us probed in game made a ~14 ms bump every 3rd frame, a regular one the dt filter passes (Felix 2026-10-26,
--- "lehmig"; the collision thread's replay: a work frame's p50 2.6 ms, so the cap trims the peaks only)
-M.WORK_MS = 6
-local workT0 = 0
 local frameN = 0
 -- the order's sort: by class, then pathKey (a module function: one made per call kept LuaJIT from compiling update)
 local function byClassThenPath(a, b)
   if a[6] ~= b[6] then return a[6] < b[6] end
   return a[7] < b[7]
 end
+-- A pass with nothing to do is skipped (the user, 2026-10-28: "the game speed/time is inconsistent"): it still sorted
+-- every tile by distance and ranked each (1331 tiles in Baltimore: ~2.5 ms of Lua and its garbage every third frame,
+-- the frame-to-frame swing the engine's smoothed time step turned into game speed pulsing +-25 % over 0.25 s). A pass
+-- runs when a tile came, went or waits (dirty), the car or the view moved RECHECK_M since the last one, another car's
+-- trees are near (foci) or RECHECK_S went by.
+M.RECHECK_M = 5
+M.RECHECK_S = 1.0
+-- (dirty, lastPass: declared with the tiles, which set them)
 -- view: the camera's {x, y} when it is away from the car (core: VIEW_AWAY_M), else nil: what is shown follows what the
 -- player looks at, the colliding items stay round the car (the user, 2026-10-20: "the LODs still all follow the car").
--- Trees give way to the governor's heavy ops (Felix 2026-10-26, "lehmig" at speed: no hitches, yet runs of 30-60 ms
--- frames): a terrain commit waits for two calm frames, and tree changes, outside the governor's budget, kept frames
--- from being calm while every far tile and road had already stopped; their engine cost also landed in the frames round
--- the commit. So no tree work while a heavy op waits, in its frame or in the quiet frames after it (gov: core's
--- governor; nil = never yield). trees.YIELD = false turns it off; M.yielded counts the frames given way.
-M.YIELD = true
-M.yielded = 0
-
-function M.update(anchorId, player, view, gov)
+-- frameMs: this frame's Lua time for the tree work (default FRAME_MS); 0: none this frame (core: the governor's heavy
+-- frame or the quiet frames round it), the batch waits for the next frame.
+function M.update(anchorId, player, view, frameMs)
   if not next(tiles) then return end
+  if frameMs and frameMs <= 0 then M.yielded = (M.yielded or 0) + 1; return end
   if not setup() then return end
   frameN = frameN + 1
-  if M.YIELD and gov and (gov.heavyPending or gov.blocked or (gov.isHeavyFrame and gov:isHeavyFrame())) then
-    M.yielded = M.yielded + 1
-    return
-  end
   if frameN % M.EVERY_N ~= 0 then return end
-  local budget = M.PER_FRAME * M.EVERY_N
-  workT0 = now()
-  M.lastShapeItems = touchedItems        -- the previous frame's (diagnostics)
-  touched, touchedItems = {}, 0
   coldBase, coldSpell = 0, 0
   expireWarm(frameN)
+  -- the car's velocity: the colliding cells along its path (M.cellMask), the tiles ahead first (LOOKAHEAD), the shapes
+  -- loaded ahead while it stands (FIRST_LOADS)
+  local veh = getPlayerVehicle and getPlayerVehicle(0)
+  local vel = veh and veh.getVelocity and veh:getVelocity()
+  local sp = vel and math.sqrt(vel.x * vel.x + vel.y * vel.y) or 0
+  slowNow = sp < M.WARM_MAX_MS
+  if player and slowNow and M.FIRST_LOADS then warmStep(player, frameN) end
+  -- (the car starting or stopping changes what collides: M.cellMask's corridor from FAST_MS on)
+  if not dirty and not ghostSince and #foci == 0 and lastPass and lastPass.anchor == anchorId and player
+      and lastPass.fast == (sp >= M.FAST_MS)
+      and math.abs(player.x - lastPass.x) + math.abs(player.y - lastPass.y) < M.RECHECK_M
+      and (view and lastPass.vx and math.abs(view.x - lastPass.vx) + math.abs(view.y - lastPass.vy) < M.RECHECK_M
+        or not view and not lastPass.vx)
+      and lastPass.clock() < M.RECHECK_S * 1000 then
+    M.skipped = (M.skipped or 0) + 1      -- (diagnostics)
+    -- nothing to change: a spare Forest made for the pool (its ~9 ms alone, not in a frame of items), as a pass that
+    -- changed nothing does below
+    if #pool < M.POOL_SPARE then pool[#pool + 1] = newForest():getID() end
+    return
+  end
+  dirty = false                           -- (set again below by anything this pass leaves undone)
+  lastPass = player and { anchor = anchorId, x = player.x, y = player.y, vx = view and view.x, vy = view and view.y,
+    fast = sp >= M.FAST_MS, clock = stopwatch.new() } or nil
+  local budget = M.PER_FRAME * M.EVERY_N
+  local limit, elapsed = frameMs or M.FRAME_MS, M.clock()
+  newForests = 0
+  M.lastShapeItems = touchedItems        -- the previous frame's (diagnostics)
+  touched, touchedItems = {}, 0
   releaseGhosts(anchorId, player)
   for key, t in pairs(tiles) do
     if (t.anchor ~= anchorId and not t.ghost) or t.drop then
@@ -906,7 +1127,7 @@ function M.update(anchorId, player, view, gov)
       local fd = f and f:getData()
       local left = false
       for i, it in pairs(t.made) do
-        if budget <= 0 then return end
+        if budget <= 0 or elapsed() > limit then dirty = true; return end
         local sh = t.madeShape[i]
         if not sh or allow(sh) then
           if fd then removeItem(fd, it, sh) end
@@ -917,21 +1138,16 @@ function M.update(anchorId, player, view, gov)
       if not left then
         releaseForest(t)
         tiles[key] = nil
-      end
+      else dirty = true end
     end
   end
   if not player then return end
   -- the colliding items: by cells round the car, at speed along its path (M.cellMask)
   local car = { x = player.x, y = player.y }
-  local veh = getPlayerVehicle and getPlayerVehicle(0)
-  local vel = veh and veh.getVelocity and veh:getVelocity()
-  local sp = vel and math.sqrt(vel.x * vel.x + vel.y * vel.y) or 0
   if sp >= M.FAST_MS then
     car.ux, car.uy, car.lead = vel.x / sp, vel.y / sp, math.max(M.SOLID_M, sp * M.SOLID_LEAD_S)
   end
   M.lastFast = car.ux ~= nil
-  slowNow = sp < M.WARM_MAX_MS
-  if slowNow and M.FIRST_LOADS then warmStep(player, frameN) end
   -- nearest tiles first (to the camera when it is away: view), those whose colliding items change before the rest;
   -- [3] the distance to the car (the colliding items), [4] every item solid, [5] the solid cells, [6] the class
   local order = {}
@@ -990,6 +1206,7 @@ function M.update(anchorId, player, view, gov)
   local urgentR2 = math.max(M.URGENT_MIN_M, sp * M.URGENT_S) ^ 2
   local rowsScanned = 0
   local function finish()
+    M.lastRows = rowsScanned                -- (diagnostics)
     if nearMade then
       local ok, roads = pcall(require, 'beamngEarth/roads')
       if ok and roads.requestCollision then roads.requestCollision(urgentMade) end
@@ -998,88 +1215,138 @@ function M.update(anchorId, player, view, gov)
   for _, o in ipairs(order) do
     local t = tiles[o[1]]
     local fd = nil                          -- the tile's Forest data, made when it first needs an item
+    local function data()
+      if not fd then
+        local fo = forest(t)
+        fd = fo and fo:getData()
+      end
+      return fd
+    end
     local want = tileThreshold(o[2], t)
     local band = groupBand(t, o[2])
     local all, mask = o[4], o[5]
     local near = all or mask ~= ''
     if want ~= t.shown or band ~= t.band or all ~= t.all or mask ~= (t.mask or '') or t.pending then
-      -- only solid cells changed: those cells' rows and the ones left over (t.pendingRows), else every row
-      local idxs, more = nil, nil
+      if rowsScanned > M.ROWS_PER_FRAME then dirty = true; finish(); return end   -- (its pass in a later frame: pending kept)
+      -- only solid cells changed: those cells' rows and the ones left over (t.pendingRows); else every row, from where
+      -- an interrupted pass for the same targets stopped (t.scan)
+      local idxs = nil
       if want == t.shown and band == t.band and all == t.all and (not t.pending or t.pendingRows) then
         idxs = M.changedRows(t, t.mask or '', mask, t.pending and t.pendingRows or nil, car)
-        more = unwait(t)
-      else
-        t.wait, t.waiting = nil, nil        -- (every row is looked at)
+        -- (the tile's state is what it shows once these rows are done: those not done are its pendingRows)
+        t.all, t.mask, t.near = all, mask, near
       end
-      if rowsScanned > M.ROWS_PER_FRAME then finish(); return end
-      -- (the tile's state is what it shows once its rows are done: the rows not done yet are its pendingRows)
-      t.pending, t.pendingRows, t.pendingClass = false, nil, nil
-      t.all, t.mask, t.shown, t.band, t.near = all, mask, want, band, near
-      local left = {}
+      local scan = t.scan
+      local from = 1
+      if not idxs then
+        from = scan and scan.want == want and scan.band == band and scan.all == all and scan.mask == mask
+          and scan.from or 1
+      end
+      t.pending, t.pendingRows, t.pendingClass, t.scan = false, nil, nil, nil
       local cells = mask ~= '' and not all and M.cellsOf(t) or nil
+      local f, s, names = t.f, t.s, t.groups or GROUPS
       local n1 = idxs and #idxs or t.n
-      local nrows = n1 + (more and #more or 0)
-      local f = t.flat
-      local waiting = t.waiting
-      rowsScanned = rowsScanned + nrows
-      for k = 1, nrows do
-        local i = k > n1 and more[k - n1] or idxs and idxs[k] or k
-        if k % 32 == 0 and M.WORK_MS > 0 and now() - workT0 >= M.WORK_MS then budget = 0 end
-        if budget <= 0 then          -- (the rest another frame)
-          for k2 = k, nrows do left[#left + 1] = k2 > n1 and more[k2 - n1] or idxs and idxs[k2] or k2 end
-          break
-        end
-        if k <= n1 and waiting and waiting[i] then goto nextRow end      -- (it waits for its shape: t.wait)
-        local j = (i - 1) * ROW_N
-        local r = f[j + 8]
-        local g = (t.groups or GROUPS)[f[j + 1] + 1]
+      rowsScanned = rowsScanned + math.max(0, n1 - from + 1)
+      local left, skipped, stopped = nil, nil, nil
+      local k = from
+      while k <= n1 do
+        if (k - from) % CHECK_ROWS == CHECK_ROWS - 1 and elapsed() > limit then stopped = k; break end
+        if budget <= 0 then stopped = k; break end
+        local i = idxs and idxs[k] or k
+        local b = (i - 1) * s
+        local r = f[b + F_RANK]
+        local g = names[f[b + F_GROUP] + 1]
         local cap = g and M.GROUP_MAX_M[g]
-        if cap and o[2] > cap then r = 2 end     -- this group is not shown this far out
+        local isGuardrail = M.isBarrier(g)
+        if isGuardrail then
+          -- Preserve continuous 3 m runs until a tile cap actually requires thinning.
+          local rowCap
+          for _, lim in ipairs(M.TILE_CAP) do
+            if o[2] <= lim[1] then rowCap = lim[2]; break end
+          end
+          if cap and o[2] > cap then
+            r = 2
+          elseif not rowCap or t.n <= rowCap then
+            r = 0
+          end
+        elseif cap and o[2] > cap then
+          r = 2     -- this group is not shown this far out
+        end
+        if g and M.groupOff[g] then r = 2 end    -- a group the player turned off (setGroupEnabled)
         -- a group this mod has no shapes for (a newer server's): left out, not drawn as a tree
         if g and not M.CATALOG[g] then
           r = 2
           if not M.unknownGroups[g] then M.unknownGroups[g] = true; log('W', 'beamngEarth.trees', 'no shapes for group ' .. g) end
         end
         -- an item something else stands in for (navgraph.lua's switchable signal heads)
-        if g and M.suppress and M.suppress(g, f[j + 2], f[j + 3]) then r = 2 end
+        if g and M.suppress and M.suppress(g, f[b + F_X], f[b + F_Y]) then r = 2 end
         local solid = (all or (cells ~= nil and mask:byte(cells[i]) == 49)) and not M.NO_COLLIDE[g or '']
+        local later = false                     -- (this row another frame: its shapes are full, or no Forest yet)
         if r < want and (not t.made[i] or (t.solid[i] == true) ~= solid) then
           local sh, sc = shapeOf(t, i)
           local body = M.FIRST_LOADS and vienna.body(g)
-          body = body and M.variant(body, t.variant)
+          body = body and spelled(body, t.variant)
           if body and not loaded[body] then     -- (a sign's body first, alone: the face another frame)
             if coldOk(body) then warmShape(body, player, frameN) end
-            left[#left + 1] = i
+            later = true
           elseif allow(sh) then
-            fd = fd or forest(t):getData()
-            if t.made[i] then removeItem(fd, t.made[i], t.madeShape[i]); budget = budget - 1 end  -- solid <-> not
-            t.made[i] = makeItem(fd, f, j, sh, sc, solid, g, t.variant)
+            local d = data()
+            if not d then stopped = k; break end      -- (a new Forest: next frame)
+            if t.made[i] then removeItem(d, t.made[i], t.madeShape[i]); budget = budget - 1 end  -- solid <-> not
+            t.made[i] = makeItem(d, t, i, sh, sc, solid, g, t.variant)
             t.solid[i] = (t.made[i] and solid) or nil      -- true or nil
             t.madeShape[i] = t.made[i] and sh or nil
             if solid then
               nearMade = true
-              local dx, dy = f[j + 2] - car.x, f[j + 3] - car.y
+              local dx, dy = f[b + F_X] - car.x, f[b + F_Y] - car.y
               if not urgentMade and dx * dx + dy * dy <= urgentR2 then urgentMade = true end
             end
             budget = budget - 1
-          else wait(t, i, sh) end                 -- another frame (this one's shapes are full)
+            if elapsed() > limit then stopped = k + 1; break end
+          else later = true end
         elseif r >= want and t.made[i] then
           if allow(t.madeShape[i] or '') then
-            fd = fd or forest(t):getData()
-            removeItem(fd, t.made[i], t.madeShape[i])
+            local d = data()
+            if not d then stopped = k; break end
+            removeItem(d, t.made[i], t.madeShape[i])
             t.made[i], t.solid[i], t.madeShape[i] = nil, nil, nil
             budget = budget - 1
-          else wait(t, i, t.madeShape[i] or '') end
+            if elapsed() > limit then stopped = k + 1; break end
+          else later = true end
         end
-        ::nextRow::
+        if later then
+          if idxs then left = left or {}; left[#left + 1] = i else skipped = skipped or k end
+        end
+        k = k + 1
       end
-      if #left > 0 or (t.wait and next(t.wait) ~= nil) then
-        t.pending, t.pendingRows, t.pendingClass = true, left, math.min(o[6], t.pendingClass or 2)
+      if idxs then
+        if stopped then
+          left = left or {}
+          for k2 = stopped, n1 do left[#left + 1] = idxs[k2] end
+        end
+        if left and #left > 0 then
+          t.pending, t.pendingRows, t.pendingClass = true, left, math.min(o[6], t.pendingClass or 2)
+          dirty = true
+        end
+      elseif stopped or skipped then
+        -- a pass over the tile's rows stopped (its frame's time or items, or no Forest yet): the next pass for the
+        -- same targets goes on from the row it stopped at, or the first it left for another frame (skipped)
+        t.pending, t.pendingClass = true, math.min(o[6], t.pendingClass or 2)
+        t.scan = { from = math.min(stopped or n1 + 1, skipped or n1 + 1), want = want, band = band, all = all,
+          mask = mask }
+        dirty = true
+        if not stopped then t.shown, t.band, t.all, t.mask, t.near = want, band, all, mask, near end
+      else
+        t.shown, t.band, t.all, t.mask, t.near = want, band, all, mask, near
       end
-      if budget <= 0 then finish(); return end
+      if stopped then finish(); return end
     end
   end
   finish()
+  -- nothing changed this frame: a spare Forest made for the pool (its ~9 ms alone, not in a frame of items)
+  if budget == M.PER_FRAME * M.EVERY_N and newForests == 0 and #pool < M.POOL_SPARE then
+    pool[#pool + 1] = newForest():getID()
+  end
 end
 
 -- Disconnect, a new server session, mod unload: every item removed.
@@ -1091,13 +1358,14 @@ function M.clear()
     releaseForest(t)
   end
   expireWarm(frameN, true)
-  tiles, frameN = {}, 0
+  tiles, frameN, dirty, lastPass = {}, 0, true, nil
   clock = nil             -- (a new one at the next use)
 end
 
 -- Level end: the level deletes its objects itself.
 function M.reset()
   tiles, types, ready, pool, forestCount, pop = {}, {}, false, {}, 0, {}
+  dirty, lastPass = true, nil
   loaded, loadedBase, warmBases, warmSpells, warmQueued, warmItems, warmForestId = {}, {}, {}, {}, {}, {}, nil
   coldLast, M.coldRecent, clock, M.coldLoads, M.warmLoads = nil, {}, nil, 0, 0
 end

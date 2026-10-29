@@ -56,12 +56,17 @@ COLUMNS = {
     # for the segments Overture took from a relation (no way id: Samara's Novo-Sadovaya, "r3851280@53", drawn 10 m wide
     # instead of its 6 lanes, the user 2026-10-24): the way of the same name around them (join)
     "name": "name",
+    # a road not built yet (GitHub #184: a trunk road under construction, opening 2026-12-31, drawn as a finished road;
+    # Overture calls highway=construction "unknown"): only these two values, every other highway NULL
+    "osm_highway": "CASE WHEN highway IN ('construction', 'proposed') THEN highway END",
     "bx0": "bbox.xmin", "by0": "bbox.ymin", "bx1": "bbox.xmax", "by1": "bbox.ymax",
 }
 USED = {"id", "bbox", "lanes", "width", "maxspeed", "sidewalk", "lit", "smoothness", "surface", "oneway", "layer", "name"}
 FLOATS = ("lanes", "width", "maxspeed", "osm_layer")
-TEXTS = ("sidewalk", "lit", "smoothness", "osm_surface", "osm_oneway")
+TEXTS = ("sidewalk", "lit", "smoothness", "osm_surface", "osm_oneway", "osm_highway")
+UNBUILT = ("construction", "proposed")      # osm_highway's values: not drawn (roads.unbuilt)
 NAME_MATCH_M = 25.0     # m a segment's middle may lie outside the bbox of the same-named way it takes the tags of
+ONEWAY_YES = ("yes", "1", "-1", "true")
 
 
 # Racetracks (GitHub #143): Overture's transportation theme has no highway=raceway (Daytona's oval and road course, the
@@ -238,7 +243,8 @@ class OsmTags:
             # only the ways with a tag the roads use (and the raceways): join() treats a way without one as one not
             # here, and building a dict per way of every highway in the cell was most of this thread's CPU
             # (osmtags, 14 CPU-s of a Deck's teleport, 2026-10-23)
-            some = " OR ".join(f"{c} IS NOT NULL" for c in sorted(USED - {"id", "bbox"}))
+            some = " OR ".join([f"{c} IS NOT NULL" for c in sorted(USED - {"id", "bbox"})]
+                               + [f"highway IN ({', '.join(repr(v) for v in UNBUILT)})"])
             rows = None
             if rd.shards_ok:
                 # the candidates' row groups (~120 k ways each, a cell needs a few hundred of them) decoded once per
@@ -415,4 +421,20 @@ def join(feats, tags):
         src = ids if c == "osm_oneway" else named
         feats.attrs[c if c.startswith("osm_") else "osm_" + c] = mg.text_column(
             [str(tags.get(w, {}).get(c, "")) if w is not None else "" for w in src])
+    # A way without a lane count takes the count of the same-named way around it going the same way (one-way or
+    # not): OpenStreetMap's lanes ahead of the class's width (Portland's arterials carry lanes on some of their ways
+    # only, the rest were drawn at the class's guess, the user 2026-10-27).
+    lanes, ows = feats.attrs["osm_lanes"], feats.attrs["osm_oneway"]
+    names = feats.attrs.get("name")
+    sense = {}
+    for w, t in tags.items():
+        if "lanes" in t and t.get("name") and all(k in t for k in ("bx0", "by0", "bx1", "by1")):
+            key = (str(t["name"]), str(t.get("osm_oneway", "")) in ONEWAY_YES)
+            sense.setdefault(key, []).append((w, t["bx0"], t["by0"], t["bx1"], t["by1"]))
+    for i in range(n if sense and names is not None else 0):
+        if np.isnan(lanes[i]):
+            nm = str(names[i])
+            w = _named_way(feats, i, {nm: sense.get((nm, str(ows[i]) in ONEWAY_YES), [])})
+            if w is not None:
+                lanes[i] = float(tags[w]["lanes"])
     return feats

@@ -85,34 +85,15 @@ def _graph(roads_list):
 
 
 def _cycles(edges, adj, max_edges=MAX_EDGES, max_loop=MAX_LOOP_M):
-    """Each short cycle of the road graph once: [(edge index, traversed from its start)]."""
-    seen = set()
-    for k0, (_, _, _, a0, b0, L0) in enumerate(edges):
-        if a0 == b0:                                    # a closed road: a loop by itself
-            cycles = [[(k0, True)]]
-        else:
-            cycles = []
-            stack = [(b0, [(k0, True)], L0)]            # walk from b0 back to a0
-            while stack:
-                n, path, L = stack.pop()
-                if len(path) > max_edges or L > max_loop:
-                    continue
-                for k in adj.get(n, []):
-                    if any(k == q for q, _ in path):
-                        continue
-                    _, _, _, a, b, Lk = edges[k]
-                    fwd = (a == n)
-                    nxt = b if fwd else a
-                    if nxt == a0:
-                        cycles.append(path + [(k, fwd)])
-                    elif len(path) < max_edges:
-                        stack.append((nxt, path + [(k, fwd)], L + Lk))
-        for cyc in cycles:
-            key = frozenset(k for k, _ in cyc)
-            if key in seen:
-                continue
-            seen.add(key)
-            yield cyc
+    """Each short cycle of the road graph once: [(edge index, traversed from its start)]. earthfast.road_cycles (Rust:
+    per edge a stack walk back to its start, each node's edges in index order; adj is _graph's, the same order)."""
+    fast.require(89, "road_cycles")
+    a = np.array([e[3] for e in edges], np.int64)
+    b = np.array([e[4] for e in edges], np.int64)
+    L = np.array([e[5] for e in edges], np.float64)
+    off, edge, fwd = fast._ef.road_cycles(a, b, L, int(max_edges), float(max_loop))
+    for c in range(len(off) - 1):
+        yield [(int(edge[m]), bool(fwd[m])) for m in range(off[c], off[c + 1])]
 
 
 RING_MAX_AREA_M2 = 12000.0  # a roundabout up to ~120 m across

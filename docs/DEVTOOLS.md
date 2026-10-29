@@ -13,8 +13,10 @@ own. Mods call it from a Vue mod entry `/ui/ui-vue/mods/<mod>/index.js` (`onLoad
 using BngSwitch / BngSlider / BngButton from `@/common/components/base`).
 
 BeamNG.Earth uses that:
-- a button **"BeamNG.Earth"** in the shared Mods tab (where users look), opening our settings page;
-  later its own tab once there are several pages (Settings, World Map, Dev Tools);
+- a tab of our own, **"BeamNG.Earth"** (since 2026-10-28, as BeamMP does): one side button per settings page
+  (EarthSettingsPage.vue with props {page}), EarthSettingsSide.vue (connection, help) as the tab's second card; the
+  same pages as a full page of their own (route beamngEarthSettings, EarthSettings.vue) for the main menu. The
+  schema and the shared state are in earthSettingsStore.js;
 - **Settings page** (Vue, `/ui/ui-vue/mods/beamngEarth/EarthSettings.vue`): server connection and
   session, rebase distance, view distance mode (real horizon / fixed km) and haze strength, detail
   level / streaming budget (when the M3 controller exists), sky mode (real time / manual) and the time

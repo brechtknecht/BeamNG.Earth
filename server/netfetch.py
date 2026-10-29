@@ -39,12 +39,14 @@ chains has its breaker open, and earthd then says "Offline - using cached data" 
 One User-Agent for the whole project (USER_AGENT): the app, its version and the project URL; no
 user name, e-mail, machine name, location or session id is ever sent.
 """
+import collections
 import email.utils
 import http.client
 import json
 import logging
 import os
 import random
+import ssl
 import threading
 import time
 from collections import deque
@@ -170,6 +172,10 @@ POLICIES = {
                                        miss_ttl=90 * DAY, **TILE_HOST),
     "s3.amazonaws.com": HostPolicy(rate=50.0, burst=100.0, max_conc=8, daily_budget=None,
                                    allow_prefetch=True, offline_ok=True, miss_ttl=None, **TILE_HOST),
+    # BeamNG.Earth's own data on GitHub Pages (railtags.py: the weekly OSM rail shards, ~300 km each, kept on disk)
+    "tecnagamer.github.io": HostPolicy(rate=4.0, burst=8.0, max_conc=2, daily_budget=2000, allow_prefetch=True,
+                                       offline_ok=True, miss_ttl=7 * DAY, timeout=20.0, max_attempts=2,
+                                       base_delay=2.0, breaker_threshold=6, breaker_window=120.0, optional=True),
     # 20 variables a request = 2 Open-Meteo calls: 500 requests = 1,000 calls a day, hard
     "api.open-meteo.com": HostPolicy(rate=0.1, burst=2.0, max_conc=1, daily_budget=500, daily_hard=500,
                                      cache_ttl=900.0, miss_ttl=None, max_wait=15.0, timeout=10.0, optional=True),
@@ -187,6 +193,13 @@ POLICIES = {
                  "esa-worldcover.s3.eu-central-1.amazonaws.com",
                  "dataforgood-fb-data.s3.amazonaws.com",
                  "copernicus-dem-30m.s3.amazonaws.com")},      # the polar caps' DEM (polardem.py)
+    # British Columbia's lidar DEMs (lidarbc.py): range reads of the Province's open bucket; optional
+    "nrs.objectstore.gov.bc.ca": HostPolicy(rate=20.0, burst=40.0, max_conc=6, daily_budget=None, allow_prefetch=True,
+                                            offline_ok=True, miss_ttl=None, binary=True, timeout=30.0, optional=True),
+    # Canada's lidar terrain model (hrdem.py): range reads of NRCan's COG mosaic; optional (Mapterhorn stands in)
+    "canelevation-dem.s3.ca-central-1.amazonaws.com": HostPolicy(rate=20.0, burst=40.0, max_conc=6, daily_budget=None,
+                                                                 allow_prefetch=True, offline_ok=True, miss_ttl=None,
+                                                                 binary=True, timeout=30.0, optional=True),
     # OurAirports' nightly CSV dump on GitHub Pages (airports.py): two files (~3 MB gzipped) once a week,
     # one request at a time, a hard cap well above a week's need; the copy on disk serves offline
     "davidmegginson.github.io": HostPolicy(rate=0.2, burst=2.0, max_conc=1, daily_budget=20, daily_hard=40,
@@ -195,7 +208,7 @@ POLICIES = {
     # Photon (komoot's OpenStreetMap geocoder, made for search-as-you-type; geocode.py): the map's search box,
     # debounced and cached; a modest rate, a daily cap (fair use of a free public service)
     "photon.komoot.io": HostPolicy(rate=2.0, burst=4.0, max_conc=1, daily_budget=2000, daily_hard=3000,
-                                   cache_ttl=7 * DAY, miss_ttl=None, max_wait=5.0, timeout=8.0, max_attempts=1, optional=True),
+                                   cache_ttl=7 * DAY, miss_ttl=None, max_wait=5.0, timeout=12.0, max_attempts=1, optional=True),
     # OSRM on OpenStreetMap by FOSSGIS (routing.py): one request per GPS destination or re-route; their fair use:
     # ~1 request a second at most, no bulk
     "routing.openstreetmap.de": HostPolicy(rate=0.5, burst=2.0, max_conc=1, daily_budget=300, daily_hard=500,
@@ -248,6 +261,58 @@ def _regional_policies():
 
 POLICIES.update(_regional_policies())
 DEFAULT_POLICY = HostPolicy()
+
+# What each source gives the world, and what the player gets while it does not answer (the user, 2026-10-27: "in case
+# a certain source is not responding ... tell the player what that source effects"). Shown after the host in the
+# status line (Server.net_note); SOURCES.md says more about each.
+ROLES = {
+    "basemap.nationalmap.gov": "US aerial photos; coarser satellite photos meanwhile",
+    "imagery.nationalmap.gov": "detailed US aerial photos (NAIP); coarser photos meanwhile",
+    "apps.geo.fpac.usda.gov": "detailed US aerial photos (NAIP, second source); coarser photos meanwhile",
+    "mdgeodata.md.gov": "Maryland's 6-inch aerial photos; coarser photos meanwhile",
+    "tiles.maps.eox.at": "worldwide satellite photos; new ground outside the detailed-photo regions may stay plain",
+    "tiles.mapterhorn.com": "terrain heights; new places use the coarser backup meanwhile",
+    "download.mapterhorn.com": "the list of where detailed terrain heights exist; new places may load slower",
+    "s3.amazonaws.com": "terrain heights (backup source); only matters while the main one is down too",
+    "copernicus-dem-30m.s3.amazonaws.com": "terrain heights near the poles",
+    "canelevation-dem.s3.ca-central-1.amazonaws.com": "Canada's lidar ground under the distant terrain; as before meanwhile",
+    "nrs.objectstore.gov.bc.ca": "British Columbia's detailed aerial photos (and its lidar, if on); coarser photos meanwhile",
+    "stac.overturemaps.org": "the map data's file list; the copy that comes with the app is used meanwhile",
+    "overturemaps-us-west-2.s3.us-west-2.amazonaws.com":
+        "roads, buildings, water and land use; places not visited before may come without them",
+    "overturemapswestus2.blob.core.windows.net":
+        "roads, buildings, water and land use (second source); only matters while the first is down too",
+    "esa-worldcover.s3.eu-central-1.amazonaws.com":
+        "land cover (ground materials, rocks, town streets); places not visited before get a plain ground meanwhile",
+    "dataforgood-fb-data.s3.amazonaws.com": "the trees; places not visited before have none meanwhile",
+    "gis.ngdc.noaa.gov": "sea depths; new coasts get a plain sloping sea floor meanwhile",
+    "davidmegginson.github.io": "the airport list; the copy on disk is used meanwhile",
+    "data.openstreetmap.us": "road details from OpenStreetMap (lanes, widths, sidewalks); estimated meanwhile",
+    "tecnagamer.github.io": "railway details, US railroad crossing equipment and lane markings; estimated meanwhile",
+    "api.open-meteo.com": "live weather; the weather stays as it is meanwhile",
+    "downloads.sourceforge.net": "the gravity model; standard gravity meanwhile",
+    "photon.komoot.io": "the map's address search",
+    "routing.openstreetmap.de": "GPS routes",
+    "earth.tgforever.net": "the BeamNG.Earth server list in BeamMP",
+    "raw.githubusercontent.com": "the update check",
+    "api.github.com": "one-click updates",
+    "github.com": "one-click updates",
+}
+
+
+def role_of(host):
+    """What host gives the world and what is missing while it does not answer (ROLES; a regional photo source by its
+    place), or None for a host not known here."""
+    host = host.split("#", 1)[0]
+    got = ROLES.get(host)
+    if got is not None:
+        return got
+    import urllib.parse
+    import imagery_regional
+    for name, (url, *_rest) in imagery_regional.REGIONAL.items():
+        if urllib.parse.urlsplit(url).hostname == host:
+            return f"{imagery_regional.PLACE.get(name, name)}'s detailed aerial photos; coarser photos meanwhile"
+    return None
 
 
 # --- errors ------------------------------------------------------------------------------------
@@ -537,12 +602,30 @@ SHARED_TLS = os.environ.get("BNGE_SHARED_TLS", "1") != "0"
 _HTTPS = http.client.HTTPSConnection
 
 
+def windows_ssl_context():
+    """Use Windows' native certificate verification for HTTPS (not CERT_NONE).
+
+    Windows curl/Schannel can build a valid certificate path while OpenSSL's
+    chain selection rejects a stale or expired intermediate. truststore uses
+    Windows CryptoAPI to validate the whole chain, including hostname.
+    """
+    if os.name != "nt":
+        return None
+    try:
+        import truststore
+    except ImportError:
+        log.warning("Windows native TLS certificate verification unavailable: install truststore")
+        return None
+    return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+
+
 class HttpsTransport:
     """GET over one persistent HTTP(S) connection per thread and host (a fresh TLS handshake per tile
     roughly doubled the latency). No redirects are followed."""
 
     def __init__(self):
         self._local = threading.local()
+        self._tls_context = windows_ssl_context()
 
     def request(self, url, headers, timeout):
         """(status, {lower-case header: value}, body)."""
@@ -556,7 +639,11 @@ class HttpsTransport:
             if conn is None:
                 if u.scheme == "https":
                     cls = http.client.HTTPSConnection
-                    kw = {"context": tls_context()} if SHARED_TLS and cls is _HTTPS else {}    # (tests: a stand-in)
+                    kw = {}
+                    if self._tls_context is not None:       # (Windows: its own certificate checks, truststore)
+                        kw["context"] = self._tls_context
+                    elif SHARED_TLS and cls is _HTTPS:      # (tests: a stand-in)
+                        kw["context"] = tls_context()
                     conn = conns[key] = cls(u.netloc, timeout=timeout, **kw)
                 else:
                     conn = conns[key] = http.client.HTTPConnection(u.netloc, timeout=timeout)
@@ -571,6 +658,15 @@ class HttpsTransport:
                 if not reused:          # a fresh connection failed: that is the attempt's result (the
                     raise               # Fetcher retries through the bucket, with backoff)
                 # else: the server may have closed the idle keep-alive connection; reconnect once
+
+
+# --- download speed ---------------------------------------------------------------------------
+RATE_MIN_BYTES = 512 * 1024     # a response this large or larger is a speed sample (smaller ones are mostly latency)
+RATE_WINDOW_S = 120.0           # the samples of the last this many seconds count ...
+RATE_MIN_SAMPLES = 3            # ... at least this many of them
+SLOW_MBPS = 0.4                 # MB/s a large response comes in at or slower (the median): a slow connection. A Windows
+                                # PC on Wi-Fi got 0.02-0.15 MB/s a request; a first visit's ~75 MB of map data took
+                                # minutes and the roads looked stuck (GitHub #241); a wired PC gets 5-15 MB/s
 
 
 # --- per-host state ----------------------------------------------------------------------------
@@ -627,10 +723,24 @@ class Fetcher:
         self._date = self._today()
         self._flushed = clock()
         self._load_stats()
+        self._rates = collections.deque(maxlen=64)     # (clock, MB/s) of the large responses (throughput)
+
+    def throughput(self):
+        """The median speed (MB/s) the large responses of the last RATE_WINDOW_S came in at, or None (too few)."""
+        now = self.clock()
+        with self._lock:
+            r = sorted(v for t, v in self._rates if now - t <= RATE_WINDOW_S)
+        return r[len(r) // 2] if len(r) >= RATE_MIN_SAMPLES else None
+
+    def slow(self):
+        """The throughput when it is SLOW_MBPS or less (a slow connection), else None."""
+        r = self.throughput()
+        return r if r is not None and r <= SLOW_MBPS else None
 
     # --- hosts and policies ------------------------------------------------------------------
     def policy(self, host):
-        return self.policies.get(host, self.default_policy)
+        # (a lane, "host#name": the host's own policy, its own bucket and breaker: get's lane)
+        return self.policies.get(host.split("#", 1)[0], self.default_policy)
 
     def host(self, name):
         with self._lock:
@@ -765,11 +875,11 @@ class Fetcher:
             raise Deferred(f"{h.name}: bucket low, {kind} dropped", url, h.name)
         return h.sem if ahead is None else _Slots(h.sem, ahead)
 
-    def _admit(self, url, kind):
+    def _admit(self, url, kind, lane=None):
         """Everything before the network: (Host, is_probe). The caller then _acquire()s per attempt."""
         if self.offline_flag:
             raise Offline(f"offline: {url}", url, host_of(url))
-        h = self.host(host_of(url))
+        h = self.host(host_of(url) + ("#" + lane if lane else ""))
         self._check_policy(h, url, kind)
         self._check_budget(h, url, kind)
         ok, probe, wait = h.breaker.allow()
@@ -792,9 +902,11 @@ class Fetcher:
         with self._rng_lock:
             return self.rng.uniform(0.0, min(p.max_delay, p.base_delay * 2 ** attempt))
 
-    def get(self, url, *, kind="demand", headers=None):
-        """GET url under its host's policy: a Response with status 2xx, or one of the errors above."""
-        h, probe = self._admit(url, kind)
+    def get(self, url, *, kind="demand", headers=None, lane=None):
+        """GET url under its host's policy: a Response with status 2xx, or one of the errors above. lane: a name of
+        its own (its own rate bucket, breaker and day's count under the host's policy): one kind of request whose
+        failures must not shut another out (the status bar's town lookups and the map's search, GitHub #350)."""
+        h, probe = self._admit(url, kind, lane)
         p = h.policy
         attempts = 1 if probe else max(1, p.max_attempts)
         hd = self.headers(h.name, headers)
@@ -823,6 +935,9 @@ class Fetcher:
                         err = FetchFailed(f"{url}: {type(e).__name__}: {e}", url, h.name)
                         continue
                     elapsed = self.clock() - t0
+                    if body and len(body) >= RATE_MIN_BYTES and elapsed > 0:
+                        with self._lock:
+                            self._rates.append((t0 + elapsed, len(body) / elapsed / 1e6))
                     if NETLOG:
                         _netlog(url, hd, status, body)
                     if perftrace.ON:

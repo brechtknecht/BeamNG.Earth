@@ -109,6 +109,31 @@ def fetcher(script=None, policies=None, **kw):
     return f, clock, sleep, tr
 
 
+class ThroughputTest(unittest.TestCase):
+    """GitHub #241: map data at a crawl looked like stuck road workers; the status says the connection is slow."""
+
+    def test_large_responses_measure_the_connection(self):
+        big = b"x" * (1 << 20)
+        f, clock, _, _ = fetcher({USGS: [(200, {}, big, 10.0)]})            # 1 MiB in 10 s: ~0.1 MB/s
+        self.assertIsNone(f.throughput())
+        for n in range(3):
+            f.get(url(USGS, n))
+        self.assertAlmostEqual(f.throughput(), len(big) / 10.0 / 1e6, places=3)
+        self.assertIsNotNone(f.slow())
+        clock.advance(nf.RATE_WINDOW_S + 1)                                # (old samples age out)
+        self.assertIsNone(f.throughput())
+
+    def test_fast_or_small_responses_are_not_slow(self):
+        f, _, _, _ = fetcher({USGS: [(200, {}, b"x" * (1 << 20), 0.1)]})   # ~10 MB/s
+        for n in range(4):
+            f.get(url(USGS, n))
+        self.assertIsNone(f.slow())
+        g, _, _, _ = fetcher({USGS: [(200, {}, b"x" * 1000, 5.0)]})        # small and slow: latency, no sample
+        for n in range(4):
+            g.get(url(USGS, n))
+        self.assertIsNone(g.throughput())
+
+
 class TokenBucketTest(unittest.TestCase):
     def test_burst_then_rate(self):
         """N demand requests at t=0: `burst` less URGENT_TOKENS go at once, the rest 1/rate apart (the bucket keeps
@@ -399,6 +424,17 @@ class RetryAfterTest(unittest.TestCase):
         with self.assertRaises(nf.RateLimited):
             f.get(url(MT))
         self.assertEqual(f.unavailable_hosts(), [MT])
+
+    def test_a_lane_has_its_own_breaker_under_the_hosts_policy(self):
+        """GitHub #350: the status bar's town lookups timed out, opened photon.komoot.io's breaker and the map's
+        search said 'unavailable'. A lane is the host's policy with its own bucket and breaker."""
+        P = "photon.komoot.io"
+        f, clock, sleep, tr = fetcher()
+        f.host(P + "#reverse").breaker.trip(60)
+        with self.assertRaises(nf.HostUnavailable):
+            f.get(f"https://{P}/reverse?lat=1&lon=2", lane="reverse")
+        self.assertEqual(f.get(f"https://{P}/api/?q=x").body, b"data")          # search: still open
+        self.assertIs(f.host(P + "#reverse").policy, f.host(P).policy)
 
     def test_optional_hosts_left_out_of_the_status(self):
         """GitHub #23: SourceForge (gravity only) blocked in the player's country showed "Degraded" for good."""
@@ -868,7 +904,8 @@ class OfflineTest(unittest.TestCase):
         f.host(EOX).breaker.trip(60.0)
         self.assertFalse(f.offline)
         c.refresh_status()                                              # the note changed: re-sent
-        self.assertEqual(c.writer.msgs[-1]["text"], f"Ready | Degraded: {EOX} unreachable")
+        self.assertEqual(c.writer.msgs[-1]["text"],
+                         f"Ready | Degraded: {EOX} unreachable ({nf.ROLES[EOX]})")     # (what it affects)
         for h in (USGS, MT, "s3.amazonaws.com"):
             f.host(h).breaker.trip(60.0)
         self.assertTrue(f.offline)
@@ -912,3 +949,20 @@ class OfflineTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RolesTest(unittest.TestCase):
+    def test_every_source_says_what_it_affects(self):
+        # the status line names what a source that does not answer affects (the user, 2026-10-27); SOURCES.md too
+        import imagery_regional
+        missing = [h for h, p in nf.POLICIES.items() if not p.denied and nf.role_of(h) is None]
+        self.assertEqual(missing, [])
+        self.assertEqual(sorted(set(imagery_regional.REGIONAL) - set(imagery_regional.PLACE)), [])
+        self.assertIn("Lower Saxony", nf.role_of("opendata.lgln.niedersachsen.de"))
+        self.assertIsNone(nf.role_of("example.com"))
+
+    def test_sources_md_names_every_source(self):
+        doc = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "SOURCES.md"),
+                   encoding="utf-8").read()
+        missing = [h for h, p in nf.POLICIES.items() if not p.denied and h not in doc]
+        self.assertEqual(missing, [])

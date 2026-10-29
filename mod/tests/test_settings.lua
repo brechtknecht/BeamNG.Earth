@@ -35,8 +35,25 @@ local vals, warn = settings.load()
 local d = settings.defaults()
 T.check(#warn == 0, 'no file: no warnings')
 local same = true
-for k, v in pairs(d) do if vals[k] ~= v then same = false end end
-T.check(same, 'no file: every value is its default')
+for k, v in pairs(d) do
+  if vals[k] ~= v and k ~= 'quality' and k ~= 'qualityDetected' then same = false end
+end
+T.check(same, 'no file: every value is its default (but the quality, picked from the hardware)')
+T.check(vals.quality == 'high', 'no file, no GPU info: the High preset (= the old defaults)')
+
+-- the quality presets
+T.check(settings.detectQuality({ name = 'AMD Custom GPU 0932 (RADV VANGOGH)', memoryMB = 6144 }) == 'medium',
+  'a Steam Deck gets Medium')
+T.check(settings.detectQuality({ name = 'Intel UHD 620', memoryMB = 1024 }) == 'low', 'a small GPU gets Low')
+T.check(settings.detectQuality({ name = 'AMD Radeon RX 7900 XTX', memoryMB = 24560 }) == 'high', 'a big GPU gets High')
+for _, p in ipairs(settings.PRESET_ORDER) do
+  for _, k in ipairs(settings.PRESET_KEYS) do
+    T.check(settings.validate(k, settings.PRESETS[p][k]) == settings.PRESETS[p][k], p .. ' preset: valid ' .. k)
+  end
+end
+for _, k in ipairs(settings.PRESET_KEYS) do
+  T.check(settings.PRESETS.high[k] == d[k], 'High is the old default of ' .. k)
+end
 T.check(d.rebaseDistance == rebase.DEFAULT_DISTANCE and d.skyMode == 'real' and d.clouds == true
   and d.viewDistanceMode == 'horizon' and d.viewDistanceKm == 100 and d.hudVisible == false,
   'defaults (15 km rebase, real sky, clouds on, the real horizon (2026-10-11), 100 km fixed, HUD hidden with the page)')
@@ -296,18 +313,18 @@ local view = { connection = 'connected', anchorId = 2, dist = 1200, toRebase = 1
   status = 'ok', defaultLat = 1, defaultLon = 2, rebaseDistance = 15000, rebaseMin = 2000, rebaseMax = 16000, attribution = 'c' }
 local okDraw, errDraw = pcall(ui.draw, view, { teleport = function() end, setRebaseDistance = function(m) return m end })
 local joined = table.concat(drawnText, '\n')
-T.check(okDraw and joined:match('rebase in 13.8 km') and joined:match('pause menu > Mods > BeamNG.Earth'),
+T.check(okDraw and joined:match('rebase in 13.8 km') and joined:match('pause menu > BeamNG.Earth'),
   'compact HUD: status line and the settings hint (' .. tostring(errDraw) .. ')')
 ui.compact, drawnText = false, {}
 okDraw = pcall(ui.draw, view, { teleport = function() end, setRebaseDistance = function(m) return m end })
 T.check(okDraw and table.concat(drawnText, '\n'):match('Anchor: #2'), 'full window still draws')
 
 ------------------------------------------------------------------------------------------
--- the page's own copy of the defaults (EarthSettings.vue settingsSchema: its reset buttons and
+-- the page's own copy of the defaults (earthSettingsStore.js settingsSchema: its reset buttons and
 -- "default" labels) agrees with SCHEMA for every persisted setting it lists
 
 do
-  local f = io.open(dir .. '/../beamng_earth/ui/ui-vue/mods/beamngEarth/EarthSettings.vue', 'r')
+  local f = io.open(dir .. '/../beamng_earth/ui/ui-vue/mods/beamngEarth/earthSettingsStore.js', 'r')
   local page = f and f:read('*a') or ''
   if f then f:close() end
   local defs, seen = settings.defaults(), 0
@@ -445,4 +462,41 @@ do
   for k, v in pairs(saved) do rawset(_G, k, v) end
 end
 
+-- #44: dashboard visibility is a persisted player setting.
+do
+  local dashboard0, settingsFile0 = rawget(_G, 'beamngEarth_dashboard'), files[settings.FILE]
+  beamngEarth_dashboard = nil
+  settings.load()
+  settings.set('dashboardSatellite', false)
+  T.check(files[settings.FILE].dashboardSatellite == false, '#44: dashboard visibility off is persisted')
+  T.check(settings.load().dashboardSatellite == false, '#44: dashboard visibility off survives reload')
+  settings.set('dashboardSatellite', true)
+  T.check(files[settings.FILE].dashboardSatellite == true, '#44: dashboard visibility on is persisted')
+  beamngEarth_dashboard = dashboard0
+  files[settings.FILE] = settingsFile0
+  settings.load()
+end
+
+
+-- presets: picking one sets its knobs; moving a knob makes it Custom (or the preset it now matches)
+local r = settings.setQuality('low')
+T.check(r.ok and settings.get('quality') == 'low' and settings.get('trees') == 'low' and settings.get('groundCover') == false,
+  'Low sets its knobs')
+settings.set('rocks', false)
+T.check(settings.get('quality') == 'custom', 'a knob moved off the preset: Custom')
+settings.set('rocks', true)
+T.check(settings.get('quality') == 'low', 'moved back: the preset again')
+settings.set('quality', 'ultra')
+T.check(settings.get('trees') == 'high' and settings.get('nightLights') == 'many', 'Ultra through set()')
+T.check(settings.validate('quality', 'bogus') == nil, 'an unknown preset is refused')
+
+-- an older file with a knob changed and no quality: kept, Custom (the first run never overrides the player)
+files[settings.FILE] = { version = 1, groundCover = false }
+local v2 = settings.load()
+T.check(v2.groundCover == false and v2.quality == 'custom', 'an old changed knob: kept, quality Custom')
+files[settings.FILE] = { version = 1, groundCover = false, rocks = false, trees = 'low', nightLights = 'few',
+  groundCoverDensity = 'low', viewDistanceMode = 'fixed', viewDistanceKm = 40 }
+local v3 = settings.load()
+T.check(v3.quality == 'custom' or v3.quality == 'low', 'old knobs that match no preset stay theirs')
+files[settings.FILE] = nil
 T.done('test_settings')

@@ -76,6 +76,21 @@ function Anchor:geodeticToEnu(latDeg, lonDeg, h)
   return self:ecefToEnu(M.geodeticToEcef(latDeg, lonDeg, h))
 end
 
+-- The world's convention (the server's ground, roads and outlines): a place's x, y are those of its point at h = 0, its
+-- z that of the point at its height. At its height a point lands h x distance / earth radius farther out (2-3 m at
+-- 1650 m, 13 km from the anchor), so a lat / lon read from (x, y, z) with z in it missed the road it stood on.
+function Anchor:worldToGeodetic(x, y, z)
+  local lat, lon = self:enuToGeodetic(x, y, 0)
+  local _, _, h = self:enuToGeodetic(x, y, z or 0)
+  return lat, lon, h
+end
+
+function Anchor:geodeticToWorld(latDeg, lonDeg, h)
+  local x, y = self:geodeticToEnu(latDeg, lonDeg, 0)
+  local _, _, z = self:geodeticToEnu(latDeg, lonDeg, h or 0)
+  return x, y, z
+end
+
 -- True north at a point (e, n) of this frame, as a unit direction (x, y) of the frame's ground plane. The frame's +y
 -- is north only at the anchor; elsewhere the meridian turns by about d * tan(lat) / R (0.1 deg 15 km off at 39 deg,
 -- 1.5 deg at 85 deg, any direction near a pole, where north is toward the pole).
@@ -121,6 +136,19 @@ function Anchor:transformTo(other)
     eb[3][1] * dx + eb[3][2] * dy + eb[3][3] * dz,
   }
   return setmetatable({ r = r, t = t }, Transform)
+end
+
+-- transformTo, its translation corrected at the place (x, y, z) of this frame so that place lands where the other
+-- frame's world puts it (worldToGeodetic / geodeticToWorld: x, y at h = 0). The worlds of two anchors differ by more
+-- than a rigid move: a place at height h sits h x distance / earth radius from its rigid image (4 m at 1650 m and
+-- 15 km, a rebase on a high plateau); what is near (x, y, z) moves with it, as the rigid transform moves it.
+function Anchor:worldTransformTo(other, x, y, z)
+  local xf = self:transformTo(other)
+  if self.lat == other.lat and self.lon == other.lon then return xf end    -- (the same world: as it is)
+  local rx, ry, rz = xf:apply(x, y, z)
+  local wx, wy, wz = other:geodeticToWorld(self:worldToGeodetic(x, y, z))
+  xf.t[1], xf.t[2], xf.t[3] = xf.t[1] + wx - rx, xf.t[2] + wy - ry, xf.t[3] + wz - rz
+  return xf
 end
 
 -- A point of the old frame in the new frame.

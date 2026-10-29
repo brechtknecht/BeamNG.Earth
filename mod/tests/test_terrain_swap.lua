@@ -113,5 +113,6 @@ terrain.REBIND_AFTER_SWAP = false
 -- the baked base colour's size (A/B, the server's hello): a power of two from 128 to 2048, set on the block too
 T.check(terrain.setBaseTexSize(256) == 256 and terrain.BASE_TEX_SIZE == 256, '256 taken')
 T.check(terrain.get():getField('baseTexSize', 0) == '256', 'and set on the block')
-T.check(terrain.setBaseTexSize(300) == 1024 and terrain.setBaseTexSize(nil) == 1024, 'anything else: the default')
+T.check(terrain.setBaseTexSize(300) == terrain.BASE_TEX_DEFAULT and terrain.setBaseTexSize(nil) == terrain.BASE_TEX_DEFAULT,
+  'anything else: the default')
 T.done('test_terrain_swap')

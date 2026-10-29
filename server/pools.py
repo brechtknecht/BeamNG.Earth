@@ -62,6 +62,30 @@ class RespawningPool:
             pool = self._pool
         for _ in range(getattr(pool, "_max_workers", 1)):
             pool.submit(fn)
+    def recycle(self, why):
+        """The pool's processes killed and the pool made again: for a worker that is alive but never answers (a
+        road tile in flight for minutes left the loading line at "roads & buildings 0/26" for good, Windows,
+        1.7.0-beta, KyzoFox): a dead process makes the pool broken (_renew), a hung one never did. The futures in
+        flight end with BrokenProcessPool (their callers retry). At most every RESPAWN_S. True when recycled."""
+        with self._lock:
+            now = time.monotonic()
+            if now - self._last < RESPAWN_S:
+                return False
+            self._last = now
+            self.respawns += 1
+            old = self._pool
+            self._pool = ProcessPoolExecutor(*self._args, **self._kwargs)
+        log.warning("%s worker processes restarted (%s; %d so far)", self.name, why, self.respawns)
+        for p in list((getattr(old, "_processes", None) or {}).values()):
+            try:
+                p.kill()
+            except Exception:           # (gone already)
+                pass
+        try:
+            old.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+        return True
 
     def shutdown(self, *args, **kwargs):
         with self._lock:

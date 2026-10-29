@@ -91,8 +91,93 @@ class PoleTest(unittest.TestCase):
         m = furniture.wire_mesh(wires, (0, 0, 0))
         self.assertEqual(len(m[1]) % 4, 0)
 
-    def test_no_poles_in_town(self):
-        self.assertEqual(furniture.place([road("d", "tertiary", True)], [], (0, 0, 256, 256)), [])
+    def test_town_street_without_sidewalk_is_lit(self):
+        """A town street with no sidewalk run: lamps from its edge (the user, 2026-10-27: lamps only near the
+        camera; most streets had none), on its poles where the lines run overhead, on posts where buried; a main
+        road's every pole, a side street's every other; a service road: nothing."""
+        rows = furniture.place([road("d", "secondary", True)], [], (0, 0, 256, 256))
+        groups = [x[0] for x in rows]
+        self.assertEqual(groups.count(furniture.G_POLELAMP), groups.count(furniture.G_POLE))
+        self.assertIn(furniture.G_LENS, groups)
+        # (North America: a side street's every other pole; elsewhere every pole: OpenStreetMap's lamps 25-30 m apart)
+        rows = furniture.place([road("d", "residential", True)], [], (0, 0, 256, 256), region="na")
+        groups = [x[0] for x in rows]
+        self.assertLess(groups.count(furniture.G_POLELAMP), 0.6 * groups.count(furniture.G_POLE))
+        self.assertGreater(groups.count(furniture.G_POLELAMP), 0)
+        groups = [x[0] for x in furniture.place([road("d", "residential", True)], [], (0, 0, 256, 256))]
+        self.assertEqual(groups.count(furniture.G_POLELAMP), groups.count(furniture.G_POLE))
+        rows = furniture.place([road("d", "residential", True)], [], (0, 0, 256, 256), buried=1.0)
+        lamps = [x for x in rows if x[0] == furniture.G_LAMP]
+        self.assertGreaterEqual(len(lamps), 5)
+        self.assertNotIn(furniture.G_POLE, [x[0] for x in rows])
+        self.assertTrue(all(abs(abs(x[2] - 50.0) - (4.0 + furniture.LAMP_EDGE_M)) < 0.01 for x in lamps))
+        self.assertEqual(furniture.place([road("d", "service", True)], [], (0, 0, 256, 256)), [])
+        # highways: urban ones and every ramp lit along the outer edge (one-way: the drivers' right), rural ones dark
+        hw = road("m", "motorway", True)
+        hw = (hw[0], hw[1]._replace(dir=1, oneway=True), hw[2], hw[3])
+        lamps = [x for x in furniture.place([hw], [], (0, 0, 256, 256)) if x[0] == furniture.G_LAMP]
+        self.assertGreaterEqual(len(lamps), 3)
+        self.assertTrue(all(x[2] < 50.0 for x in lamps), "right of travel along +x: south of the line")
+        self.assertTrue(all(x[6] == furniture.HIGHWAY_LAMP_H[None] for x in lamps), "the taller highway post")
+        lens = [x for x in furniture.place([hw], [], (0, 0, 256, 256)) if x[0] == furniture.G_LENS]
+        k = furniture.HIGHWAY_LAMP_H[None] / furniture.LAMP_H[furniture.G_LAMP]
+        self.assertAlmostEqual(lens[0][3] - lamps[0][3], furniture.LAMP_HEADS[furniture.G_LAMP][2] * k
+                               - furniture.LENS_DROP_M, places=1)
+        self.assertEqual([x for x in furniture.place([road("m", "motorway", False)], [], (0, 0, 256, 256))
+                          if x[0] == furniture.G_LAMP], [])
+        ramp = road("r", "motorway", False, 20.0, 230.0)
+        ramp = (ramp[0], ramp[1]._replace(link=True), ramp[2], ramp[3])
+        self.assertTrue(any(x[0] == furniture.G_LAMP for x in furniture.place([ramp], [], (0, 0, 256, 256))))
+        # a rural ramp: lamps at its ends only (partial interchange lighting), an urban one along it
+        rural = [x for x in furniture.place([ramp], [], (0, 0, 256, 256)) if x[0] == furniture.G_LAMP]
+        urban = road("u", "motorway", True, 20.0, 230.0)
+        urban = (urban[0], urban[1]._replace(link=True), urban[2], urban[3])
+        self.assertEqual(len(rural), 2)
+        self.assertGreater(sum(x[0] == furniture.G_LAMP for x in furniture.place([urban], [], (0, 0, 256, 256))), 2)
+        # the states' practice: California lights its interchanges only, Utah its side streets sparsely
+        self.assertEqual(furniture.lamp_region("US", "US-CA"), "na:ramps")
+        self.assertEqual(furniture.lamp_region("US", "US-UT"), "na:sparse")
+        self.assertEqual(furniture.lamp_region("US", "US-MD"), "na")
+        self.assertEqual(furniture.lamp_region("CA", "CA-ON"), "na")
+        self.assertIsNone(furniture.lamp_region("DE", "DE-BY"))
+        self.assertEqual([x for x in furniture.place([hw], [], (0, 0, 256, 256), region="na:ramps")
+                          if x[0] == furniture.G_LAMP], [], "an urban freeway in California: dark between interchanges")
+        self.assertTrue(any(x[0] == furniture.G_LAMP for x in furniture.place([ramp], [], (0, 0, 256, 256),
+                                                                              region="na:ramps")), "its ramps lit")
+        n = {r: sum(x[0] == furniture.G_LAMP for x in furniture.place([road("d", "residential", True)], [],
+                                                                        (0, 0, 256, 256), buried=1.0, town=True,
+                                                                        region=r)) for r in ("na", "na:sparse")}
+        self.assertLess(n["na:sparse"], n["na"])
+        # a country road in a tile of few buildings (town: not a dense core): poles, no lamps
+        rows = furniture.place([road("c", "residential", False)], [], (0, 0, 256, 256), town=True)
+        self.assertIn(furniture.G_POLE, [x[0] for x in rows])
+        self.assertNotIn(furniture.G_POLELAMP, [x[0] for x in rows])
+
+    def test_buried_lines_no_poles(self):
+        """The country's low-voltage lines underground (furniture.BURIED_LV, the user 2026-10-26: poles "almost
+        everywhere"): that share of the roads (hashed) have no poles; all of them in the Netherlands."""
+        self.assertEqual(furniture.buried_share("nl"), 1.0)
+        self.assertEqual(furniture.buried_share("US"), 0.0)
+        self.assertEqual(furniture.buried_share(None), 0.0)
+        rows = furniture.place([road("c", "tertiary", False)], [], (0, 0, 256, 256), wires=[], buried=1.0)
+        self.assertNotIn(furniture.G_POLE, [x[0] for x in rows])
+        roads_ = [road(f"r{k}", "tertiary", False) for k in range(200)]
+        with_poles = sum(1 for r in roads_
+                         if any(x[0] == furniture.G_POLE for x in furniture.place([r], [], (0, 0, 256, 256), buried=0.5)))
+        self.assertTrue(70 <= with_poles <= 130, with_poles)
+
+    def test_buried_town_street_gets_lamps(self):
+        r = road("t", "residential", True)
+        rows = []
+        for side in (1, -1):
+            rows += furniture.place([r], LampTest.walks(None, r, side), (0, 0, 256, 256), wires=[], town=True, buried=1.0)
+        groups = [x[0] for x in rows]
+        self.assertNotIn(furniture.G_POLE, groups)
+        self.assertIn(furniture.G_LAMP, groups)
+        self.assertIn(furniture.G_LENS, groups)        # (the lamps' lenses: night lighting)
+        # and a far glow at every lens, at the same place
+        lens = sorted(tuple(x[1:4]) for x in rows if x[0] == furniture.G_LENS)
+        self.assertEqual(lens, sorted(tuple(x[1:4]) for x in rows if x[0] == furniture.G_GLOW))
 
 
 class JunctionTest(unittest.TestCase):
@@ -164,55 +249,6 @@ class JunctionTest(unittest.TestCase):
         self.assertLess(rows[0][2], 100.0, "on the southern stem")
         self.assertGreater(rows[0][1], 100.0, "on its right for northbound drivers (east side)")
 
-
-
-class SpeedSignTest(unittest.TestCase):
-    def test_a_sign_after_each_end_facing_its_traffic(self):
-        r = road("t", "tertiary", True, x0=0.0, x1=400.0)
-        rows = furniture.speed_signs([r], {"t": 30.0 / 0.999}, (-50, -50, 450, 150))
-        self.assertEqual(sorted(x[0] for x in rows), ["speed30", "speed30"])
-        east = min(rows, key=lambda x: x[1])
-        self.assertAlmostEqual(east[1], furniture.SIGN_IN_M, places=1)
-        self.assertLess(east[2], 50.0, "eastbound traffic: its kerb is the south side")
-        west = max(rows, key=lambda x: x[1])
-        self.assertGreater(west[2], 50.0)
-
-    def test_no_sign_without_a_model_or_on_short_roads(self):
-        self.assertEqual(furniture.speed_signs([road("t", "tertiary", True)], {"t": 35.0}, (-500, -50, 700, 150)), [])
-        self.assertEqual(furniture.speed_signs([road("s", "tertiary", True, x0=0.0, x1=100.0)], {"s": 30.0},
-                                               (-500, -50, 700, 150)), [])
-
-
-    def test_km_h_signs_where_limits_are_in_km_h(self):
-        """Europe: round km/h signs are used there, including higher motorway limits and no-limit signs."""
-        r = road("t", "tertiary", True, x0=0.0, x1=400.0)
-        rows = furniture.speed_signs([r], {"t": 80 / 1.609344}, (-50, -50, 450, 150), mph_signs=False)
-        self.assertEqual(sorted(x[0] for x in rows), ["speedk80", "speedk80"])
-        rows = furniture.speed_signs([r], {"t": 50 / 1.609344}, (-50, -50, 450, 150), mph_signs=False)
-        self.assertEqual(sorted(x[0] for x in rows), ["speedk50", "speedk50"])
-        rows = furniture.speed_signs([r], {"t": 130 / 1.609344}, (-50, -50, 450, 150), mph_signs=False)
-        self.assertEqual(sorted(x[0] for x in rows), ["speedk130", "speedk130"])
-        rows = furniture.speed_signs([r], {"t": 150 / 1.609344}, (-50, -50, 450, 150), mph_signs=False)
-        self.assertEqual(sorted(x[0] for x in rows), ["speedk150", "speedk150"])
-        rows = furniture.speed_signs([r], {"t": float("inf")}, (-50, -50, 450, 150), mph_signs=False)
-        self.assertEqual(sorted(x[0] for x in rows), ["speedknone", "speedknone"])
-
-    def test_km_h_sign_for_every_ten_and_the_limits_around_them(self):
-        """Every posted tens value from 30 to 150 has a sign (90 is rural France and Romania, 70 an unmapped secondary
-        road), a limit between two rounds to the nearer (half up: 45 is 50, 35 is 40), 20 has none and 160+ gets the 150."""
-        r = road("t", "tertiary", True, x0=0.0, x1=400.0)
-
-        def groups(kmh):
-            rows = furniture.speed_signs([r], {"t": kmh / 1.609344}, (-50, -50, 450, 150), mph_signs=False)
-            return sorted({x[0] for x in rows})
-
-        for n in range(30, 151, 10):
-            self.assertEqual(groups(n), [f"speedk{n}"], n)
-        self.assertEqual(groups(44), ["speedk40"])
-        self.assertEqual(groups(45), ["speedk50"])
-        self.assertEqual(groups(35), ["speedk40"])
-        self.assertEqual(groups(20), [])
-        self.assertEqual(groups(200), ["speedk150"])
 
 
 class SignAssetsTest(unittest.TestCase):

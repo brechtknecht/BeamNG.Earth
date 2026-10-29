@@ -37,6 +37,23 @@ class RespawnTest(unittest.TestCase):
         finally:
             p.shutdown()
 
+    def test_a_hung_worker_is_restarted(self):
+        """A worker that never answers (alive, so the pool is not broken) is killed by recycle(): the call in flight
+        ends with BrokenProcessPool and the next one is served (a road tile hung for minutes, 1.7.0-beta)."""
+        import time
+        p = pools.RespawningPool("test", 1)
+        try:
+            hung = p.submit(time.sleep, 3600)
+            time.sleep(0.5)                     # (it is running)
+            with self.assertLogs("earthd.pools", "WARNING"):
+                self.assertTrue(p.recycle("test"))
+            with self.assertRaises(BrokenProcessPool):
+                hung.result(timeout=30)
+            self.assertEqual(p.submit(abs, -5).result(timeout=30), 5)
+            self.assertFalse(p.recycle("again at once"))    # (at most every RESPAWN_S)
+        finally:
+            p.shutdown()
+
 
 if __name__ == "__main__":
     unittest.main()
