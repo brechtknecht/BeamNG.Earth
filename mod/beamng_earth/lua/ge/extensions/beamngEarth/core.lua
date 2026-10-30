@@ -31,6 +31,8 @@ M.TER_SWAP = true
 -- teleports and rebases land on an anchor on its grid (geodesy.snapAnchor; teleportTo, rebaseAnchor): the server's
 -- revisit cache keys on it
 M.SNAP_TELEPORTS = true
+-- every scene change (roads, far tiles, trees, collision rebuilds, parked cars) waits while the window is minimized
+M.HOLD_MINIMIZED = true
 
 -- No terrain change while the window is minimized (canvas client size 0): on 0.40.3 every crash of 2026-10-24
 -- whose log shows the window state (access violation reading 0x48 at exe+0x143296, main thread) came 20-60 ms
@@ -2060,30 +2062,36 @@ local function onUpdate(dtReal, dtSim)
     -- the roads before the far tiles: they share the governor's budget and the first to ask gets it; after a
     -- teleport the far field's hundreds of tiles took it frame after frame and the road meshes under the car
     -- came after it had passed (Brasov, Sinaia 2026-10-15: the car drove bare ground)
-    roads.update(gov, st.anchorId, st.player, M.viewAway())
-    gasstations.update(gov)
-    t = mark('roads', t)
-    farfield.update(gov, (gov.w1 or dtReal * 1000) / 1000, st.cam, st.player)
-    M.updatePhotoless()
-    t = mark('far', t)
-    sea.update(st.anchorId, st.player)
-    t = mark('sea', t)
-    -- the trees' own Lua time a frame (trees.lua FRAME_MS), more while the world loads, none in a heavy frame, the
-    -- quiet frames round it or while a heavy op waits for them (governor.lua: a heavy frame stays a lone spike)
-    trees.update(st.anchorId, st.player, M.viewAway(), (gov.blocked or gov.heavyPending or gov:isHeavyFrame()) and 0
-      or (gov.loading and trees.LOADING_FRAME_MS or trees.FRAME_MS))
-    t = mark('trees', t)
-    pcall(ambience.update, st.anchorId, sea)      -- (sound never stops the world's updates)
-    pcall(pumpjacks.update)
-    pcall(nightlights.update)
-    t = mark('sound', t)
+    -- no scene changes at all while the window is minimized, like the terrain moves (windowMinimized): Felix's crash
+    -- of 2026-10-30 (C++ main thread, 0.40.4) came 22 s after minimizing, with road meshes, collision rebuilds and far
+    -- tile textures still streaming in; it all waits until the window is back
+    local minimized = M.HOLD_MINIMIZED and windowMinimized()
+    if not minimized then
+      roads.update(gov, st.anchorId, st.player, M.viewAway())
+      gasstations.update(gov)
+      t = mark('roads', t)
+      farfield.update(gov, (gov.w1 or dtReal * 1000) / 1000, st.cam, st.player)
+      M.updatePhotoless()
+      t = mark('far', t)
+      sea.update(st.anchorId, st.player)
+      t = mark('sea', t)
+      -- the trees' own Lua time a frame (trees.lua FRAME_MS), more while the world loads, none in a heavy frame, the
+      -- quiet frames round it or while a heavy op waits for them (governor.lua: a heavy frame stays a lone spike)
+      trees.update(st.anchorId, st.player, M.viewAway(), (gov.blocked or gov.heavyPending or gov:isHeavyFrame()) and 0
+        or (gov.loading and trees.LOADING_FRAME_MS or trees.FRAME_MS))
+      t = mark('trees', t)
+      pcall(ambience.update, st.anchorId, sea)      -- (sound never stops the world's updates)
+      pcall(pumpjacks.update)
+      pcall(nightlights.update)
+      t = mark('sound', t)
+    end
     local pb = nil
     if st.block then
       pb = st.parkBox or {}
       st.parkBox = pb
       pb[1], pb[2], pb[3], pb[4] = lattice.groundBox(st.block.cx, st.block.cy)
     end
-    if not fociBroken then
+    if not fociBroken and not minimized then
       local ok, err = pcall(collisionfoci.update, dtReal, { roads.setFoci, trees.setFoci }, extraFoci)
       if not ok then fociBroken = true; log('E', 'beamngEarth', 'collision foci: ' .. tostring(err)) end
       t = mark('foci', t)
@@ -2093,10 +2101,12 @@ local function onUpdate(dtReal, dtSim)
       if not ok then fociBroken = true; log('E', 'beamngEarth', 'far cars: ' .. tostring(err)) end
       t = mark('farcars', t)
     end
-    parking.update(st.anchorId, not (st.player and st.player.camera) and st.player or nil, pb, gov)  -- (no car: none parked)
-    t = mark('parking', t)
-    navgraph.update(st.anchorId, pb, gov)
-    t = mark('navgraph', t)
+    if not minimized then
+      parking.update(st.anchorId, not (st.player and st.player.camera) and st.player or nil, pb, gov)  -- (no car: none parked)
+      t = mark('parking', t)
+      navgraph.update(st.anchorId, pb, gov)
+      t = mark('navgraph', t)
+    end
     updateSky(dtReal)
     updateGuard()
     t = mark('sky', t)
