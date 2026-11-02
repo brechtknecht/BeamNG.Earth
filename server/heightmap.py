@@ -33,15 +33,18 @@ import numpy as np
 import staging
 from PIL import Image
 
-SIZE = 1024
-SQUARE = 1.0                        # m; exactly representable, so the lattice is exact
+# BNGE_SQUARE=2 (Felix's test branch, 2026-11-02): the 2 m block of before 2026-11-01 (512² for 1 km, a quarter of the
+# samples): upstream's 1 m block took 3-10x as long to build and the follow blocks fell behind at 200-300 km/h. The mod
+# takes hello.squareSize (lattice.configure).
+SQUARE = 2.0 if os.environ.get("BNGE_SQUARE", "1").strip() in ("2", "2.0") else 1.0  # m; exact, so the lattice is exact
+SIZE = int(1024 / SQUARE)
 FAR_SQUARE = 2.0                    # m: the far field's near tiles' lattice (every second block sample)
 HALF = SIZE * SQUARE / 2            # block position = centre - HALF
 VALID = (SIZE - 1) * SQUARE         # 1023 m: collidable extent from the SW corner (P1)
 GRID_BY_M = {1024.0: 128.0, 2048.0: 256.0}  # the centre grid (m) by the block's width (m)
 GRID = GRID_BY_M[SIZE * SQUARE]     # block centres are multiples of this
 CHUNK_ROWS = 256                    # bounds the geodesy temporaries
-CHUNK = 128                         # samples: ChunkCache's chunk, 128 m (the block's follow grid)
+CHUNK = int(128 / SQUARE)           # samples: ChunkCache's chunk, 128 m (the block's follow grid)
 CHUNK_CACHE = 512                   # chunks kept per frame (128 KB each: 64 MB, 8 blocks)
 # Height quanta (m), finest first: 65536 Q = 256 ... 4096 m of range per block.
 Q_LADDER = (1 / 256, 1 / 128, 1 / 64, 1 / 32, 1 / 16)

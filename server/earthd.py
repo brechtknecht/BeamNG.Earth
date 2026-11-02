@@ -459,10 +459,10 @@ FOLLOW_RULES = {
 }
 BLOCK_SIZES = tuple(int(m / heightmap.SQUARE) for m in sorted(FOLLOW_RULES))    # samples per edge (1024, 2048)
 TERRAIN_BLOCK = farfield.TERRAIN_BLOCK     # terrain mode's frozen 2 km block
-BLOCK_DEFAULT = 1024        # Server()'s block (test_v131_default.py pins the library default)
+BLOCK_DEFAULT = heightmap.SIZE  # (1024 at 1 m, 512 with BNGE_SQUARE=2) Server()'s block (test_v131_default.py pins the library default)
 # The command line's block in mesh mode: 1 km (M4: in-game 2026-10-10, the 512² block at 2 m; since 2026-11-01 the
 # same kilometre at 1 m, 1024² samples: the stock maps' resolution, a .ter swap of ~29 ms on the Stelvio)
-CLI_BLOCK_MESH = 1024
+CLI_BLOCK_MESH = heightmap.SIZE   # (1 km: 1024 at 1 m, 512 with BNGE_SQUARE=2)
 # |cx|,|cy| of an anchor's first terrain. A rebase hint stays within ~512 m of the new origin, but
 # a resync (same origin, after a server restart) asks for the block around the player, which can be
 # up to the mod's maximum rebase distance (16 km) away, plus however far the player got past it.
@@ -2403,7 +2403,10 @@ class Server:
         provisional: the DEM's ground, no road plans, sea floor or tunnels, the cached roads painted), its stand-in
         photo started beside it (at most STANDIN_WAIT_S; else none, the photo later). Built here (make_provisional) it
         took 11-33 s of a first visit beside the rest of this process's work (nyc_speed.py --cold, 2026-11-02)."""
-        pool = self.photo_pool or (self.block_pools[LANE_PREFETCH][0] if self.block_pools else None)
+        # (its own process first: in the photo or prefetch process it queued behind a graded build or the photos, a
+        # 0.7 s build sent after 17-25 s at 300 km/h, 2026-11-02; STAND_IN_PROCESS)
+        pool = (self.stand_in_pool or self.photo_pool
+                or (self.block_pools[LANE_PREFETCH][0] if self.block_pools else None))
         if pool is None:
             return self.make_provisional(anchor, cx, cy, None)
         t0 = time.perf_counter()
@@ -6792,8 +6795,7 @@ async def main_async(args):
                       args.surface == "on", None, logging.getLogger().level,
                       args.airports == "on", args.sea == "on", NICE_FAR_BUILDINGS, roadsmod.ROADS_IN_GROUND))
     import budget
-    photo_pool = None
-    if (block_pools and args.near_visual == "detail" and args.imagery and not budget.small()
+    if (photo_pool is None and block_pools and args.near_visual == "detail" and args.imagery and not budget.small()
             and os.environ.get("BNGE_PHOTO_PROC", "1") != "0"):      # 0: photos in the other lane's block process
         photo_pool = poolsmod.RespawningPool(     # detail mode's block photos (blockworker.base_photo)
             "base photo", 1, mp_context=ctx, initializer=blockworker.init,
@@ -6856,6 +6858,16 @@ async def main_async(args):
     server.game_cpus = getattr(args, "game_cpus", None)    # (cpupin.py: the game pinned at each hello)
     server.server_cpus = getattr(args, "server_cpus", None)
     server.photo_pool = photo_pool
+    if block_pools and STAND_IN_PROCESS and args.grading == "on" and args.roads == "on":
+        # follow blocks' provisional stand-ins (make_provisional_follow), never behind a graded build or a photo
+        server.stand_in_pool = poolsmod.RespawningPool(
+            "provisional block", 1, mp_context=ctx, initializer=blockworker.init,
+            initargs=(args.cache_dir, args.offline, args.roads == "on", True,
+                      args.road_widths == "on", args.surface == "on", None,
+                      logging.getLogger().level, args.airports == "on", args.sea == "on", -1,
+                      roadsmod.ROADS_IN_GROUND, args.gas_stations == "on"))
+        if POOL_PRESTART:
+            server.stand_in_pool.prestart(blockworker.ready)
     server.boost_cpus = (cpupin.boosted(server.server_cpus, server.game_cpus)
                          if getattr(args, "load_boost", "on") == "on" else None)
     # (a driving player's catch-up lends less: half the game's cores for the whole of a 150 mph drive took its frame
