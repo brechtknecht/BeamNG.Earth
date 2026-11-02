@@ -6383,7 +6383,7 @@ class Connection:
                     x0, y0, x1, y1 = self.desired[k].bbox
                     return max(x0 * ux, x1 * ux) + max(y0 * uy, y1 * uy) - (cx * ux + cy * uy) < -FAR_BEHIND_M
                 for adds, removes in self.groups:
-                    if (adds and removes and all(k[:1].isdigit() for k in adds + removes)
+                    if (adds and removes and not any(farfield.is_special_key(k) for k in adds + removes)
                             and min(farfield.tile_of(k).level for k in adds)
                             < min(farfield.tile_of(k).level for k in removes) and all(map(back, adds))):
                         behind.update(adds)
@@ -6487,7 +6487,7 @@ class Connection:
             self._retire(self.ck(k) for k in removes)
             if perftrace.ON:
                 now = time.monotonic()
-                if adds and removes:            # how close to the car a level change happens (pop-in)
+                if adds and removes and not any(farfield.is_special_key(k) for k in adds + removes):    # pop-in
                     (fx, fy), (vx, vy) = self.focus, self.vel
                     v = math.hypot(vx, vy)
                     tl = [farfield.tile_of(k) for k in adds]
