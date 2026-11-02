@@ -1306,6 +1306,8 @@ class Surface:
                 return
             self._pending_layers.add((key, layers))
             self._pending.add(key)
+        if not getattr(self, "fetch", True):
+            return      # (the provisional blocks' process: the others fetch it; parsing it here held its build, below)
 
         def run():
             try:

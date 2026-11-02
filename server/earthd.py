@@ -6861,7 +6861,7 @@ async def main_async(args):
     if block_pools and STAND_IN_PROCESS and args.grading == "on" and args.roads == "on":
         # follow blocks' provisional stand-ins (make_provisional_follow), never behind a graded build or a photo
         server.stand_in_pool = poolsmod.RespawningPool(
-            "provisional block", 1, mp_context=ctx, initializer=blockworker.init,
+            "provisional block", 1, mp_context=ctx, initializer=blockworker.init_provisional,
             initargs=(args.cache_dir, args.offline, args.roads == "on", True,
                       args.road_widths == "on", args.surface == "on", None,
                       logging.getLogger().level, args.airports == "on", args.sea == "on", -1,

@@ -105,6 +105,9 @@ def _spans_kept(md, key, feats):
 
 _POOL = None
 _POOL_LOCK = threading.Lock()
+# The follow blocks' provisional process (blockworker.init_provisional): a road's neighbour cells only when on disk; asked
+# on demand they were fetched and parsed cold inside its road paint (15.7 s of a 0.7 s block, 300 km/h, 2026-11-02).
+CACHED_NEIGHBOURS_ONLY = False
 
 
 def neighbours_hook(md, key):
@@ -131,8 +134,11 @@ def _neighbours(md, key):
         if _POOL is None:
             from concurrent.futures import ThreadPoolExecutor
             _POOL = ThreadPoolExecutor(8, thread_name_prefix="gradesep-cells")
-    futs = [_POOL.submit(lambda k: md.cell(k, layers=("roads",), kind="demand").layers.get("roads"), k) for k in keys]
-    return [f.result() for f in futs]
+    if CACHED_NEIGHBOURS_ONLY:      # (None: not at hand, as roads.lane_flow takes it)
+        keys = [k if md.has(k, "roads") else None for k in keys]
+    futs = [_POOL.submit(lambda k: md.cell(k, layers=("roads",), kind="demand").layers.get("roads"), k)
+            if k is not None else None for k in keys]
+    return [f.result() if f is not None else None for f in futs]
 
 
 def _kind_half(feats, i):

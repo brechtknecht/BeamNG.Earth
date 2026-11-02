@@ -2081,6 +2081,17 @@ base_photo = _accounted(base_photo)
 navgraph = _accounted(navgraph)
 
 
+def init_provisional(*args, **kw):
+    """init for the follow blocks' provisional process (earthd make_provisional_follow): its land cover and roads only
+    from what is on disk, never fetched here. Its background fetches parsed the OSM cells of a fresh place beside the
+    build (holding the interpreter lock): a 0.7 s build took 16 s, 12.7 of it road paint (300 km/h, 2026-11-02)."""
+    init(*args, **kw)
+    import gradesep
+    gradesep.CACHED_NEIGHBOURS_ONLY = True
+    if getattr(_s, "surface", None) is not None:
+        _s.surface.fetch = False
+
+
 def ready():
     """A no-op job: the process started (and init run) before its first real job (pools.RespawningPool.prestart)."""
     return os.getpid()
