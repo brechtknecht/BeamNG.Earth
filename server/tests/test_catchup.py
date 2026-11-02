@@ -23,6 +23,13 @@ def conn(behind=True):
 
 
 class CatchUpTest(unittest.TestCase):
+    def setUp(self):        # (off by default on the test branch: upstream's share)
+        self._share = earthd.CATCHUP_LEND_SHARE
+        earthd.CATCHUP_LEND_SHARE = 0.25
+
+    def tearDown(self):
+        earthd.CATCHUP_LEND_SHARE = self._share
+
     def test_on_while_behind_and_again_after_another_ended_it(self):
         c = conn()
         earthd.Connection.catch_up(c, 40.0)
