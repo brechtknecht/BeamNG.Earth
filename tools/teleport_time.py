@@ -21,7 +21,7 @@ import mcp  # noqa: E402
 
 POLL_S = 0.5
 LUA = r'''
-local s = loadstring('return ' .. beamngEarth_core.status())() or {}
+local s = loadstring('return ' .. (beamngEarth_core.status():gsub('<function[^>]*>', 'nil')))() or {}
 local rs = require('beamngEarth/roads').status() or {}
 local f, t = s.far or {}, s.trees or {}
 return jsonEncode({ anchor = s.anchorId, farDone = f.done, farQueued = f.queued, live = f.live,

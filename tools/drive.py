@@ -357,7 +357,7 @@ TEST_VEHICLE = ("vivace", None)     # model, config (None = default); handled ev
 SETUP_TEST_VEHICLE = r"""
 local car = getPlayerVehicle(0)
 if not car then return jsonEncode({ error = 'no player vehicle' }) end
-local s = loadstring('return ' .. beamngEarth_core.status())()
+local s = loadstring('return ' .. (beamngEarth_core.status():gsub('<function[^>]*>', 'nil')))()
 local p, d = car:getPosition(), car:getDirectionVector()
 local opts = { pos = vec3(p.x, p.y, p.z + 2), rot = quatFromDir(vec3(d.x, d.y, 0):normalized(), vec3(0, 0, 1)),
   autoEnterVehicle = true }

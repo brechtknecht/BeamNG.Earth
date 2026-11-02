@@ -57,7 +57,7 @@ def shot(path):
 SETUP = r'''
 local car = getPlayerVehicle(0)
 if not car then return jsonEncode({error = 'no player vehicle'}) end
-local s = loadstring('return ' .. beamngEarth_core.status())()
+local s = loadstring('return ' .. (beamngEarth_core.status():gsub('<function[^>]*>', 'nil')))()
 local p = car:getPosition()
 BNGE_BALL = { carId = car:getID(), lat = s.player.lat, lon = s.player.lon }
 local ball = core_vehicles.spawnNewVehicle('ball', { pos = vec3(p.x, p.y, p.z + 3), rot = quat(0, 0, 0, 1),
@@ -89,7 +89,7 @@ for l = -2, 7 do
   local t = ff._tile(l .. '_' .. math.floor(p.x / size) .. '_' .. math.floor(p.y / size))
   if t and t.shown and not t.failed then under = l; break end
 end
-local s = loadstring('return ' .. beamngEarth_core.status())()
+local s = loadstring('return ' .. (beamngEarth_core.status():gsub('<function[^>]*>', 'nil')))()
 return jsonEncode({ x = p.x, y = p.y, z = p.z, vx = v.x, vy = v.y, vz = v.z, ground = ground, under = under,
   block = s.block, anchor = s.anchorId, far = s.far, perf = beamngEarth_perfmon.snapshot() })'''
 

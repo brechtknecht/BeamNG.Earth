@@ -33,7 +33,7 @@ HITCH_MS = 50.0
 LUA_SAMPLE = r'''
 if not beamngEarth_perfmon then extensions.load('beamngEarth_perfmon') end
 local p = beamngEarth_perfmon and beamngEarth_perfmon.snapshot() or {}
-local s = beamngEarth_core and loadstring('return ' .. beamngEarth_core.status())() or {}
+local s = beamngEarth_core and loadstring('return ' .. (beamngEarth_core.status():gsub('<function[^>]*>', 'nil')))() or {}
 local v = getPlayerVehicle(0)
 -- P1b: ground heights at fixed world points around the player; after a terrain move the same
 -- points are re-read (the v1.2 lattice should make them bit-identical).
