@@ -59,6 +59,21 @@ class PlanCacheTest(unittest.TestCase):
         self.assertEqual(md.calls, 0, "planned in the last run: read from the revisit cache")
         self.assertTrue(np.array_equal(za, zb))
 
+    def test_has(self):
+        """PlanCache.has: a cell's plans on disk, this run's or (a later run) the revisit cache's; nothing read."""
+        f = features([[(-300, 20), (300, 20)], [(0, -300), (0, 300)]], ["residential", "secondary"])
+        la, lo, _ = FRAME.enu_to_geodetic(np.linspace(-200, 200, 50), np.linspace(-30, 60, 50), 0.0)
+        a = self.grader(FakeMD(f))
+        keys = sorted({k for pl, idx in a.store.planners_of(np.asarray(la), np.asarray(lo))
+                       for k in pl._keys(np.asarray(la)[idx], np.asarray(lo)[idx])})
+        self.assertFalse(any(a.shared.has(k) for k in keys), "nothing planned yet")
+        a.apply(la, lo, np.zeros(50))
+        self.assertTrue(all(a.shared.has(k) for k in keys), "this run's plans")
+        os.environ[plancache.RUN_ENV] = "next"          # (a later server run: its own run folder, empty)
+        b = self.grader(FakeMD(f))
+        self.assertTrue(all(b.shared.has(k) for k in keys), "the revisit cache's copy")
+        self.assertFalse(b.shared.has((14, 1, 1)), "another cell")
+
     def test_incomplete_plans_not_kept(self):
         import revisit
         f = features([[(-300, 20), (300, 20)]], ["residential"])
@@ -80,10 +95,10 @@ class PlanCacheTest(unittest.TestCase):
         self.assertIsNone(plancache.for_grader(self.dir, self.grader(FakeMD(None), False), None, None))
 
     def test_waits_for_an_equal_planner(self):
-        c = plancache.PlanCache(self.dir, 1.0, 2.0, "s")
+        c = plancache.PlanCache(self.dir, "s")
         state, mine = c.claim(KEY)
         self.assertEqual((state, mine), (None, True))
-        other = plancache.PlanCache(self.dir, 1.0, 2.0, "s")
+        other = plancache.PlanCache(self.dir, "s")
         got = []
         t = threading.Thread(target=lambda: got.append(other.claim(KEY)))
         t.start()
@@ -97,7 +112,7 @@ class PlanCacheTest(unittest.TestCase):
         self.assertEqual(other.stats["waited"], 1)
 
     def test_does_not_wait_behind_a_less_favoured_planner(self):
-        c = plancache.PlanCache(self.dir, 1.0, 2.0, "s")
+        c = plancache.PlanCache(self.dir, "s")
         with mock.patch.object(xproc, "PRIORITY", 5):
             self.assertEqual(c.claim(KEY), (None, True))
         t0 = time.monotonic()
@@ -105,7 +120,7 @@ class PlanCacheTest(unittest.TestCase):
         self.assertLess(time.monotonic() - t0, 0.5)
 
     def test_stale_lock_taken_over(self):
-        c = plancache.PlanCache(self.dir, 1.0, 2.0, "s")
+        c = plancache.PlanCache(self.dir, "s")
         self.assertEqual(c.claim(KEY), (None, True))
         lock = c._path(KEY) + ".lock"
         old = time.time() - xproc.STALE_S - 5
@@ -123,22 +138,6 @@ class PlanCacheTest(unittest.TestCase):
         locks = [n for _r, _d, fs in os.walk(self.dir) for n in fs if n.endswith(".lock")]
         self.assertEqual(locks, [], "its lock released")
 
-    def test_region_plans_round_trip(self):
-        f = features([[(-300, 20), (300, 20)], [(0, -300), (0, 300)]], ["residential", "secondary"])
-        g = self.grader(FakeMD(f))
-        got = g._make_cell(KEY, (-100.0, -100.0, 100.0, 100.0))
-        pc = g.shared
-        self.assertTrue(pc.store_region(KEY, (-100.4, -100.0, 100.0, 100.6), got, ["14/1/2"]))
-        self.assertIsNone(pc.region(KEY, (-200.0, -50.0, 50.0, 50.0)), "not within its box")
-        self.assertIsNone(pc.region((14, 4000, 6001), (-50.0, -50.0, 50.0, 50.0)), "another cell")
-        box, back, missed = pc.region(KEY, (-50.0, -50.0, 50.0, 50.0))
-        self.assertEqual(box, (-100.4, -100.0, 100.0, 100.6))
-        self.assertEqual(missed, ["14/1/2"])
-        self.assertEqual([fid for fid, _p in back[0]], [fid for fid, _p in got[0]])
-        for (_f, p), (_g, q) in zip(back[0], got[0]):
-            self.assertTrue(np.array_equal(p.xy, q.xy) and np.array_equal(p.z, q.z))
-        self.assertIsNone(pc.load(KEY), "not the cell's whole plans")
-
     def test_prune_old_runs(self):
         root = os.path.join(self.dir, "plans")
         for run in ("old", "new"):
@@ -148,6 +147,56 @@ class PlanCacheTest(unittest.TestCase):
             os.utime(os.path.join(root, d), (old, old))
         self.assertEqual(plancache.prune(root), 1)
         self.assertEqual(os.listdir(root), ["new"], "a run still writing (its newest folder) is kept")
+
+
+class LockTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.lock = os.path.join(self.dir, "x.lock")
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_release_tries_again_while_the_file_is_open_elsewhere(self):
+        # Windows: a lock another process has open cannot be removed (WinError 32); a release that gave up at once left
+        # the lock behind and every process after it waited (GitHub #435)
+        self.assertTrue(xproc.take(self.lock))
+        real, calls = os.remove, []
+
+        def busy(path):
+            calls.append(path)
+            if len(calls) < 3:
+                raise PermissionError(32, "in use")
+            real(path)
+        with mock.patch.object(xproc.os, "remove", busy):
+            xproc.release(self.lock)
+        self.assertEqual(len(calls), 3)
+        self.assertFalse(os.path.exists(self.lock))
+
+    def test_a_dead_holders_lock_is_taken_over(self):
+        # the game closed mid-download (the server's processes end with it): its locks were waited out for STALE_S
+        import subprocess
+        p = subprocess.Popen([sys.executable, "-c", "pass"])
+        p.wait()
+        with open(self.lock, "w") as f:
+            f.write(f"{xproc.KIND_RANK['demand']} 0 {p.pid}")
+        t0 = time.monotonic()
+        got, mine = xproc.once(self.lock, lambda: None, 5.0, "demand")
+        self.assertEqual((got, mine), (None, True), "taken over")
+        self.assertLess(time.monotonic() - t0, 1.0)
+        xproc.release(self.lock)
+
+    def test_alive(self):
+        self.assertTrue(xproc.alive(os.getpid()))
+        self.assertTrue(xproc.alive(None))
+
+    def test_waiter_reads_the_holders_urgency_once(self):
+        self.assertTrue(xproc.take(self.lock, "demand"))
+        with mock.patch.object(xproc, "_holder", wraps=xproc._holder) as lu:
+            got, mine = xproc.once(self.lock, lambda: None, 0.3, "demand")
+        self.assertEqual((got, mine), (None, False), "waited out wait_s")
+        self.assertEqual(lu.call_count, 1)
+        xproc.release(self.lock)
 
 
 if __name__ == "__main__":

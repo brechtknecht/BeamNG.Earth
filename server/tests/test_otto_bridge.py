@@ -70,7 +70,12 @@ class OttoBridgeTest(TestCase):
         def cell(key, **kwargs):
             return SimpleNamespace(layers={"roads": cells[str(key)]})
 
-        cls.grader = grading.Grader(cls.frame, SimpleNamespace(cell=cell), sample)
+        # (planned in the capture's frame: its DEM samples are those the 1.7.0 planner asked for in it; the planning
+        # regions' frames ask at other points)
+        md = SimpleNamespace(cell=cell)
+        store = grading.PlanStore(md, sample)
+        store.frame_of = lambda region: cls.frame
+        cls.grader = grading.Grader(cls.frame, md, sample, store=store)
 
         def elev(la, lo):
             return cls.grader.apply(la, lo, sample(la, lo), grading.ROAD_LIFT)
@@ -92,8 +97,9 @@ class OttoBridgeTest(TestCase):
             self.assertLess(float(np.abs(np.diff(slopes)).max()), 0.014, fid)
             approach = self.bridges._ground(self.data[f"approach{i}.xy"])
             # Fixed before/after reference: the motorway approaches are not lifted.
-            # (1 cm: the banking's joined-road context, PR #410, moves the far approach point by ~5 mm)
-            np.testing.assert_allclose(approach, self.data[f"approach{i}.z"], atol=0.01, rtol=0)
+            # (1 cm: the banking's joined-road context, PR #410, moves the far approach point by ~5 mm; 2.5 cm since the
+            # segments' lines are carried on past their joints, grading.EXTRAP_M: 1.9 cm at this junction)
+            np.testing.assert_allclose(approach, self.data[f"approach{i}.z"], atol=0.025, rtol=0)
             np.testing.assert_allclose(z[[0, -1]], approach[[0, 5]], atol=1e-6, rtol=0)
             entering = (approach[0] - approach[1]) / 4.0
             leaving = (approach[6] - approach[5]) / 4.0
@@ -124,7 +130,7 @@ class OttoBridgeTest(TestCase):
         self.assertLess(float(np.abs(slopes).max()), grading.UNDER_MAX_GRADE)
         self.assertLess(float(np.abs(np.diff(slopes)).max()), 0.035)
         # Every road incident at either real Otto Road ramp junction agrees.
-        plans = self.grader.cells[mapcells.cell_of(LAT, LON)]
+        plans = self.grader._cell_plans(mapcells.cell_of(LAT, LON))
         for point in (xy[0], xy[-1]):
             ends = [float(p.z[at]) for _fid, p in plans for at in (0, -1)
                     if np.linalg.norm(p.xy[at] - point) < 0.01]

@@ -103,6 +103,47 @@ class Station:
     trusted: bool = True    # its records current (TRUST_CONF): a station mapped as one building needs it
 
 
+def _candidates(f):
+    """[(feature index, classify's result, confidence)] of a places layer's fuel-station candidates, made once per layer
+    (kept on it): classify over every place of a city cell was ~0.3 s of each of its road tiles (47k places, 2026-11-02).
+    Pure given the layer."""
+    got = f.__dict__.get("_fuel_candidates")
+    if got is not None:
+        return got
+    cid = f.__dict__.get("_bnge_cell")
+    import roads
+    mk = (cid, "fuel_candidates") if cid is not None else None
+    if mk is not None:          # (this process's, for another copy of the layer: the map data reloads them)
+        with roads._FACTS_LOCK:
+            got = roads._FACTS_MEM.get(mk)
+        if got is not None:
+            f.__dict__["_fuel_candidates"] = got
+            return got
+    a = f.attrs
+
+    def col(k, i):
+        v = a[k][i] if k in a else None
+        return "" if v is None else str(v)
+    out = []
+    for i in range(len(f)):
+        c = classify(col("basic_category", i), col("taxonomy", i), col("brand_wikidata", i),
+                     col("operating_status", i) or None, col("brand_name", i))
+        if c is None:
+            continue
+        try:
+            conf = float(col("confidence", i) or 1.0)
+        except ValueError:
+            conf = 1.0
+        out.append((i, c, conf, col("name", i), col("brand_name", i), col("brand_wikidata", i), col("src_dataset", i)))
+    f.__dict__["_fuel_candidates"] = out
+    if mk is not None:
+        with roads._FACTS_LOCK:
+            roads._FACTS_MEM[mk] = out
+            while len(roads._FACTS_MEM) > roads.FACTS_MEM_KEPT:
+                roads._FACTS_MEM.popitem(last=False)
+    return out
+
+
 def pins(frame, layers):
     """Pins of the fuel-station candidates among places layers (mapgeom.Features, one per map cell; a place in two
     cells is taken once, by id), in frame (an EnuFrame)."""
@@ -110,30 +151,16 @@ def pins(frame, layers):
     for f in layers:
         if f is None or len(f) == 0:
             continue
-        a = f.attrs
-
-        def col(k, i):
-            v = a[k][i] if k in a else None
-            return "" if v is None else str(v)
         xy = None
-        for i in range(len(f)):
+        for i, c, conf, name, brand, wikidata, src in _candidates(f):
             fid = str(f.ids[i])
             if fid in seen:
-                continue
-            c = classify(col("basic_category", i), col("taxonomy", i), col("brand_wikidata", i),
-                         col("operating_status", i) or None, col("brand_name", i))
-            if c is None:
                 continue
             seen.add(fid)
             if xy is None:
                 xy = f.xy_in(frame)
             k = f.coord_off[f.ring_off[f.part_off[i]]]
-            try:
-                conf = float(col("confidence", i) or 1.0)
-            except ValueError:
-                conf = 1.0
-            out.append(Pin(fid, float(xy[k, 0]), float(xy[k, 1]), col("name", i), col("brand_name", i),
-                           col("brand_wikidata", i), *c, conf, col("src_dataset", i)))
+            out.append(Pin(fid, float(xy[k, 0]), float(xy[k, 1]), name, brand, wikidata, *c, conf, src))
     return out
 
 
@@ -1527,13 +1554,14 @@ def tile_sites(frame, tx, ty, md, elev, cuts=None, pads=None):
     list that gets (station id, [(lat (k,), lon (k,))]) of this tile's stations' forecourt pads (forecourt_pad; the
     ground's painters: surface.Surface.add_fuel_pads). Without places data (offline, no file): no stations."""
     import roads
-    x0, y0, x1, y1 = roads.tile_bbox(tx, ty)
+    box = roads.tile_bbox(tx, ty)
+    x0, y0, x1, y1 = box
     try:
         keys = roads.cells_of_tile(frame, tx, ty, margin=REACH_M + MERGE_M)
         places = [md.cell(k, layers=("places",), kind="demand").layers.get("places") for k in keys]
         stations = merge(pins(frame, places))
     except Exception as e:      # an unreachable source costs the stations, not the tile
-        log.debug("gas stations of road tile %d_%d: %s", tx, ty, e)
+        log.debug("gas stations of road tile %s_%s: %s", tx, ty, e)
         return [], frozenset()
     sites = []
     for st in stations:
@@ -1558,7 +1586,7 @@ def tile_sites(frame, tx, ty, md, elev, cuts=None, pads=None):
         if cuts is not None:
             cuts.extend(site.drives)
         st = site.station
-        if x0 <= st.x < x1 and y0 <= st.y < y1:
+        if roads.box_owns(box, st.x, st.y):
             recs.append(_record(site, frame, elev))
             if pads is not None and site.pad:
                 pads.append((st.id, _pad_ll(site.pad, frame)))

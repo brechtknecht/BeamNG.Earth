@@ -196,34 +196,30 @@ class BasePhotoTest(unittest.TestCase):
 
 
 class BaseRoutingTest(unittest.TestCase):
-    """earthd: the base photo goes to the photo process, else the other lane's block process, when the server has no
-    imagery analyses; with them (or a tile missing on disk) it is rendered in the server (write_base)."""
+    """earthd: the base photo goes to the other lane's block process when the server has no imagery analyses, or the
+    player waits for its block (URGENT_ELSEWHERE); else (or a tile missing on disk) it is rendered in the server."""
 
     def test_routing_and_fallback(self):
         import earthd
         S = earthd.Server
-        us, europe = SimpleNamespace(lat=40.0, lon=-105.0), SimpleNamespace(lat=50.9, lon=14.8)
-
-        def server(**kw):
-            o = SimpleNamespace(block_pools=[("request", None), ("prefetch", None)], imagery=object(), deshadow=None,
-                                colormatch=None, photo_pool=None)
-            vars(o).update(kw)
-            o.analyses_here = lambda anchor: S.analyses_here(o, anchor)
-            return o
-        s = server()
-        self.assertEqual(S._base_process(s, earthd.LANE_REQUEST, us), "prefetch")
-        self.assertEqual(S._base_process(s, earthd.LANE_PREFETCH, us), "request")
+        s = SimpleNamespace(block_pools=[("request", None), ("prefetch", None)], imagery=object(), deshadow=None,
+                            colormatch=None)
+        self.assertEqual(S._base_process(s, earthd.LANE_REQUEST), "prefetch")
+        self.assertEqual(S._base_process(s, earthd.LANE_PREFETCH), "request")
         for k in ("deshadow", "colormatch"):
-            self.assertIsNone(S._base_process(server(**{k: object()}), earthd.LANE_REQUEST, us), k)
-            # they correct only the USGS tiles: elsewhere the photo goes to the block process as without them
-            self.assertEqual(S._base_process(server(**{k: object()}), earthd.LANE_REQUEST, europe), "prefetch", k)
-        self.assertIsNone(S._base_process(server(block_pools=[]), earthd.LANE_REQUEST, us))
-        # the photo process when there is one: never behind the other lane's block (main_async, not on a small machine)
-        for lane in (earthd.LANE_REQUEST, earthd.LANE_PREFETCH):
-            self.assertEqual(S._base_process(server(photo_pool="photo"), lane, us), "photo")
-        self.assertIsNone(S._base_process(server(photo_pool="photo", deshadow=object()), earthd.LANE_REQUEST, us))
-        aleutians = SimpleNamespace(lat=52.9, lon=173.0)
-        self.assertTrue(S.analyses_here(server(deshadow=object()), aleutians))
+            # (with the analyses on: a requested block's photo there all the same, rendered again here with them;
+            # a prefetched one's here)
+            self.assertIsNone(S._base_process(SimpleNamespace(**{**vars(s), k: object()}), earthd.LANE_PREFETCH), k)
+            self.assertEqual(S._base_process(SimpleNamespace(**{**vars(s), k: object()}), earthd.LANE_REQUEST),
+                             "prefetch" if earthd.URGENT_ELSEWHERE else None, k)
+        self.assertIsNone(S._base_process(SimpleNamespace(**{**vars(s), "block_pools": []}), earthd.LANE_REQUEST))
+        # the photo process (PHOTO_PROCESS_MIN_CPUS): a requested block's photo there below FAST_BASE_V; faster, it
+        # makes the stand-in first and the photo goes to the other lane as before
+        p = SimpleNamespace(**{**vars(s), "photo_pool": "photo", "fast": False})
+        self.assertEqual((S._base_process(p, earthd.LANE_REQUEST), S._base_process(p, earthd.LANE_PREFETCH)),
+                         ("photo", "request"))
+        p.fast = True
+        self.assertEqual(S._base_process(p, earthd.LANE_REQUEST), "prefetch")
         calls = []
 
         def write_base(anchor, cx, cy, photo=None, quick=False):
@@ -237,54 +233,6 @@ class BaseRoutingTest(unittest.TestCase):
         s._base_elsewhere = lambda anchor, cx, cy, pool, photo: photo.append("there") or "there.png"
         name, photo, _ = S._base_photo(s, None, 3, 4, "pool")
         self.assertEqual((name, photo, calls), ("there.png", ["there"], [(1, 2)]))
-
-
-class RegionBookkeepingTest(unittest.TestCase):
-    """Blocks graded from region plans (grading.Grader.region): a region that came out unlike its cells' whole plans has
-    its height chunks dropped (with those of the block region a tunnel portal's region went into) and its blocks
-    reported to be built again; one that came out the same keeps them."""
-
-    def setUp(self):
-        import heightmap
-        self.cache = heightmap.ChunkCache()
-        blockworker._s = SimpleNamespace(lock=threading.Lock(), graders={1: object()}, chunks={1: self.cache},
-                                         tunnels={1: "profiles"})
-
-    def build(self, rid, chunk_keys, deps, block):
-        st = blockworker._regions_state()
-        tags = st.setdefault(("tags", 1), {})
-        tc = blockworker._TaggedChunks(self.cache, tags, rid, blockworker._s.lock)
-        for k in chunk_keys:
-            if tc.get(k) is None:
-                tc.put(k, np.zeros((2, 2)))
-        st[("block", 1, *block)] = set(deps) | tc.used
-        return tc
-
-    def test_a_different_region_drops_its_chunks(self):
-        st = blockworker._regions_state()
-        st[1] = [1, None, None]
-        st[2] = [1, None, None]
-        st[("parent", 2)] = 1               # (a portal's region: its heights in region 1's chunks)
-        self.build(1, [(0, 0), (0, 1)], {1, 2}, (0.0, 0.0))
-        tc = self.build(None, [(0, 1), (0, 2)], set(), (384.0, 0.0))
-        self.assertEqual(tc.used, {1}, "a chunk of region 1 reused: that block depends on it")
-        self.assertEqual(blockworker.region_poll(), [], "unresolved")
-        st[1][2], st[2][2] = True, False
-        done = dict(blockworker.region_poll())
-        self.assertEqual(done, {(1, 0.0, 0.0): False, (1, 384.0, 0.0): True})
-        self.assertIsNone(self.cache.get((0, 0)), "region 1's chunks dropped with its portal's region")
-        self.assertIsNotNone(self.cache.get((0, 2)), "a chunk of the whole plans kept")
-        self.assertNotIn(1, blockworker._s.tunnels, "the tunnels' ends graded from it made again")
-        self.assertEqual([k for k in st if k != "done" and k != ("tags", 1)], [], "nothing left")
-
-    def test_a_same_region_keeps_them(self):
-        st = blockworker._regions_state()
-        st[1] = [1, None, None]
-        self.build(1, [(0, 0)], {1}, (0.0, 0.0))
-        st[1][2] = True
-        self.assertEqual(blockworker.region_poll(), [((1, 0.0, 0.0), True)])
-        self.assertIsNotNone(self.cache.get((0, 0)))
-        self.assertEqual(st[("tags", 1)], {}, "untagged: as the whole plans make them")
 
 
 if __name__ == "__main__":

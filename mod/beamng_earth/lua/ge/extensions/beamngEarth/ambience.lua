@@ -53,6 +53,14 @@ function M.onTile(anchorId, key, data)
   local nodes = type(data.audio) == 'table' and data.audio or {}
   local w = 0
   for i = 6, #nodes, 6 do w = w + (nodes[i] or 0) end
+  if type(data.geo) == 'table' then
+    -- a geotile (trees.lua placed its nodes into the anchor's world): no anchor's, moved at a rebase, never a ghost
+    local cx, cy = tonumber(data.geo.cx) or 0, tonumber(data.geo.cy) or 0
+    tiles['g:' .. tostring(key)] = { geo = true, nodes = nodes, biome = data.biome, weight = w, cx = cx, cy = cy,
+      gx = math.floor(cx / TILE), gy = math.floor(cy / TILE) }
+    dirty = true
+    return
+  end
   local tx, ty = tostring(key):match('(%-?%d+)_(%-?%d+)$')
   tx, ty = tonumber(tx) or 0, tonumber(ty) or 0
   tiles[anchorId .. ':' .. tostring(key)] = { anchor = anchorId, nodes = nodes, biome = data.biome, weight = w,
@@ -61,8 +69,9 @@ function M.onTile(anchorId, key, data)
 end
 
 function M.onDrop(anchorId, key)
-  if tiles[anchorId .. ':' .. tostring(key)] then
-    tiles[anchorId .. ':' .. tostring(key)] = nil
+  local k = (tostring(key):match('^g%d+_') and 'g' or anchorId) .. ':' .. tostring(key)
+  if tiles[k] then
+    tiles[k] = nil
     dirty = true
   end
 end
@@ -76,7 +85,11 @@ function M.transform(xf)
       a[i], a[i + 1], a[i + 2] = xf:apply(a[i], a[i + 1], a[i + 2])
     end
     t.cx, t.cy = xf:apply(t.cx, t.cy, 0)
-    t.ghost = t.ghost or os.clockhp()
+    if t.geo then
+      t.gx, t.gy = math.floor(t.cx / TILE), math.floor(t.cy / TILE)
+    else
+      t.ghost = t.ghost or os.clockhp()
+    end
   end
   dirty = true
   moveSpaces(xf)            -- (the road tiles' sound spaces: their tiles stay as ghosts the same way, roads.lua)
@@ -325,6 +338,12 @@ M.POINTS = { [4] = M.PORTAL_EVENT, [5] = WC .. 'Refinery_Tower_Engines', [6] = W
 M.POINT_VOLUME = { [8] = 0.35 }
 local spaces = {}       -- road tile key -> { { id, row }, ... }
 M.spacesMade = 0
+-- SFXSpaces are never deleted: parked out of reach and used again (2026-11-01: a teleport dropped a road tile's tunnel
+-- spaces and the game crashed in the sound world's next update, a virtual call on a freed space: the engine's SFX
+-- world still listed it). The point emitters are deleted as before.
+local parked = {}       -- ambience name -> { space id, ... }
+M.PARK_Z = -100000
+M.spacesParked = 0
 
 local function placeSpace(o, r)
   if M.POINTS[r[1]] then o:setPosition(vec3(r[2], r[3], r[4])); return end
@@ -343,33 +362,66 @@ function M.onSpaces(key, flat)
     local r = { flat[i], flat[i + 1], flat[i + 2], flat[i + 3], flat[i + 4], flat[i + 5], flat[i + 6], flat[i + 7] }
     local amb = M.SPACES[r[1]]
     local ev = M.POINTS[r[1]]
-    local o = (amb or ev) and Sim.upcast(createObject(ev and 'SFXEmitter' or 'SFXSpace'))
+    local o
+    local pool = not ev and amb and parked[amb]
+    while pool and #pool > 0 and not o do          -- a parked space of this ambience
+      o = scenetree.findObjectById(table.remove(pool))
+      if o then M.spacesParked = M.spacesParked - 1 end
+    end
     if o then
-      if ev then
-        o:setTransform(MatrixF(true))
-        o:setField('track', 0, ev)
-      else
-        o:setField('soundAmbience', 0, amb)
-      end
       placeSpace(o, r)
-      o.canSave = false
-      o:registerObject('bngEarthSpace_' .. (M.spacesMade + 1))
-      if ev then
-        o:play()
-        if M.POINT_VOLUME[r[1]] then o:setVolumePitchCT(M.POINT_VOLUME[r[1]], 1, 0, 0) end
-      end
       list[#list + 1] = { id = o:getId(), row = r }
-      M.spacesMade = M.spacesMade + 1
+    else
+      o = (amb or ev) and Sim.upcast(createObject(ev and 'SFXEmitter' or 'SFXSpace'))
+      if o then
+        if ev then
+          o:setTransform(MatrixF(true))
+          o:setField('track', 0, ev)
+        else
+          o:setField('soundAmbience', 0, amb)
+        end
+        placeSpace(o, r)
+        o.canSave = false
+        o:registerObject('bngEarthSpace_' .. (M.spacesMade + 1))
+        if ev then
+          o:play()
+          if M.POINT_VOLUME[r[1]] then o:setVolumePitchCT(M.POINT_VOLUME[r[1]], 1, 0, 0) end
+        end
+        list[#list + 1] = { id = o:getId(), row = r }
+        M.spacesMade = M.spacesMade + 1
+      end
     end
   end
   spaces[key] = list
 end
 
 -- The tile goes (roads.lua dropTile).
+-- A road geotile's spaces placed again (roads.lua M.replace: the rows mapped into the new anchor's world): moved where
+-- the count is the same, made again else.
+function M.placeSpaces(key, flat)
+  local list = spaces[key]
+  if not list or type(flat) ~= 'table' or #list ~= math.floor(#flat / 8) then return M.onSpaces(key, flat) end
+  for k, s in ipairs(list) do
+    local i = (k - 1) * 8 + 1
+    s.row = { flat[i], flat[i + 1], flat[i + 2], flat[i + 3], flat[i + 4], flat[i + 5], flat[i + 6], flat[i + 7] }
+    local o = scenetree.findObjectById(s.id)
+    if o then placeSpace(o, s.row) end
+  end
+end
+
 function M.dropSpaces(key)
   for _, s in ipairs(spaces[key] or {}) do
     local o = scenetree.findObjectById(s.id)
-    if o then o:delete() end
+    local amb = M.SPACES[s.row[1]]
+    if o and amb and not M.POINTS[s.row[1]] then        -- a space: parked (never deleted, above)
+      o:setPosition(vec3(0, 0, M.PARK_Z))
+      o:setScale(vec3(1, 1, 1))
+      parked[amb] = parked[amb] or {}
+      table.insert(parked[amb], s.id)
+      M.spacesParked = M.spacesParked + 1
+    elseif o then
+      o:delete()
+    end
   end
   spaces[key] = nil
 end
@@ -482,7 +534,7 @@ function M.update(anchorId, sea)
   if not next(tiles) and not current then return end
   local now = os.clockhp()
   for k, t in pairs(tiles) do
-    if (t.ghost and now - t.ghost > M.GHOST_MAX_S) or (not t.ghost and t.anchor ~= anchorId) then
+    if (t.ghost and now - t.ghost > M.GHOST_MAX_S) or (not t.ghost and not t.geo and t.anchor ~= anchorId) then
       tiles[k] = nil
       dirty = true
     end

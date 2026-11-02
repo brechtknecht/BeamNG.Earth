@@ -21,6 +21,7 @@ import numpy as np
 
 import fast
 import mapgeom
+import ships
 import staging
 
 FLOOR_M = 3.0               # m per storey (residential)
@@ -321,7 +322,7 @@ def oriented_box(p):
 class Spec:
     """What is built for one footprint (decided by plan())."""
     __slots__ = ("ring", "floors", "floor_h", "height", "roof", "roof_mat", "facade", "band", "shop", "plain", "min_h", "wall", "door", "windows", "front", "steeple", "stoop",
-                 "sign", "porch", "cls", "seed", "deck", "pitch", "portal", "gring")
+                 "sign", "porch", "cls", "seed", "deck", "pitch", "portal", "gring", "ship")
 
     def __init__(self, **kw):
         for k in self.__slots__:
@@ -453,7 +454,16 @@ def plan(ring, attrs, neighbours=0, lat=None, lon=None, look=None, town=False, d
     arid West (district_town): single-storey main streets and ranch houses."""
     area = _area2(ring) / 2
     c = ring.mean(0)
-    seed = _hash01(round(float(c[0]) * 2), round(float(c[1]) * 2), round(area)) if look is None else look
+    # (its random choices: keyed on the map feature's id, the same from every anchor and tile; a ring without one
+    # by its local centroid, as before. Keyed on the centroid in the tile's frame alone, a house changed its look
+    # whenever a rebase moved the anchor: geotiles, 2026-10-29)
+    sid = attrs.get("seed_id")
+    seed = look if look is not None else _hash01(sid, "plan") if sid is not None else \
+        _hash01(round(float(c[0]) * 2), round(float(c[1]) * 2), round(area))
+    if attrs.get("ship"):           # a moored ship (ships.is_ship): a hull, not a building
+        return ships.spec(ring, attrs, seed)
+    if attrs.get("pier"):           # a quay structure alongside one (ships.pier_alongside): a low deck
+        return ships.pier_spec(ring, seed)
     style = region_style(lat, lon)
     _, _, hl, hw = oriented_box(ring)
     box_fill = area / max(4 * hl * hw, 1e-6)
@@ -1481,6 +1491,9 @@ def build(specs_and_ground, lite=False):
         if spec.cls in BRIDGE_CLASSES:
             _steel_frame(m, spec, gmin, mat_idx[spec.facade if spec.facade in LOOKS else STEEL], lite)
             continue
+        if spec.cls == "ship":
+            ships.draw(m, spec, gmin, gmax, mat_idx, lite)
+            continue
         ring = drawn_ring(spec)
         mh = spec.min_h or 0.0
         if spec.deck and not lite and _parking_deck(m, spec, gmin, gmax, mat_idx):
@@ -1573,7 +1586,7 @@ def collision_mesh(specs_and_ground):
             ring = ring[::-1]
         mh = spec.min_h or 0.0
         z0 = gmin - FOUNDATION_M if mh <= 0.5 else base_z(spec, gmin, gmax) + mh
-        z1 = base_z(spec, gmin, gmax) + mh + spec.height
+        z1 = base_z(spec, gmin, gmax) + mh + (spec.floor_h if spec.cls == "ship" else spec.height)  # (a ship: its deck)
         for i in range(len(ring)):
             a, b = ring[i], ring[(i + 1) % len(ring)]
             m.quad((a[0], a[1], z0), (b[0], b[1], z0), (b[0], b[1], z1), (a[0], a[1], z1), zero, zero, zero, zero, tok)
@@ -2250,10 +2263,48 @@ class _PartsOf:
         return out
 
 
+def _hulls_nearby(frame, layers, x0, y0, x1, y1, water_xy, reach=ships.PIER_REACH_M):
+    """Local rings of the moored ships (ships.is_ship) whose outline centres lie outside the tile but within reach of
+    it (a quay in this tile may lie alongside a ship the next tile draws)."""
+    out = []
+    for f in layers:
+        if f is None or len(f.kind) == 0:
+            continue
+        a = f.attrs
+        rows = range(len(f.kind))
+        if isinstance(f, mapgeom.Features):
+            cx_, cy_ = f.outer_centres(frame)
+            bx = f.boxes(frame)
+            big = np.maximum(bx[:, 2] - bx[:, 0], bx[:, 3] - bx[:, 1]) >= ships.MIN_L / math.sqrt(2)
+            rows = np.flatnonzero(big & (cx_ >= x0 - reach) & (cx_ < x1 + reach) & (cy_ >= y0 - reach)
+                                  & (cy_ < y1 + reach) & ~((cx_ >= x0) & (cx_ < x1) & (cy_ >= y0) & (cy_ < y1))
+                                  & (bx[:, 0] <= x1 + ships.PIER_GAP_M) & (bx[:, 2] >= x0 - ships.PIER_GAP_M)
+                                  & (bx[:, 1] <= y1 + ships.PIER_GAP_M) & (bx[:, 3] >= y0 - ships.PIER_GAP_M)).tolist()
+        for i in rows:
+            if "src_dataset" in a and str(a["src_dataset"][i]) != "OpenStreetMap":
+                continue
+            if not water_xy and not ships.has_evidence({k: (a[k][i] if k in a else None)
+                                                        for k in ("class", "subtype", "name")}):
+                continue                        # (no water near and no ship's tags: cheaper than the outline)
+            parts = f.parts(i)
+            if not parts or not parts[0] or len(parts[0][0]) < 4:
+                continue
+            e, n = mapgeom.enu_xy(f, frame, np.asarray(parts[0][0], np.float64))
+            cx, cy = float(e[:-1].mean()), float(n[:-1].mean())
+            if (x0 <= cx < x1 and y0 <= cy < y1) or max(np.ptp(e), np.ptp(n)) < ships.MIN_L / math.sqrt(2):
+                continue                        # (the tile's own: tested already)
+            r = clean_ring(np.stack([e - x0, n - y0], 1))
+            at = {k: (a[k][i] if k in a else None) for k in ("class", "subtype", "name")}
+            if r is not None and ships.is_ship(r, at, lambda: ships.on_water(r.mean(0), water_xy)):
+                out.append(r)
+    return out
+
+
 def tile_buildings(frame, x0, y0, x1, y1, layers, elev, water=None, part_layers=(), west_town=False, roads_xy=None,
                    tunnels_xy=None, garages_xy=None, supports=None, bridges_xy=None, water_xy=None, decks=None,
-                   ml_roads_xy=None, ways_xy=None, skip=frozenset(), min_size=None):
-    """[(Spec, gmin, gmax)] of the buildings whose footprint centroid is in the tile [x0, x1) x [y0, y1)
+                   ml_roads_xy=None, ways_xy=None, skip=frozenset(), min_size=None, own=None):
+    """[(Spec, gmin, gmax)] of the buildings whose footprint centroid is in the tile [x0, x1) x [y0, y1) (own: the
+    tile's box when it says which points are its own, roads.box_owns: a geotile's)
     (anchor frame), rings relative to (x0, y0). layers: mapgeom.Features of buildings (one per map cell; a
     building in two cells is taken once, by id); elev(lat, lon) the physics ground. part_layers: the
     building parts of the same cells: a building whose parts all have heights is drawn as its parts
@@ -2296,7 +2347,7 @@ def tile_buildings(frame, x0, y0, x1, y1, layers, elev, water=None, part_layers=
             e, n = mapgeom.enu_xy(f, frame, outer)
             k = len(e) - 1             # the same reduction as np.mean, without its wrapper (36k calls a tile set)
             cx, cy = float(e[:-1].sum() / k), float(n[:-1].sum() / k)
-            if not (x0 <= cx < x1 and y0 <= cy < y1):
+            if not (x0 <= cx < x1 and y0 <= cy < y1) if own is None else not own.owns(cx, cy):
                 continue
             if min_size is not None:
                 h_ = a["height"][i] if a.get("height") is not None else None
@@ -2306,13 +2357,26 @@ def tile_buildings(frame, x0, y0, x1, y1, layers, elev, water=None, part_layers=
                 if h_ < min_size[0] and abs(float(np.dot(e[:-1], n[1:]) - np.dot(e[1:], n[:-1]))) / 2 < min_size[1]:
                     continue
             at = {k: (a[k][i] if k in a else None) for k in
-                  ("class", "height", "num_floors", "min_height", "roof_shape", "roof_height", "name",
+                  ("class", "subtype", "height", "num_floors", "min_height", "roof_shape", "roof_height", "name",
                    "facade_material", "facade_color", "roof_material", "roof_color")}
+            if key is not None:         # (plan's random choices keyed on the feature, not where the anchor puts it)
+                at["seed_id"] = str(key)
             hh_ = at.get("height")
             if hh_ is not None and np.isfinite(hh_) and 0 < hh_ < FLAT_FOOTPRINT_M and not parts_of.get(str(key)):
                 continue                # a mapped area, not a building (the Golden Gate toll plaza's 0.01 m footprint
                                         # drew a slab with a rim round the booths, 2026-10-21)
             bparts = parts_of.get(str(key)) if key is not None else None
+            ship_parts = None
+            if bparts and "src_dataset" in a and str(a["src_dataset"][i]) == "OpenStreetMap":
+                # a ship mapped with parts (the Iowa's turrets, the Queen Mary's funnels): the hull, its parts on deck
+                ring_ = clean_ring(np.stack([e - x0, n - y0], 1))
+                if ring_ is not None and ships.is_ship(ring_, at, lambda: ships.on_water(ring_.mean(0), water_xy)):
+                    ship_parts = []     # (its ring, (own height, bottom) or None)
+                    for p in bparts:
+                        pr_ = clean_ring(p[0] - np.array([x0, y0]))
+                        if pr_ is not None:
+                            ship_parts.append((pr_, p[1]))
+                    bparts = None
             if bparts and any(p[1] is not None for p in bparts):
                 # drawn as its parts, with the building's class and one look for all of them; a part
                 # without a height takes the building's (else its lowest known part's)
@@ -2385,11 +2449,37 @@ def tile_buildings(frame, x0, y0, x1, y1, layers, elev, water=None, part_layers=
                 at = dict(at, bridge_part=on) if fm_ in STEEL_MATERIALS else dict(at, bridge_masonry=fm_)
             if is_ml:
                 at = dict(at, ml=True)          # (_ml_steep once its ground is known)
+            elif on is None and mh <= 0.5 and (ship_parts is not None or ships.is_ship(
+                    ring, at, lambda: ships.on_water(ring.mean(0), water_xy))):     # (the water test asked last)
+                at = dict(at, ship=True, ship_parts=ship_parts)
             attrs.append(at)
             looks.append(None)
             mins.append(mh)
     if not rings:
         return []
+    # a quay structure alongside a moored ship: a low deck (its scanned height is the ship's flank). The ship may be
+    # the next tile's: those are looked for only when this tile has water and a long thin candidate
+    piers = [k_ for k_, (r, at) in enumerate(zip(rings, attrs)) if not at.get("ship") and not at.get("ml")
+             and looks[k_] is None and mins[k_] <= 0.5 and ships.pier_shaped(r)] if water_xy else []
+    if piers:
+        hulls = [r for r, at in zip(rings, attrs) if at.get("ship")] +             _hulls_nearby(frame, layers, x0, y0, x1, y1, water_xy)
+        for k_ in piers:
+            if any(ships.pier_alongside(rings[k_], hr) for hr in hulls):
+                attrs[k_] = dict(attrs[k_], pier=True)
+    # what lies mostly on a ship's hull is the ship's (a second outline of it, machine-learned or a second OSM way): not
+    # a building as well. Its hull may be the next tile's (those tagged a ship: asking the water for every tile by the
+    # water cost a waterfront tile ~10 %)
+    if any(not at.get("ship") and not at.get("pier") for at in attrs):
+        hulls = [r for r, at in zip(rings, attrs) if at.get("ship")] + _hulls_nearby(frame, layers, x0, y0, x1, y1, None)
+        if hulls:
+            drop = {k_ for k_, (r, at) in enumerate(zip(rings, attrs)) if not at.get("ship") and not at.get("pier")
+                    and any(ships.on_hull(r, hr) for hr in hulls)}
+            if drop:
+                keep = [k_ for k_ in range(len(rings)) if k_ not in drop]
+                rings, attrs = [rings[k_] for k_ in keep], [attrs[k_] for k_ in keep]
+                looks, mins = [looks[k_] for k_ in keep], [mins[k_] for k_ in keep]
+                if not rings:
+                    return []
     if bridges_xy or decks:             # a road bridge through a building: a passage (Tower Bridge's towers and gate)
         def ground_at(c):
             la, lo, _ = frame.enu_to_geodetic(float(c[0]) + x0, float(c[1]) + y0, 0.0)
@@ -2435,7 +2525,7 @@ def tile_buildings(frame, x0, y0, x1, y1, layers, elev, water=None, part_layers=
         g = up_all[i0:i1].copy()
         if at.get("ml") and ways_xy is not None and _ml_steep(ring, g, ways_xy):
             continue
-        if water is not None:
+        if water is not None and not at.get("ship"):
             c = ring.mean(0)
             cla, clo, _ = frame.enu_to_geodetic(c[0] + x0, c[1] + y0, 0.0)
             if water(float(cla), float(clo)):
@@ -2650,6 +2740,8 @@ FAR_SEND_M = float(os.environ.get("BNE_BLDFAR_SEND_M", "1600"))    # far buildin
                                                                     # sent within this (Euclidean: roads.tiles_near)
 FAR_DROP_M = float(os.environ.get("BNE_BLDFAR_DROP_M", str(FAR_SEND_M + 300)))     # ... dropped beyond
 FAR_PER_POSE = 4
+FAR_GEO = 1                 # the far geotiles' protocol (hello.farGeo, the mod's roads.lua M.FAR_GEO): far buildings,
+                            # skyline and far bridges in the global tiles' frames (blockworker.far_geo)
 
 
 MAIN_STREET_CLASSES = {"primary", "secondary", "tertiary"}
@@ -2700,21 +2792,28 @@ def doors(items, lines, x0, y0, drives=None):
             continue
         ring = drawn_ring(spec) + np.array([x0, y0])
         best = None
+        # every wall's middle against every road segment at once (a wall at a time: ~6 numpy calls per wall), the same
+        # numbers: each wall's nearest segment k, the nearest point on it Q and its distance
+        nxt = np.concatenate((ring[1:], ring[:1]))
+        E = nxt - ring
+        MID = (ring + nxt) / 2
+        T = np.clip(((MID[:, None, :] - A[None]) * D[None]).sum(2) / L2[None], 0, 1)
+        Q = A[None] + T[..., None] * D[None]
+        DIST = np.hypot(*(Q - MID[:, None, :]).transpose(2, 0, 1))
+        K = DIST.argmin(1)
         for i in range(len(ring)):
-            a, b = ring[i], ring[(i + 1) % len(ring)]
-            e = b - a
+            a = ring[i]
+            e = E[i]
             Le = float(math.hypot(*e))
             if Le < 2.5:
                 continue
-            mid = (a + b) / 2
-            t = np.clip(((mid - A) * D).sum(1) / L2, 0, 1)
-            q = A + t[:, None] * D
-            dist = np.hypot(*(q - mid).T)
-            k = int(dist.argmin())
+            mid = MID[i]
+            dist = DIST[i]
+            k = int(K[i])
             if dist[k] > DOOR_ROAD_M:
                 continue
             out = np.array([e[1], -e[0]]) / Le
-            if float(np.dot(q[k] - mid, out)) <= 0:
+            if float(np.dot(Q[i, k] - mid, out)) <= 0:
                 continue                                 # the wall faces away from that road
             rank = (bool(SMINOR[k]) if storefront else False, float(dist[k]))
             if best is None or rank < best[0]:
@@ -2877,10 +2976,12 @@ def road_tile_items(frame, tx, ty, md, ground, decks=None, skip=frozenset()):
     [(xy (k, 2), z (k,))] in the anchor frame (roads.BridgeProfiles.parts): buildings they run through get a way.
     skip: building ids left out (gas station canopies)."""
     import roads
-    x0, y0, x1, y1 = roads.tile_bbox(tx, ty)
+    box = roads.tile_bbox(tx, ty)
+    x0, y0, x1, y1 = box
     cds = [md.cell(k, layers=("buildings", "building_parts", "roads", "infrastructure", "water"), kind="demand")
            for k in roads.cells_of_tile(frame, tx, ty, margin=0.0)]
     return tile_buildings(frame, x0, y0, x1, y1, [c.layers.get("buildings") for c in cds], ground,
+                          own=box if hasattr(box, "owns") else None,
                           part_layers=[c.layers.get("building_parts") for c in cds],
                           west_town=district_town(frame, tx, ty, md),
                           roads_xy=road_lines(frame, [c.layers.get("roads") for c in cds], x0, y0),
@@ -2892,6 +2993,33 @@ def road_tile_items(frame, tx, ty, md, ground, decks=None, skip=frozenset()):
                           water_xy=water_rings(frame, [c.layers.get("water") for c in cds], x0, y0),
                           decks=[(np.asarray(d[0], np.float64)[:, :2] - [x0, y0], np.asarray(d[1], np.float64))
                                  + tuple(d[2:3]) for d in decks] if decks else None, skip=skip)
+
+
+def near_rings(frame, tx, ty, md, margin=2.0, skip=frozenset()):
+    """The outer rings (k, 2) in the anchor frame of every building of the map within margin m of road tile (tx, ty):
+    its own and its neighbours' (road_tile_items has only the ones whose centre is in it). skip: ids left out."""
+    import roads
+    x0, y0, x1, y1 = roads.tile_bbox(tx, ty)
+    out = []
+    seen = set()
+    for k in roads.cells_of_tile(frame, tx, ty, margin=margin):
+        f = md.cell(k, layers=("buildings",), kind="demand").layers.get("buildings")
+        if f is None or not len(f):
+            continue
+        bx = f.boxes(frame)
+        for i in range(len(f)):
+            fid = str(f.ids[i])
+            if fid in seen or fid in skip:
+                continue
+            b = bx[i]
+            if b[2] < x0 - margin or b[0] > x1 + margin or b[3] < y0 - margin or b[1] > y1 + margin:
+                continue
+            seen.add(fid)
+            for part in f.parts(i):
+                if len(part) and len(part[0]) >= 3:
+                    e, n = mapgeom.enu_xy(f, frame, part[0])
+                    out.append(np.c_[e, n])
+    return out
 
 
 TOWN_COVERAGE = 0.16        # a tile whose footprints cover less than this share is a town / suburb (heights)
@@ -2907,7 +3035,7 @@ POLES_COVERAGE = 0.30       # ... and its streets get wired wooden poles (furnit
 
 
 def coverage(items, tile=256.0):
-    """The share of the tile covered by building footprints."""
+    """The share of the tile (a square of side tile m: roads.tile_side) covered by building footprints."""
     return sum(_area2(s.ring) / 2 for s, _, _ in items if (s.min_h or 0) <= 0.5) / (tile * tile)
 
 
@@ -2935,28 +3063,41 @@ def road_tile(frame, tx, ty, md, ground, lines=None, props=None, items=None):
     return meshes, collider_boxes(items, x0, y0), collision_mesh(items)
 
 
-def far_tile(frame, tx, ty, md, ground, out_dir, vfs_dir, aid, lamp_region=None):
-    """A far (render-only) building tile written to the session folder: (vfs path of its JSON, building
-    count) or None. The lite mesh of the same buildings as road_tile's."""
-    import json
-    import os
+FAR_LAYERS = ("buildings", "building_parts", "infrastructure", "roads", "water")
+
+
+def far_items(frame, tile, ty, md, ground, lamp_region=None):
+    """The far (lite) buildings of road tile (tile, ty) (an anchor tile, or a geotile: tile a geotiles.GeoBox, ty None:
+    its own buildings, those the road geotile of the same key holds) in frame: (items, lamps [[x, y, z], ...] of its
+    streets in frame, the tile's box)."""
     import roads
-    x0, y0, x1, y1 = roads.tile_bbox(tx, ty)
-    cds = [md.cell(k, layers=("buildings", "building_parts", "infrastructure", "roads", "water"), kind="demand")
-           for k in roads.cells_of_tile(frame, tx, ty, margin=0.0)]
-    items = tile_buildings(frame, x0, y0, x1, y1, [c.layers.get("buildings") for c in cds], ground,
+    box = roads.tile_bbox(tile, ty)
+    x0, y0, x1, y1 = box
+    own = box if hasattr(box, "owns") else None
+    cds = [md.cell(k, layers=FAR_LAYERS, kind="demand") for k in roads.cells_of_tile(frame, tile, ty, margin=0.0)]
+    items = tile_buildings(frame, x0, y0, x1, y1, [c.layers.get("buildings") for c in cds], ground, own=own,
                            part_layers=[c.layers.get("building_parts") for c in cds],
-                           west_town=district_town(frame, tx, ty, md),
+                           west_town=district_town(frame, tile, ty, md),
                            garages_xy=garage_rings(frame, [c.layers.get("infrastructure") for c in cds], x0, y0),
                            supports=support_rings(frame, [c.layers.get("infrastructure") for c in cds], x0, y0),
                            bridges_xy=bridge_lines(frame, [c.layers.get("roads") for c in cds], x0, y0),
                            water_xy=water_rings(frame, [c.layers.get("water") for c in cds], x0, y0),
                            ml_roads_xy=road_lines(frame, [c.layers.get("roads") for c in cds], x0, y0),
                            ways_xy=way_lines(frame, [c.layers.get("roads") for c in cds], x0, y0, size=x1 - x0))
+    size = max(x1 - x0, y1 - y0)
+    lamps = far_lamps(frame, [c.layers.get("roads") for c in cds], x0, y0, size,
+                      built_squares(items, 0.0, 0.0, size), ground, lamp_region, own=own)
+    return items, lamps, box
+
+
+def far_tile(frame, tx, ty, md, ground, out_dir, vfs_dir, aid, lamp_region=None):
+    """A far (render-only) building tile written to the session folder: (vfs path of its JSON, building
+    count) or None. The lite mesh of the same buildings as road_tile's."""
+    import json
+    import os
+    items, lamps, (x0, y0, _x1, _y1) = far_items(frame, tx, ty, md, ground, lamp_region)
     mesh = build(items, lite=True)
     data = {"v": 1}
-    lamps = far_lamps(frame, [c.layers.get("roads") for c in cds], x0, y0, x1 - x0,
-                      built_squares(items, 0.0, 0.0, x1 - x0), ground, lamp_region)
     if lamps:
         data["lamps"] = lamps
     if mesh is not None:
@@ -2995,10 +3136,11 @@ def built_squares(items, x0, y0, size, sq=256.0):
     return {k for k, v in n.items() if v >= FAR_LAMP_MIN_BLD}
 
 
-def far_lamps(frame, road_layers, x0, y0, size, built, ground, region=None, sq=256.0):
-    """The lamps of a far tile's streets: [x, y, z] in the anchor frame (rounded), at most FAR_LAMP_MAX. built: the
-    tile's built-up 256 m squares (built_squares); ground(lat, lon) the ground (arrays); region: furniture.lamp_region's
-    (the spacing)."""
+def far_lamps(frame, road_layers, x0, y0, size, built, ground, region=None, sq=256.0, own=None):
+    """The lamps of a far tile's streets: [x, y, z] in frame (rounded; z the frame's up at FAR_LAMP_Z over the ground),
+    at most FAR_LAMP_MAX. built: the tile's built-up 256 m squares (built_squares); ground(lat, lon) the ground
+    (arrays); region: furniture.lamp_region's (the spacing); own: a geotile's box (geotiles.OwnedBox): only its own
+    lamps (each in one tile)."""
     import furniture
     import roads as roadsmod
     import fast
@@ -3060,11 +3202,16 @@ def far_lamps(frame, road_layers, x0, y0, size, built, ground, region=None, sq=2
         return []
     keep = [k for k in range(len(st)) if lit_any[int(st[k, 2])]
             or (int((st[k, 0] - x0) // sq), int((st[k, 1] - y0) // sq)) in built]
-    st = st[keep][:FAR_LAMP_MAX]
+    st = st[keep]
+    if own is not None and len(st):
+        st = st[np.asarray(own.owns(st[:, 0], st[:, 1]), bool)]
+    st = st[:FAR_LAMP_MAX]
     if not len(st):
         return []
     lat, lon, _ = frame.enu_to_geodetic(st[:, 0], st[:, 1], 0.0)
-    z = np.asarray(ground(np.asarray(lat), np.asarray(lon)), np.float64) + FAR_LAMP_Z
+    lat, lon = np.asarray(lat, np.float64), np.asarray(lon, np.float64)
+    h = np.asarray(ground(lat, lon), np.float64) + FAR_LAMP_Z
+    z = np.asarray(frame.geodetic_to_enu(lat, lon, h)[2], np.float64)     # (the frame's up: the Earth's curvature)
     return np.round(np.c_[st[:, 0], st[:, 1], z], 1).tolist()
 
 
@@ -3156,16 +3303,11 @@ def _sky_mesh(items):
     return P, UV, T, M, MATERIALS, C
 
 
-def skyline_tile(frame, ux, uy, md, ground, out_dir, vfs_dir, aid, lamp_region=None):
-    """A skyline tile (render-only) written to the session folder: (vfs path of its JSON, building count) or None
-    when its cells are not at hand (fetched in the background: asked again later). Key (ux, uy): SKY_UNIT x SKY_UNIT
-    road tiles from road tile (ux * SKY_UNIT, uy * SKY_UNIT)."""
-    import json
-    import roads
-    x0, y0, _, _ = roads.tile_bbox(ux * SKY_UNIT, uy * SKY_UNIT)
-    x1, y1 = x0 + SKY_UNIT * roads.TILE, y0 + SKY_UNIT * roads.TILE
-    keys = sorted({k for i in range(SKY_UNIT) for j in range(SKY_UNIT)
-                   for k in roads.cells_of_tile(frame, ux * SKY_UNIT + i, uy * SKY_UNIT + j, margin=0.0)}, key=str)
+def sky_items(frame, box, keys, md, ground, lamp_region=None, own=None):
+    """The skyline's buildings of box (x0, y0, x1, y1) in frame over map cells keys: (picked items, lamps), or None when
+    the cells are not at hand (fetched in the background: asked again later). own: a geotile's box (its own buildings
+    and lamps, each in one tile)."""
+    x0, y0, x1, y1 = box
     # (and the roads: their street lamps, far_lamps)
     if not all(md.has(k, "buildings") and md.has(k, "roads") for k in keys):
         for k in keys:                      # (the background lane: never before what the player is near)
@@ -3173,9 +3315,10 @@ def skyline_tile(frame, ux, uy, md, ground, out_dir, vfs_dir, aid, lamp_region=N
         return None
     cds = [md.cell(k, layers=("buildings", "roads"), kind="background") for k in keys]
     layers = [c.layers.get("buildings") for c in cds]
-    items = tile_buildings(frame, x0, y0, x1, y1, layers, ground, min_size=(1e9, SKY_MIN_AREA_M2))
-    lamps = far_lamps(frame, [c.layers.get("roads") for c in cds], x0, y0, x1 - x0,
-                      built_squares(items, 0.0, 0.0, x1 - x0), ground, lamp_region)
+    items = tile_buildings(frame, x0, y0, x1, y1, layers, ground, min_size=(1e9, SKY_MIN_AREA_M2), own=own)
+    size = max(x1 - x0, y1 - y0)
+    lamps = far_lamps(frame, [c.layers.get("roads") for c in cds], x0, y0, size,
+                      built_squares(items, 0.0, 0.0, size), ground, lamp_region, own=own)
     for spec, _gmin, _gmax in items:        # (the simplest shape: a box or a few corners, a flat roof, nothing on it)
         ring = np.asarray(spec.ring, np.float64)
         if len(ring) > 4 and abs(_area2(ring)) / 2 < SKY_BOX_AREA_M2:
@@ -3194,6 +3337,23 @@ def skyline_tile(frame, ux, uy, md, ground, out_dir, vfs_dir, aid, lamp_region=N
             break
         picked.append(it)
         n += k
+    return picked, lamps
+
+
+def skyline_tile(frame, ux, uy, md, ground, out_dir, vfs_dir, aid, lamp_region=None):
+    """A skyline tile (render-only) written to the session folder: (vfs path of its JSON, building count) or None
+    when its cells are not at hand (fetched in the background: asked again later). Key (ux, uy): SKY_UNIT x SKY_UNIT
+    road tiles from road tile (ux * SKY_UNIT, uy * SKY_UNIT)."""
+    import json
+    import roads
+    x0, y0, _, _ = roads.tile_bbox(ux * SKY_UNIT, uy * SKY_UNIT)
+    x1, y1 = x0 + SKY_UNIT * roads.TILE, y0 + SKY_UNIT * roads.TILE
+    keys = sorted({k for i in range(SKY_UNIT) for j in range(SKY_UNIT)
+                   for k in roads.cells_of_tile(frame, ux * SKY_UNIT + i, uy * SKY_UNIT + j, margin=0.0)}, key=str)
+    got = sky_items(frame, (x0, y0, x1, y1), keys, md, ground, lamp_region)
+    if got is None:
+        return None
+    picked, lamps = got
     mesh = _sky_mesh(picked) if picked else None
     data = {"v": 1}
     if mesh is not None:
@@ -3225,37 +3385,44 @@ BRIDGE_TOP_RGBA = (92, 92, 94, 255)        # the deck's asphalt from afar
 BRIDGE_SIDE_RGBA = (176, 174, 168, 255)    # its concrete
 
 
-def _bridge_slab(parts, x0, y0, x1, y1):
-    """The slab mesh of the bridge parts [(xy (k, 2), z (k,), width m)] (anchor frame) for the segments whose midpoint
-    is in [x0, x1) x [y0, y1), relative to (x0, y0), or None."""
+FAR_NEED = 106             # earthfast.bridge_slabs
+
+
+def bridge_slabs(parts, origin, box=None, owners=None):
+    """The slab meshes of the bridge parts [(xy (k, 2), z (k,), width m)] (in one frame), relative to origin (x, y),
+    by owner (earthfast.bridge_slabs): box (x0, y0, x1, y1): the segments whose midpoint is in [x0, x1) x [y0, y1), one
+    mesh under the key None; owners (frame, cz, pz, px, py): those whose midpoint's place lies in a zoom-cz geotile
+    under the zoom-pz one (px, py), a mesh per geotile {(gx, gy): mesh}. Each (positions, uvs, tris, tri materials,
+    MATERIALS, colours) as build: the deck's top, its sides and its underside down to its girders, plain grey."""
+    import fast
     import roadmesh
-    m = Mesh()
+    parts = [(np.asarray(xy, np.float64)[:, :2], np.asarray(z, np.float64), float(w)) for xy, z, w in parts]
+    parts = [p for p in parts if len(p[0]) >= 2]
+    if not parts:
+        return {}
+    fast.require(FAR_NEED, "bridge_slabs")
+    xy = np.ascontiguousarray(np.concatenate([p[0] for p in parts]))
+    z = np.ascontiguousarray(np.concatenate([p[1] for p in parts]))
+    off = np.r_[0, np.cumsum([len(p[0]) for p in parts])].astype(np.int64)
+    w = np.array([p[2] for p in parts], np.float64)
+    if owners is None:
+        lat0 = lon0 = 0.0
+        cz = pz = px = py = 0
+        bb = tuple(float(v) for v in box)
+    else:
+        frame, cz, pz, px, py = owners
+        lat0, lon0, bb = float(frame.lat0), float(frame.lon0), (0.0, 0.0, 0.0, 0.0)
+    got = fast._ef.bridge_slabs(xy, z, off, w, (float(origin[0]), float(origin[1])),
+                                float(roadmesh.DECK_DEPTH + roadmesh.GIRDER_D), BRIDGE_TOP_RGBA, BRIDGE_SIDE_RGBA, bb,
+                                lat0, lon0, int(cz), int(pz), int(px), int(py))
     mi = MATERIALS.index(MARBLE)
-    uv = SKY_UV
-    top, side = (mi, BRIDGE_TOP_RGBA), (mi, BRIDGE_SIDE_RGBA)
-    depth = roadmesh.DECK_DEPTH + roadmesh.GIRDER_D
-    for xy, z, w in parts:
-        xy = np.asarray(xy, np.float64)[:, :2]
-        z = np.asarray(z, np.float64)
-        if len(xy) < 2:
+    out = {}
+    for gx, gy, P, T, C in got:
+        if not len(T):
             continue
-        nrm = roadmesh._normals(xy) * (w / 2.0)
-        L, R = xy + nrm - (x0, y0), xy - nrm - (x0, y0)
-        mid = (xy[:-1] + xy[1:]) / 2.0
-        inside = (mid[:, 0] >= x0) & (mid[:, 0] < x1) & (mid[:, 1] >= y0) & (mid[:, 1] < y1)
-        for i in np.flatnonzero(inside):
-            j = i + 1
-            a, b, zt0, zt1 = L[i], L[j], z[i], z[j]
-            c, d = R[i], R[j]
-            zb0, zb1 = zt0 - depth, zt1 - depth
-            m.quad((a[0], a[1], zt0), (c[0], c[1], zt0), (d[0], d[1], zt1), (b[0], b[1], zt1), uv, uv, uv, uv, top)
-            m.quad((a[0], a[1], zb0), (a[0], a[1], zt0), (b[0], b[1], zt1), (b[0], b[1], zb1), uv, uv, uv, uv, side)
-            m.quad((d[0], d[1], zb1), (d[0], d[1], zt1), (c[0], c[1], zt0), (c[0], c[1], zb0), uv, uv, uv, uv, side)
-            m.quad((c[0], c[1], zb0), (a[0], a[1], zb0), (b[0], b[1], zb1), (d[0], d[1], zb1), uv, uv, uv, uv, side)
-    if not m.n:
-        return None
-    P, UV, T, M, C = m.arrays()
-    return P, UV, T, M, MATERIALS, C
+        UV = np.tile(np.asarray(SKY_UV, np.float64), (len(P), 1))
+        out[None if owners is None else (int(gx), int(gy))] = (P, UV, T, np.full(len(T), mi, np.int64), MATERIALS, C)
+    return out
 
 
 def far_bridge_tile(frame, tx, ty, md, bridges, out_dir, vfs_dir, aid):
@@ -3272,7 +3439,7 @@ def far_bridge_tile(frame, tx, ty, md, bridges, out_dir, vfs_dir, aid):
         return None
     cells = [md.cell(k, layers=("roads",), kind="background").layers.get("roads") for k in keys]
     parts = [(xy, z, float(spec.width)) for _fid, spec, xy, z, _lon in bridges.parts(cells, (x0, y0, x1, y1))]
-    mesh = _bridge_slab(parts, x0, y0, x1, y1) if parts else None
+    mesh = bridge_slabs(parts, (x0, y0), box=(x0, y0, x1, y1)).get(None) if parts else None
     data = {"v": 1}
     if mesh is not None:
         shape = f"brfar_{aid}_{tx}_{ty}.cdae"
@@ -3393,10 +3560,10 @@ BRICK_WALK_COVERAGE = 0.35  # dense old cores (row houses) of brick regions ...
 BRICK_WALK_SHARE = 0.55     # ... pave this share of their streets' sidewalks with brick (hashed per street)
 
 
-def brick_walks(walks, items, lat, lon):
+def brick_walks(walks, items, lat, lon, tile=256.0):
     """Marks the sidewalk runs (roads.build_tile's walks) of a dense brick-region tile that are brick pavers
     (Fells Point's historic streets): every run of a street the same."""
-    if not walks or brick_share(lat, lon) < 0.7 or coverage(items) < BRICK_WALK_COVERAGE:
+    if not walks or brick_share(lat, lon) < 0.7 or coverage(items, tile) < BRICK_WALK_COVERAGE:
         return
     for wk in walks:
         fid = wk.get("fid")

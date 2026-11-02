@@ -52,6 +52,8 @@ import time
 from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
+import base64
+import urllib.request
 from urllib.parse import urlsplit
 
 import perftrace
@@ -77,6 +79,8 @@ PREFETCH_SLOTS = float(os.environ.get("BNGE_PREFETCH_SLOTS", "0.5"))
 BACKGROUND_RESERVE = 0.75       # background (de-shadow, weather) only above this: it comes after prefetch
 RETRY_AFTER_MIN, RETRY_AFTER_MAX = 1.0, 900.0
 BUDGET_WARN = 0.8               # share of the soft daily budget where prefetch / background stop
+PREDOWNLOAD_SHARE = 0.5         # saved areas' downloads ahead (areas.py) stop at this share of a host's daily budget
+                                # (soft, else hard): live play keeps the rest of the day
 BUDGET_REPEAT_S = 3600.0        # over budget: the warning repeats this often
 STATS_FLUSH_S = 60.0
 DAY = 86400.0
@@ -164,7 +168,9 @@ POLICIES = {
                                     allow_prefetch=True, offline_ok=True, miss_ttl=30 * DAY,
                                     binary=True, timeout=60.0, max_attempts=2, base_delay=2.0,
                                     breaker_threshold=6, breaker_window=120.0),
-    "tiles.maps.eox.at": HostPolicy(rate=10.0, burst=40.0, max_conc=6, daily_budget=30000,
+    # (20/s, 12 at once: the user's OK 2026-10-30; at 10/s a first visit's far field outside the US took ~4 min, 761
+    # tiles in 241 s at Canterbury; s2maps-tiles.eu, EOX's other domain, refuses us: no mirror)
+    "tiles.maps.eox.at": HostPolicy(rate=20.0, burst=80.0, max_conc=12, daily_budget=30000,
                                     allow_prefetch=True, offline_ok=True, miss_ttl=90 * DAY, **TILE_HOST),
     # (a tile not in Cloudflare's edge cache takes ~1 s before its first byte: requests in flight set the rate)
     "tiles.mapterhorn.com": HostPolicy(rate=50.0, burst=200.0, max_conc=32, daily_budget=80000,
@@ -186,11 +192,15 @@ POLICIES = {
     # range reads of immutable release files, kept forever; the STAC index is small JSON on CloudFront
     "stac.overturemaps.org": HostPolicy(rate=5.0, burst=10.0, max_conc=2, daily_budget=5000,
                                         allow_prefetch=True, offline_ok=True, timeout=20.0),
-    **{h: HostPolicy(rate=20.0, burst=40.0, max_conc=4, daily_budget=None, allow_prefetch=True,
+    # Overture's two copies of each release (AWS, Azure: rangeread spreads the reads over both): 8 at once each (the
+    # user, 2026-10-30: a fresh place's road cells waited on our 4; one connection gave ~5-27 MB/s, 8 ~40-50)
+    **{h: HostPolicy(rate=40.0, burst=80.0, max_conc=8, daily_budget=None, allow_prefetch=True,
                      offline_ok=True, miss_ttl=None, binary=True, timeout=30.0)
        for h in ("overturemaps-us-west-2.s3.us-west-2.amazonaws.com",
-                 "overturemapswestus2.blob.core.windows.net",
-                 "esa-worldcover.s3.eu-central-1.amazonaws.com",
+                 "overturemapswestus2.blob.core.windows.net")},
+    **{h: HostPolicy(rate=20.0, burst=40.0, max_conc=4, daily_budget=None, allow_prefetch=True,
+                     offline_ok=True, miss_ttl=None, binary=True, timeout=30.0)
+       for h in ("esa-worldcover.s3.eu-central-1.amazonaws.com",
                  "dataforgood-fb-data.s3.amazonaws.com",
                  "copernicus-dem-30m.s3.amazonaws.com")},      # the polar caps' DEM (polardem.py)
     # British Columbia's lidar DEMs (lidarbc.py): range reads of the Province's open bucket; optional
@@ -230,8 +240,20 @@ POLICIES = {
                              timeout=60.0, max_attempts=1, optional=True),
     # OSM US Layercake (osmtags.py): the OSM highways GeoParquet on Cloudflare, read in ranges (the footer once, a few
     # MB per new area); optional: without it roads keep their width guesses
-    "data.openstreetmap.us": HostPolicy(rate=4.0, burst=8.0, max_conc=2, daily_budget=5000, allow_prefetch=True,
+    # (4 at once: ~1-5 MB/s a connection, uncached at Cloudflare's edge; a fresh place's first graded block waited ~20 s
+    # on 2, the user's OK 2026-10-30; no mirror of the file exists)
+    "data.openstreetmap.us": HostPolicy(rate=8.0, burst=16.0, max_conc=4, daily_budget=5000, allow_prefetch=True,
                                         offline_ok=True, miss_ttl=None, binary=True, timeout=30.0, optional=True),
+    # USGS 3DEP lidar point clouds (roadz.py: the US bridge decks, BNE_LIDAR_DECKS): EPT metadata (kept on disk) and
+    # ~0.3 MB LAZ nodes along a cell's bridges once (the decks made from them are kept); optional (the inference)
+    "s3-us-west-2.amazonaws.com": HostPolicy(rate=10.0, burst=30.0, max_conc=4, daily_budget=20000, daily_hard=40000,
+                                             allow_prefetch=True, offline_ok=True, miss_ttl=None, binary=True,
+                                             timeout=30.0, optional=True),
+    # Norway's road database (roadz.py: road, bridge and tunnel heights, NVDB API v4): a few pages per map-data cell
+    # once, kept on disk; a modest rate for a public API that asks clients to name themselves (X-Client, no user data)
+    "nvdbapiles.atlas.vegvesen.no": HostPolicy(rate=2.0, burst=4.0, max_conc=2, daily_budget=3000, daily_hard=6000,
+                                               allow_prefetch=True, offline_ok=True, miss_ttl=None, timeout=30.0,
+                                               max_attempts=3, base_delay=2.0, optional=True),
     # never at runtime (OSM Overpass, OSMF vector tiles, Protomaps builds): §3.3
     "overpass-api.de": HostPolicy(denied=True, daily_hard=0),
     "vector.openstreetmap.org": HostPolicy(denied=True, daily_hard=0),
@@ -288,6 +310,8 @@ ROLES = {
     "gis.ngdc.noaa.gov": "sea depths; new coasts get a plain sloping sea floor meanwhile",
     "davidmegginson.github.io": "the airport list; the copy on disk is used meanwhile",
     "data.openstreetmap.us": "road details from OpenStreetMap (lanes, widths, sidewalks); estimated meanwhile",
+    "s3-us-west-2.amazonaws.com": "US lidar for bridge deck heights; estimated meanwhile",
+    "nvdbapiles.atlas.vegvesen.no": "Norway's measured road, bridge and tunnel heights; estimated meanwhile",
     "tecnagamer.github.io": "railway details, US railroad crossing equipment and lane markings; estimated meanwhile",
     "api.open-meteo.com": "live weather; the weather stays as it is meanwhile",
     "downloads.sourceforge.net": "the gravity model; standard gravity meanwhile",
@@ -316,13 +340,17 @@ def role_of(host):
 
 
 # --- errors ------------------------------------------------------------------------------------
+_quiet = threading.local()      # set while a "predownload" request runs: its errors are no build's (no revisit.fault)
+
+
 class FetchError(IOError):
     """A request that did not give data. retry_after: s before asking this host again helps."""
 
     def __init__(self, msg, url=None, host=None, retry_after=0.0, status=None):
         super().__init__(msg)
         self.url, self.host, self.retry_after, self.status = url, host, retry_after, status
-        if not isinstance(self, (NotFound, Deferred)):     # (no data there, a dropped prefetch: as it should be)
+        # (no data there, a dropped prefetch: as it should be; a saved area's download ahead: no build waited on it)
+        if not isinstance(self, (NotFound, Deferred)) and not getattr(_quiet, "on", False):
             import revisit
             revisit.fault()             # (a build that goes on without it is not kept)
 
@@ -621,34 +649,122 @@ def windows_ssl_context():
 
 class HttpsTransport:
     """GET over one persistent HTTP(S) connection per thread and host (a fresh TLS handshake per tile
-    roughly doubled the latency). No redirects are followed."""
+    roughly doubled the latency). No redirects are followed. Honours HTTP_PROXY / HTTPS_PROXY / NO_PROXY
+    (and urllib.request.getproxies() as a fallback) so users behind a corporate proxy can reach the
+    data sources; SOCKS proxies are not supported (PySocks is not a dependency)."""
 
     def __init__(self):
         self._local = threading.local()
         self._tls_context = windows_ssl_context()
+
+    # --- proxy helpers ---------------------------------------------------------------
+    @staticmethod
+    def _resolve_proxy(scheme, host):
+        """Return (proxy_host, proxy_port, proxy_user, proxy_pass) or None when no proxy applies."""
+        # NO_PROXY / no_proxy: comma-separated list of hosts (or suffixes) to bypass.
+        no_proxy = os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or ""
+        if not no_proxy:
+            try:
+                no_proxy = urllib.request.getproxies().get("no", "")
+            except Exception:
+                no_proxy = ""
+        for entry in (e.strip() for e in no_proxy.split(",") if e.strip()):
+            if entry == "*" or host == entry or host.endswith("." + entry):
+                return None
+        # env first (higher priority), then urllib's view of the system proxy
+        for var in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"):
+            val = os.environ.get(var)
+            if val:
+                break
+        else:
+            try:
+                val = urllib.request.getproxies().get(scheme) or urllib.request.getproxies().get("all")
+            except Exception:
+                val = None
+        if not val:
+            log.debug("net: no proxy for %s (no env var / system proxy)", host)
+            return None
+        val = val.strip()
+        if "://" in val:
+            val = val.split("://", 1)[1]
+        user = passw = None
+        if "@" in val:
+            creds, val = val.rsplit("@", 1)
+            if ":" in creds:
+                user, passw = creds.split(":", 1)
+            else:
+                user = creds
+        if ":" in val:
+            phost, pport = val.rsplit(":", 1)
+            try:
+                pport = int(pport)
+            except ValueError:
+                phost, pport = val, (443 if scheme == "https" else 80)
+        else:
+            phost, pport = val, (443 if scheme == "https" else 80)
+        if phost.lower().startswith("socks"):
+            log.warning("net: SOCKS proxies are not supported; ignoring %s", val)
+            return None
+        log.debug("net: proxy resolved for %s: %s:%d (user=%s)", host, phost, pport, user or "-")
+        return phost, pport, user, passw
 
     def request(self, url, headers, timeout):
         """(status, {lower-case header: value}, body)."""
         u = urlsplit(url)
         conns = self._local.__dict__.setdefault("conns", {})
         path = (u.path or "/") + (f"?{u.query}" if u.query else "")
-        key = (u.scheme, u.netloc)
+        proxy = self._resolve_proxy(u.scheme, u.hostname or "")
+        if proxy is None:
+            key = (u.scheme, u.netloc, None)
+        else:
+            log.debug("net: %s -> proxy %s:%d", url, proxy[0], proxy[1])
+            key = (u.scheme, u.netloc, proxy[0], proxy[1])
         while True:
             conn = conns.get(key)
             reused = conn is not None
             if conn is None:
-                if u.scheme == "https":
-                    cls = http.client.HTTPSConnection
-                    kw = {}
-                    if self._tls_context is not None:       # (Windows: its own certificate checks, truststore)
-                        kw["context"] = self._tls_context
-                    elif SHARED_TLS and cls is _HTTPS:      # (tests: a stand-in)
-                        kw["context"] = tls_context()
-                    conn = conns[key] = cls(u.netloc, timeout=timeout, **kw)
+                if proxy is not None and u.scheme == "https":
+                    phost, pport, puser, ppass = proxy
+                    kwargs = {"timeout": timeout}
+                    if self._tls_context is not None:
+                        kwargs["context"] = self._tls_context
+                    conn = http.client.HTTPSConnection(phost, pport, **kwargs)
+                    if puser is not None:
+                        creds = base64.b64encode(f"{puser}:{ppass or ''}".encode()).decode()
+                        conn.set_tunnel(u.hostname, u.port or 443,
+                                       headers={"Proxy-Authorization": f"Basic {creds}"})
+                    else:
+                        conn.set_tunnel(u.hostname, u.port or 443)
+                    conn = conns[key] = conn
+                elif proxy is not None:
+                    phost, pport, puser, ppass = proxy
+                    conn = http.client.HTTPConnection(phost, pport, timeout=timeout)
+                    if puser is not None:
+                        creds = base64.b64encode(f"{puser}:{ppass or ''}".encode()).decode()
+                        conn._proxy_auth = f"Basic {creds}"
+                    conn = conns[key] = conn
                 else:
-                    conn = conns[key] = http.client.HTTPConnection(u.netloc, timeout=timeout)
+                    if u.scheme == "https":
+                        cls = http.client.HTTPSConnection
+                        kwargs = {"timeout": timeout}
+                        if self._tls_context is not None:   # (Windows: its own certificate checks, truststore)
+                            kwargs["context"] = self._tls_context
+                        elif SHARED_TLS and cls is _HTTPS:  # (one TLS context for every connection; tests: a stand-in)
+                            kwargs["context"] = tls_context()
+                        conn = conns[key] = cls(u.netloc, **kwargs)
+                    else:
+                        conn = conns[key] = http.client.HTTPConnection(u.netloc, timeout=timeout)
             try:
-                conn.request("GET", path, headers=dict(headers, Connection="keep-alive"))
+                req_headers = dict(headers, Connection="keep-alive")
+                if proxy is not None and u.scheme == "http":
+                    phost, pport, puser, ppass = proxy
+                    if getattr(conn, "_proxy_auth", None):
+                        req_headers["Proxy-Authorization"] = conn._proxy_auth
+                    # absolute URL for the proxy
+                    full_url = url
+                    conn.request("GET", full_url, headers=req_headers)
+                else:
+                    conn.request("GET", path, headers=req_headers)
                 r = conn.getresponse()
                 body = r.read()
                 return r.status, {k.lower(): v for k, v in r.getheaders()}, body
@@ -802,6 +918,9 @@ class Fetcher:
             used = h.day["requests"]
         if p.daily_hard is not None and used >= p.daily_hard:
             raise BudgetExceeded(f"{h.name}: daily limit of {p.daily_hard} requests reached", url, h.name)
+        if kind == "predownload" and p.daily_hard is not None and used >= PREDOWNLOAD_SHARE * p.daily_hard:
+            raise BudgetExceeded(f"{h.name}: past {round(100 * PREDOWNLOAD_SHARE)} % of the daily limit (downloads "
+                                 "ahead)", url, h.name)
         if p.daily_budget is None:
             return
         now = self.wall()
@@ -817,6 +936,9 @@ class Fetcher:
             h.warned = now
             log.warning("net: %s: %d requests today, %d %% of the daily budget of %d: no more prefetch",
                         h.name, used, round(100 * BUDGET_WARN), p.daily_budget)
+        if kind == "predownload" and used >= PREDOWNLOAD_SHARE * p.daily_budget:
+            raise BudgetExceeded(f"{h.name}: past {round(100 * PREDOWNLOAD_SHARE)} % of the daily budget (downloads "
+                                 "ahead)", url, h.name)
         if kind not in ("demand", "urgent") and used >= BUDGET_WARN * p.daily_budget:
             raise BudgetExceeded(f"{h.name}: past {round(100 * BUDGET_WARN)} % of the daily budget", url, h.name)
 
@@ -906,6 +1028,16 @@ class Fetcher:
         """GET url under its host's policy: a Response with status 2xx, or one of the errors above. lane: a name of
         its own (its own rate bucket, breaker and day's count under the host's policy): one kind of request whose
         failures must not shut another out (the status bar's town lookups and the map's search, GitHub #350)."""
+        if kind != "predownload":
+            return self._get(url, kind, headers, lane)
+        prev = getattr(_quiet, "on", False)
+        _quiet.on = True        # (its failures mark no build incomplete: revisit.fault)
+        try:
+            return self._get(url, kind, headers, lane)
+        finally:
+            _quiet.on = prev
+
+    def _get(self, url, kind, headers, lane):
         h, probe = self._admit(url, kind, lane)
         p = h.policy
         attempts = 1 if probe else max(1, p.max_attempts)

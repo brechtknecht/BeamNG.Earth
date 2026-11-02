@@ -18,6 +18,7 @@ A layer of its own is not needed: mapdata joins the tags into the roads layer wh
 read the same cell file, so a road's lanes and width agree everywhere). Unreachable: the cell keeps no tags and the
 roads use their width guesses (roads.carriageway), as before.
 """
+import json
 import logging
 import math
 import os
@@ -30,6 +31,7 @@ import numpy as np
 import netfetch
 import overture
 import rangeread
+import xproc
 
 log = logging.getLogger("earthd.mapdata")
 
@@ -61,6 +63,13 @@ COLUMNS = {
     "osm_highway": "CASE WHEN highway IN ('construction', 'proposed') THEN highway END",
     "bx0": "bbox.xmin", "by0": "bbox.ymin", "bx1": "bbox.xmax", "by1": "bbox.ymax",
 }
+TEXT_COLUMNS = {"sidewalk", "lit", "smoothness", "osm_surface", "osm_oneway", "name", "osm_highway"}
+INT_COLUMNS = {"lanes", "osm_layer"}
+GROUPS_FILE = "groups.json"     # the version's parsed row groups (OsmTags._groups)
+TABLE_DIR = "rg"        # a row group's decoded ways (OsmTags._table), in the version's folder
+TABLE_MEM = 6           # decoded row groups kept in memory (~6 MB each; a place's cells share 3-5)
+EXACT32 = {"bx0", "by0", "bx1", "by1", "lanes", "osm_layer"}   # float32 (the file's bbox; small integers)
+TABLE_WAIT_S = 60.0     # a row group another process decodes is waited for this long
 USED = {"id", "bbox", "lanes", "width", "maxspeed", "sidewalk", "lit", "smoothness", "surface", "oneway", "layer", "name"}
 FLOATS = ("lanes", "width", "maxspeed", "osm_layer")
 TEXTS = ("sidewalk", "lit", "smoothness", "osm_surface", "osm_oneway", "osm_highway")
@@ -91,6 +100,7 @@ class OsmTags:
         self._checked = 0.0
         self._reader = overture.Reader(raw_dir, fetcher)
         self._meta = None           # (RemoteFile, row groups) of the version in use: _groups
+        self._tables = {}           # (id(RemoteFile), row group) -> its decoded ways (_table), least recent first
 
     def version(self, kind="demand"):
         """(etag, RemoteFile) of the version in use: the one pinned on disk while fresh, else the server's."""
@@ -160,27 +170,21 @@ class OsmTags:
 
     def fetch_only(self, bounds, kind="prefetch"):
         """Only the network part of cell(): the tag columns of the row groups that touch bounds into the block cache
-        (overture.Reader.fetch_only; the raceways' geometry is left to cell())."""
+        (overture.Reader.fetch_only; the raceways' geometry is left to cell()). Row groups decoded already (_table's
+        files) need nothing."""
         etag, remote = self.version(kind)
         rd = self._reader
         files = {PATH: remote}
-        con = overture.LazyConnection(rd, files, kind)
-        errors = con.errors
+        con, proto, errors = rd._connect(files, kind)
         try:
-            uri = f"'{con.proto}://{PATH}'"
+            uri = f"'{proto}://{PATH}'"
             groups = self._groups(con, uri, remote, kind)
-            cand = self._candidates(groups, bounds)
-            if rd.shards_ok:        # (the candidates' boxes, kept; the bytes of the missing shards only)
-                rgs = [overture.RowGroup(rg, remote, uri, PATH, rg, groups[rg]["first"], groups[rg]["n"],
-                                         groups[rg]["cols"]) for rg in cand]
-                boxes = rd.boxes(con, files, rgs, kind)
-                rgs = [g for g in rgs if overture.box_hit(boxes.get(g.key), bounds)]
-                present = {c for g in rgs for c in g.cols}
-                rd.shards(con, files, rgs, sorted((USED | {"highway"}) & present), kind, src_row=True, write=False)
-                return
+            cand = [rg for rg in self._candidates(groups, bounds)
+                    if not os.path.exists(os.path.join(remote.cache_dir, TABLE_DIR, f"{int(rg)}.npz"))]
             want = {c for rg in cand for c in groups[rg]["cols"] if c in USED or c == "highway"}
-            rd._fetch(files, {PATH: [r for rg in cand for c, rs in groups[rg]["cols"].items() if c in want
-                                     for r in rs]}, kind)
+            if cand:
+                rd._fetch(files, {PATH: [r for rg in cand for c, rs in groups[rg]["cols"].items() if c in want
+                                         for r in rs]}, kind)
         except Exception as e:
             real = next((x for x in errors if isinstance(x, (netfetch.FetchError, rangeread.RangeError))), None)
             if real is not None and real is not e:
@@ -192,22 +196,52 @@ class OsmTags:
     def _groups(self, con, uri, remote, kind):
         """{row group: {"first", "n", "bbox": {leaf: (min, max)}, "cols": {column: [byte ranges]}}} of the file,
         parsed once per version (0.6 s of every cell's two queries, 2026-10-22: Central Park's first block waited
-        90 s for its cells) and kept beside its blocks for the server's other processes (overture.save_metadata)."""
+        90 s for its cells)."""
         with self._lock:
             got = self._meta
         if got is not None and got[0] is remote:
             return got[1]
-        groups = overture.load_metadata(remote)
-        if groups is None:
-            tail = remote.read(max(0, remote.size - overture.FOOTER_GUESS), remote.size, kind)
-            n = int.from_bytes(tail[-8:-4], "little")
-            if n + 8 > len(tail):
-                remote.read(remote.size - n - 8, remote.size, kind)
-            meta = con.execute(f"""SELECT file_name, row_group_id, row_group_num_rows, path_in_schema, stats_min,
-                stats_max, dictionary_page_offset, data_page_offset, total_compressed_size FROM parquet_metadata({uri})
-                ORDER BY row_group_id, column_id""").fetchall()
-            groups = next(iter(overture.parse_metadata(meta).values()), {})
-            overture.save_metadata(remote, groups)
+        # parsed once per version on disk too (0.8 s of every server process's first cell, the footer's ~84k rows)
+        saved = os.path.join(remote.cache_dir, GROUPS_FILE)
+        try:
+            with open(saved, encoding="utf-8") as f:
+                groups = {int(rg): {"first": g["first"], "n": g["n"],
+                                    "bbox": {k: tuple(v) for k, v in g["bbox"].items()},
+                                    "cols": {k: [tuple(r) for r in v] for k, v in g["cols"].items()}}
+                          for rg, g in json.load(f).items()}
+            with self._lock:
+                self._meta = (remote, groups)
+            return groups
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        tail = remote.read(max(0, remote.size - overture.FOOTER_GUESS), remote.size, kind)
+        n = int.from_bytes(tail[-8:-4], "little")
+        if n + 8 > len(tail):
+            remote.read(remote.size - n - 8, remote.size, kind)
+        meta = con.execute(f"""SELECT row_group_id, row_group_num_rows, path_in_schema, stats_min, stats_max,
+            dictionary_page_offset, data_page_offset, total_compressed_size FROM parquet_metadata({uri})
+            ORDER BY row_group_id, column_id""").fetchall()
+        groups, first = {}, 0
+        for rg, nrows, col, smin, smax, dict_off, data_off, size in meta:
+            g = groups.get(rg)
+            if g is None:
+                g = groups[rg] = {"first": first, "n": nrows, "bbox": {}, "cols": {}}
+                first += nrows
+            offs = [o for o in (dict_off, data_off) if o]
+            if not offs:
+                continue
+            top, leaf = col.split(", ")[0], col.split(", ")[-1]
+            g["cols"].setdefault(top, []).append((min(offs), min(offs) + size))
+            if top == "bbox":
+                g["bbox"][leaf] = (smin, smax)
+        try:
+            os.makedirs(remote.cache_dir, exist_ok=True)
+            tmp = f"{saved}.{os.getpid()}.{threading.get_ident()}.tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({str(rg): g for rg, g in groups.items()}, f)
+            os.replace(tmp, saved)
+        except (OSError, TypeError, ValueError) as e:
+            log.debug("osmtags: row groups not saved: %s", e)
         with self._lock:
             self._meta = (remote, groups)
         return groups
@@ -225,59 +259,95 @@ class OsmTags:
                 if stat(g, "xmin", 0, -1e9) <= lon1 and stat(g, "xmax", 1, 1e9) >= lon0
                 and stat(g, "ymin", 0, -1e9) <= lat1 and stat(g, "ymax", 1, 1e9) >= lat0]
 
+    def _table(self, con, uri, groups, rg, remote, kind):
+        """Row group rg's ways with a tag the roads use (or highway=raceway): {"id", "race", "frn", COLUMNS..., and for
+        a text column "<c>_off" (its UTF-8 bytes' offsets) and "<c>_ok" (not NULL)} as arrays, NaN for a missing number.
+        Decoded once per version: kept in memory (TABLE_MEM) and in the version's folder (TABLE_DIR, the other
+        processes read it; xproc: one decodes)."""
+        k = (id(remote), rg)
+        with self._lock:
+            t = self._tables.pop(k, None)
+            if t is not None:
+                self._tables[k] = t             # (most recently used last)
+                return t
+        path = os.path.join(remote.cache_dir, TABLE_DIR, f"{int(rg)}.npz")
+
+        def load():
+            try:
+                with np.load(path, allow_pickle=False) as f:
+                    return {c: f[c] for c in f.files}
+            except (OSError, ValueError, KeyError):
+                return None
+        t, mine = xproc.once(path + ".lock", load, TABLE_WAIT_S, kind)
+        if t is None:
+            try:
+                t = self._decode(con, uri, groups, rg, remote, kind)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp.npz"
+                np.savez_compressed(tmp, **t)
+                os.replace(tmp, path)
+            finally:
+                if mine:
+                    xproc.release(path + ".lock")
+        with self._lock:
+            self._tables[k] = t
+            while len(self._tables) > TABLE_MEM:
+                self._tables.pop(next(iter(self._tables)))
+        return t
+
+    def _decode(self, con, uri, groups, rg, remote, kind):
+        g = groups[rg]
+        rd = self._reader
+        want = {c for c in g["cols"] if c in USED or c == "highway"}
+        rd._fetch({PATH: remote}, {PATH: [r for c, rs in g["cols"].items() if c in want for r in rs]}, kind)
+        cols = ", ".join(f"{expr} AS \"{name}\"" for name, expr in COLUMNS.items())
+        # only the ways with a tag the roads use (and the raceways): join() treats a way without one as one not
+        # here, and building a dict per way of every highway in the cell was most of this thread's CPU
+        # (osmtags, 14 CPU-s of a Deck's teleport, 2026-10-23)
+        some = " OR ".join([f"{c} IS NOT NULL" for c in sorted(USED - {"id", "bbox"})]
+                           + [f"highway IN ({', '.join(repr(v) for v in UNBUILT)})"])
+        got = con.execute(f"""SELECT id, highway = 'raceway', file_row_number, {cols}
+            FROM read_parquet({uri}, file_row_number = true)
+            WHERE file_row_number BETWEEN {g['first']} AND {g['first'] + g['n'] - 1}
+            AND (highway = 'raceway' OR {some})""").fetchall()
+        t = {"id": np.array([r[0] for r in got], np.int64), "race": np.array([bool(r[1]) for r in got], bool),
+             "frn": np.array([r[2] for r in got], np.int64)}
+        for j, name in enumerate(COLUMNS, 3):
+            vals = [r[j] for r in got]
+            if name in TEXT_COLUMNS:          # (one UTF-8 blob and offsets: fixed-width strings took ~20 MB)
+                enc = [b"" if v is None else str(v).encode("utf-8") for v in vals]
+                t[name + "_ok"] = np.array([v is not None for v in vals], bool)
+                t[name + "_off"] = np.concatenate([[0], np.cumsum([len(b) for b in enc])]).astype(np.int32)
+                t[name] = np.frombuffer(b"".join(enc), np.uint8)
+            else:
+                t[name] = np.array([np.nan if v is None else float(v) for v in vals],
+                                   np.float32 if name in EXACT32 else np.float64)
+        return t
+
     def _cell(self, remote, bounds, kind):
         lon0, lat0, lon1, lat1 = bounds
         rd = self._reader
         files = {PATH: remote}
-        con = overture.LazyConnection(rd, files, kind)
-        errors = con.errors
+        con, proto, errors = rd._connect(files, kind)
         try:
-            uri = f"'{con.proto}://{PATH}'"
+            uri = f"'{proto}://{PATH}'"
             groups = self._groups(con, uri, remote, kind)
             cand = self._candidates(groups, bounds)
             if not cand:
                 return {}, []
-            box = (f"bbox.xmin <= {lon1!r} AND bbox.xmax >= {lon0!r} AND bbox.ymin <= {lat1!r} "
-                   f"AND bbox.ymax >= {lat0!r}")
-            cols = ", ".join(f"{expr} AS \"{name}\"" for name, expr in COLUMNS.items())
-            # only the ways with a tag the roads use (and the raceways): join() treats a way without one as one not
-            # here, and building a dict per way of every highway in the cell was most of this thread's CPU
-            # (osmtags, 14 CPU-s of a Deck's teleport, 2026-10-23)
-            some = " OR ".join([f"{c} IS NOT NULL" for c in sorted(USED - {"id", "bbox"})]
-                               + [f"highway IN ({', '.join(repr(v) for v in UNBUILT)})"])
-            rows = None
-            if rd.shards_ok:
-                # the candidates' row groups (~120 k ways each, a cell needs a few hundred of them) decoded once per
-                # machine into local shards (overture.SHARDS): every cell of a drive read the same two again
-                rgs = [overture.RowGroup(rg, remote, uri, PATH, rg, groups[rg]["first"], groups[rg]["n"],
-                                         groups[rg]["cols"]) for rg in cand]
-                boxes = rd.boxes(con, files, rgs, kind)
-                rgs = [g for g in rgs if overture.box_hit(boxes.get(g.key), bounds)]
-                if not rgs:
-                    return {}, []
-                present = {c for g in rgs for c in g.cols}
-                shards = rd.shards(con, files, rgs, sorted((USED | {"highway"}) & present), kind, src_row=True)
-                local = [shards[g.key] for g in rgs]
-                lcon = rd.local_con()
-                try:
-                    rows = lcon.execute(f"""SELECT id, highway = 'raceway', src_row, {cols}
-                        FROM read_parquet([{", ".join(overture._lit(p) for p in local)}])
-                        WHERE {box} AND (highway = 'raceway' OR {some})""").fetchall()
-                except Exception as e:
-                    if not overture._is_duckdb_error(e):
-                        raise
-                    rd.shard_failed(local, e)
-                    rows = None
-            if rows is None:
-                want = {c for rg in cand for c in groups[rg]["cols"] if c in USED or c == "highway"}
-                rd._fetch(files, {PATH: [r for rg in cand for c, rs in groups[rg]["cols"].items() if c in want
-                                         for r in rs]}, kind)
-                only = " OR ".join(f"file_row_number BETWEEN {groups[rg]['first']} AND "
-                                   f"{groups[rg]['first'] + groups[rg]['n'] - 1}" for rg in cand)
-                rows = con.execute(f"""SELECT id, highway = 'raceway', file_row_number, {cols}
-                    FROM read_parquet({uri}, file_row_number = true)
-                    WHERE ({only}) AND {box} AND (highway = 'raceway' OR {some})""").fetchall()
-            rows.sort(key=lambda r: r[2])      # (in the file's order, however DuckDB's threads delivered them)
+            # each row group decoded once (_table) and the cell's ways picked from it by their bbox: the file is
+            # spatially clustered, so a place's cells share a few row groups (81 cells round Nottingham: 243 decodes
+            # of 3 row groups), and the decoding was most of this thread's CPU (23 CPU-s of a teleport, 2026-10-30)
+            rows = []
+            for rg in cand:
+                t = self._table(con, uri, groups, rg, remote, kind)
+                if not len(t["id"]):
+                    continue
+                # (in float32, as the file's bbox and DuckDB's comparison with it: a way whose box ends on the cell's edge)
+                b = np.float32
+                m = np.flatnonzero((t["bx0"].astype(b) <= b(lon1)) & (t["bx1"].astype(b) >= b(lon0))
+                                   & (t["by0"].astype(b) <= b(lat1)) & (t["by1"].astype(b) >= b(lat0)))
+                rows.extend(_rows(t, m))
             race = [r[2] for r in rows if r[1]]
             got = []
             if race:            # (rare: the raceways' own columns and geometry, of their row groups only)
@@ -290,7 +360,7 @@ class OsmTags:
                 except Exception:
                     pass
                 rcols = ", ".join(f'"{c}"' for c in RACEWAY_COLUMNS)
-                rows_in = ", ".join(str(int(r)) for r in sorted(race))
+                rows_in = ", ".join(str(int(r)) for r in race)
                 got = con.execute(f"""SELECT {rcols}, geometry FROM read_parquet({uri}, file_row_number = true)
                     WHERE file_row_number IN ({rows_in})""").fetchall()
         except Exception:
@@ -311,6 +381,23 @@ class OsmTags:
             d["coords"] = coords
             ways.append(d)
         return tags, ways
+
+def _rows(t, idx):
+    """Rows idx of a decoded row group (OsmTags._table) as (id, raceway, file row, COLUMNS' values (None: missing))."""
+    names = list(COLUMNS)
+    out = []
+    for i in idx:
+        vals = []
+        for c in names:
+            if c in TEXT_COLUMNS:
+                o = t[c + "_off"]
+                vals.append(t[c][o[i]:o[i + 1]].tobytes().decode("utf-8") if t[c + "_ok"][i] else None)
+            else:
+                v = float(t[c][i])
+                vals.append(None if v != v else (int(v) if c in INT_COLUMNS else v))
+        out.append((int(t["id"][i]), bool(t["race"][i]), int(t["frn"][i]), *vals))
+    return out
+
 
 RACEWAY_PAVED = {"", "asphalt", "concrete", "paved", "chipseal"}
 

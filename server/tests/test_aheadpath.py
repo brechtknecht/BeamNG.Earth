@@ -9,7 +9,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import aheadpath  # noqa: E402
-import blockworker  # noqa: E402
 
 
 class PointsTest(unittest.TestCase):
@@ -106,43 +105,3 @@ class FakeGrader:
             self.done.add(key)
 
 
-class WarmLoopTest(unittest.TestCase):
-    def setUp(self):
-        self.old = blockworker._s
-
-        class S:
-            pass
-        blockworker._s = S()
-        blockworker._s.cv = threading.Condition()
-        blockworker._s.want = []
-
-    def tearDown(self):
-        with blockworker._s.cv:
-            blockworker._s.want = []
-        blockworker._s = self.old
-
-    def test_cells_planned_at_once_most_urgent_first(self):
-        g = FakeGrader(0.4)
-        keys = [(14, i, 0) for i in range(6)]
-        with blockworker._s.cv:
-            blockworker._s.want = [(g, k) for k in keys]
-        threading.Thread(target=blockworker._warm_loop, daemon=True).start()
-        end = time.monotonic() + 5
-        while len(g.done) < len(keys) and time.monotonic() < end:
-            time.sleep(0.05)
-        self.assertEqual(g.done, set(keys))
-        order = [k for k, _ in g.started]
-        self.assertEqual(sorted(order[:blockworker.WARM_THREADS]), keys[:blockworker.WARM_THREADS])
-        t0 = g.started[0][1]
-        self.assertLess(g.started[blockworker.WARM_THREADS - 1][1] - t0, 0.2)     # together, not one after another
-
-    def test_cell_another_process_plans_is_left_to_it(self):
-        g = FakeGrader(0.05, FakeShared(busy=[(14, 0, 0)]))
-        with blockworker._s.cv:
-            blockworker._s.want = [(g, (14, 0, 0)), (g, (14, 1, 0))]
-        self.assertEqual(blockworker._next_warm(set()), (g, (14, 1, 0)))
-        self.assertIsNone(blockworker._next_warm({(14, 1, 0)}))
-
-
-if __name__ == "__main__":
-    unittest.main()

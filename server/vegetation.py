@@ -33,9 +33,10 @@ import staging
 
 log = logging.getLogger("earthd.vegetation")
 
-VERSION = 18          # (the cached cells hold their groups: 14 for the regional rules of GitHub #110; 16: the roads'
+VERSION = 20          # (the cached cells hold their groups: 14 for the regional rules of GitHub #110; 16: the roads'
                       # drawn widths and sidewalks kept clear; 17: BC's lidar canopy heights, mapdata's canopy layer 2;
-                      # 18: the rounded junction corners kept clear, roadcorners.py)
+                      # 18: the rounded junction corners kept clear, roadcorners.py; 19: one tree per flat crown, thin_tops; 20: none on or
+                      # beside a bridge deck, _mask_decks)
 TREE_MIN_M = 3.0
 CROWN_SPACING = 0.5          # tops kept this many crown radii apart (0.8 looked sparse: the user, 2026-10-13)
 BUSH_MIN_M = 1.0
@@ -300,6 +301,7 @@ class Vegetation:
         curb = np.zeros(h.shape, bool)      # the roads themselves (+ TREE_PIT_M): where a street tree may not land
         push = np.zeros((3,) + h.shape, np.float32)
         push[2] = np.inf
+        deck = np.zeros(h.shape, bool)      # bridge decks (+ DECK_CLEAR_M): no tree on, beside or moved off one
         road_cells = []
         for dy in (-1, 0, 1):
             for dx in (-1, 0, 1):
@@ -313,6 +315,7 @@ class Vegetation:
                 _mask_polys(c2.layers.get("water"), blocked, chm, 0.0, kind=3)
                 _mask_roads(c2.layers.get("roads"), road, chm, specs=self._specs, walks=True)
                 _mask_roads(c2.layers.get("roads"), curb, chm, push, clear=TREE_PIT_M, specs=self._specs)
+                _mask_decks(c2.layers.get("roads"), deck, chm, self._specs)
                 road_cells.append(c2.layers.get("roads"))
         # the rounded corners of curbless junctions (roadcorners.py): no tree, bush or rock on their asphalt
         _mask_corners(road_cells, (road, curb), chm, cd.bounds, getattr(self.surface, "urban", None), self.widths)
@@ -329,6 +332,8 @@ class Vegetation:
         tops[:, ~ci] = False
         # street trees: a top over a road corridor (its crown overhangs the street) moves just out of it,
         # onto the verge / sidewalk by the curb, unless that lands on a building, water or another road
+        tops &= ~deck                       # (over a deck: the crown of a tree below it, or none; not moved off it
+        blocked |= deck                     # onto the river or the bank under the deck, East Pratt Street 2026-10-31)
         on_road = tops & road
         tops &= ~road
         rj_, ri_ = np.nonzero(on_road)
@@ -592,6 +597,48 @@ def _mask_corners(road_cells, masks, chm, bounds, urban=None, widths=None, grow=
         _mask_polys(feats, m, chm, 0.0)
 
 
+DECK_CLEAR_M = 2.0          # m past a bridge deck's edge (its sidewalks and parapets) no tree stands
+
+
+def _mask_decks(f, mask, chm, specs):
+    """Mark the bridge decks of road Features f on the CHM-grid mask: each bridge piece (roads.bridge_parts) its deck
+    wide (roads.bridge_specs, and the sidewalks it carries: roads.deck_walks with specs(f), the ground widths) +
+    DECK_CLEAR_M either side. A street tree whose crown is over a road moves to its edge (_mask_roads' push): over a
+    deck that edge is the river or the bank below it, where the trees stood in the air or up through the deck."""
+    if f is None or not len(f.kind):
+        return
+    import roads as roadsmod
+    try:
+        bspecs = roadsmod.bridge_specs(f)
+    except Exception as e:              # (no bridge to keep clear: as _specs)
+        log.debug("vegetation: bridge specs: %s: %s", type(e).__name__, e)
+        return
+    if not any(b is not None for b in bspecs):
+        return
+    ground = specs(f) if specs is not None else roadsmod.road_specs(f)
+    n_r, n_c = mask.shape
+    segs, hws = [], []
+    for i, b in enumerate(bspecs):
+        if b is None:
+            continue
+        walk = roadsmod.deck_walks(f, i, ground)
+        half_m = b.width / 2 + (walk[0] if walk else 0.0) + DECK_CLEAR_M      # (one side's: as wide either side)
+        for ring in roadsmod.bridge_parts(f, i):
+            ring = np.asarray(ring, np.float64)
+            if len(ring) < 2:
+                continue
+            x, y = _to3857(ring[:, 0], ring[:, 1])
+            c, r = (np.asarray(x) - chm.x0) / chm.dx, (chm.y0 - np.asarray(y)) / chm.dy
+            hw = half_m / (chm.dx * max(0.05, math.cos(math.radians(float(ring[:, 1].mean())))))
+            if c.max() < -hw or r.max() < -hw or c.min() > n_c + hw or r.min() > n_r + hw:
+                continue
+            segs.append(np.stack([c[:-1], r[:-1], c[1:], r[1:]], axis=1))
+            hws.append(np.full(len(c) - 1, hw))
+    if segs:
+        fast._ef.road_corridors(mask, None, np.ascontiguousarray(np.concatenate(segs), np.float64),
+                                np.ascontiguousarray(np.concatenate(hws), np.float64))
+
+
 def _mask_roads(f, mask, chm, push=None, clear=ROAD_CLEAR_M, specs=None, walks=False):
     """Mark road corridors (half width + clear) on the CHM-grid mask (footpaths left out): the half width the road is
     drawn with (specs(f): roads.road_specs; walks: with its sidewalks) or its class's, the wider. push (optional, (3, rows,
@@ -679,10 +726,30 @@ def _no_items(as_json, lat, lon):
     return out
 
 
-def tile_items(frame, tx, ty, veg, cell_ready, elev, sea=None, as_json=False):
+# no tree or bush where the roads' grading moved the ground this much (a cutting's or an embankment's face: cleared in
+# life; drawn on the terrain's 2 m squares the face is steeper than the exact ground the items stand on, a tree on it
+# 2-10 m over or under the drawn slope: Pittsburgh's Mount Washington, 2026-10-31, .claude/devtools/floattrees.py).
+# Rocks stay (sunk into the ground: _sink_rocks)
+GRADED_CLEAR_M = 1.5
+
+
+def _off_graded(it, e, n, zg, raw):
+    """(it, e, n, zg) without the trees and bushes standing where the graded ground zg is GRADED_CLEAR_M or more off
+    the DEM's (raw(lat, lon); None: all kept)."""
+    if raw is None or not len(it):
+        return it, e, n, zg
+    zr = np.asarray(raw(it.lat, it.lon), np.float64)
+    keep = (np.abs(zg - zr) < GRADED_CLEAR_M) | np.isin(it.group, (G_ROCK, G_DESERT_ROCK))
+    if keep.all():
+        return it, e, n, zg
+    return it.take(keep), e[keep], n[keep], zg[keep]
+
+
+def tile_items(frame, tx, ty, veg, cell_ready, elev, sea=None, as_json=False, raw=None):
     """The items of anchor tile (tx, ty), each [group, x, y, z, yaw, scale, height, rank] in the anchor
     frame, the ground z from elev(lat, lon) (the DEM shaped as the block's ground: runways, carved
-    water). None when a cell under it is not at hand yet (veg cells are built in the background)."""
+    water). None when a cell under it is not at hand yet (veg cells are built in the background). raw(lat, lon): the
+    ground before the roads' grading (_off_graded)."""
     import roads as roadsmod
     x0, y0, x1, y1 = roadsmod.tile_bbox(tx, ty)
     la, lo, _ = frame.enu_to_geodetic(np.array([x0, x1, x0, x1]), np.array([y0, y0, y1, y1]), np.zeros(4))
@@ -712,6 +779,9 @@ def tile_items(frame, tx, ty, veg, cell_ready, elev, sea=None, as_json=False):
         keep = np.sort(np.argpartition(it.rank, TILE_ROWS_MAX - 1)[:TILE_ROWS_MAX])
         it, e, n = it.take(keep), e[keep], n[keep]
     zg = np.asarray(elev(it.lat, it.lon), np.float64)
+    it, e, n, zg = _off_graded(it, e, n, zg, raw)
+    if len(it) == 0:
+        return _no_items(as_json, clat, clon)
     _, _, z = frame.geodetic_to_enu(it.lat, it.lon, zg)
     z = _sink_rocks(frame, it, e, n, np.asarray(z, np.float64), elev)
     if as_json:
@@ -726,6 +796,57 @@ def tile_items(frame, tx, ty, veg, cell_ready, elev, sea=None, as_json=False):
     return [[int(g), round(float(a), 2), round(float(b), 2), round(float(c), 2), round(float(yw), 1),
              round(float(sc), 3), round(float(h), 1), round(float(r), 4)]
             for g, a, b, c, yw, sc, h, r in zip(it.group, e, n, np.asarray(z), it.yaw, it.scale, it.height, it.rank)]
+
+
+def geo_tile_items(gx, gy, veg, cell_ready, elev, sea=None, as_json=False, raw=None):
+    """The items of geotile (gx, gy) (geotiles.Z: the global grid, no anchor) in the tile's own frame (geotiles.frame:
+    x, y of each at h = 0, z at its ground), as tile_items' rows, and the tile's pivot (the median of the items'
+    z, m in that frame: the mod places the tile there, geotile.lua). Each item is in the one tile its lat / lon falls
+    in (the grid partitions the Earth: no item twice, none lost, whatever the anchor). (rows, pivot), or None when
+    its map cell is not at hand yet. raw(lat, lon): the ground before the roads' grading (_off_graded)."""
+    import geotiles
+    frame = geotiles.frame(gx, gy)
+    key = mapcells.CellKey(*geotiles.tile_cell(gx, gy))
+    clat, clon = geotiles.centre(gx, gy)
+    if not cell_ready(key):
+        return None
+    items = veg.cell(key)
+    if len(items) == 0:
+        return _no_items(as_json, clat, clon), 0.0
+    tx, ty = geotiles.tile_of(items.lat, items.lon)
+    sel = (tx == gx) & (ty == gy)
+    if not sel.any():
+        return _no_items(as_json, clat, clon), 0.0
+    it = items.take(sel)
+    e, n, _ = frame.geodetic_to_enu(it.lat, it.lon, np.zeros(len(it)))
+    e, n = np.asarray(e), np.asarray(n)
+    if sea is not None:
+        dry = sea.water(it.lat, it.lon)[0] <= 0
+        it, e, n = it.take(dry), e[dry], n[dry]
+    if len(it) == 0:
+        return _no_items(as_json, clat, clon), 0.0
+    if len(it) > TILE_ROWS_MAX:
+        keep = np.sort(np.argpartition(it.rank, TILE_ROWS_MAX - 1)[:TILE_ROWS_MAX])
+        it, e, n = it.take(keep), e[keep], n[keep]
+    zg = np.asarray(elev(it.lat, it.lon), np.float64)
+    it, e, n, zg = _off_graded(it, e, n, zg, raw)
+    if len(it) == 0:
+        return _no_items(as_json, clat, clon), 0.0
+    _, _, z = frame.geodetic_to_enu(it.lat, it.lon, zg)
+    z = _sink_rocks(frame, it, e, n, np.asarray(z, np.float64), elev)
+    pivot = round(float(np.median(z)), 2)
+    if as_json:
+        fast.require(0, "veg_rows_json")
+        f64 = lambda a: np.ascontiguousarray(a, np.float64)     # noqa: E731
+        out = JsonRows(fast._ef.veg_rows_json(np.ascontiguousarray(it.group, np.int64), f64(e), f64(n), f64(z),
+                                               f64(it.yaw), f64(it.scale), f64(it.height), f64(it.rank)))
+        out.n = len(it)
+        out.audio, out.biome = _ambience(it.group, e, n, z, it.height, clat, clon)
+        return out, pivot
+    return [[int(g), round(float(a), 2), round(float(b), 2), round(float(c), 2), round(float(yw), 1),
+             round(float(sc), 3), round(float(h), 1), round(float(r), 4)]
+            for g, a, b, c, yw, sc, h, r in zip(it.group, e, n, np.asarray(z), it.yaw, it.scale, it.height,
+                                                it.rank)], pivot
 
 
 ROCK_SINK = 0.35            # a rock sinks this share of its height per unit of ground slope (1 = 45 degrees) ...
@@ -772,16 +893,20 @@ def flat_json(rows):
     return json.dumps([v for r in rows for v in r], separators=(",", ":"))
 
 
-def write_tile(out_dir, vfs_dir, aid, tx, ty, rows, flat=False):
+def write_tile(out_dir, vfs_dir, aid, tx, ty, rows, flat=False, geo=None):
     """The tile's file: {"groups", "items": rows}, or with flat (a mod that reads it: hello.vegFlat) {"groups",
-    "stride": FLAT_STRIDE, "flat": [...]} (flat_json) under its own name. (vfs path, items)."""
+    "stride": FLAT_STRIDE, "flat": [...]} (flat_json) under its own name. (vfs path, items). geo: a geotile's
+    {"key", "frame", "pivot"} (geo_tile_items; aid unused): in the file too, its name the key's (no anchor)."""
     import json
-    name = f"veg_{aid}_{tx}_{ty}.flat.json" if flat else f"veg_{aid}_{tx}_{ty}.json"
+    stem = geo["key"] if geo is not None else f"{aid}_{tx}_{ty}"
+    name = f"veg_{stem}.flat.json" if flat else f"veg_{stem}.json"
     path = os.path.join(out_dir, name)
     tmp = staging.tmp_for(path)
     with open(tmp, "w") as f:
         # (the tile's sound: the forest cloud's nodes and biome, ambience.lua; tile_items as_json's rows carry them)
         sound = {"audio": rows.audio, "biome": rows.biome} if isinstance(rows, JsonRows) else {}
+        if geo is not None:             # (the tile's frame and pivot: the mod places it, geotile.lua)
+            sound = dict(sound, frame=list(geo["frame"]), pivot=geo["pivot"])
         if flat:
             head = dict({"groups": list(GROUPS)}, **sound, stride=FLAT_STRIDE, flat=[])
             f.write(json.dumps(head, separators=(",", ":"))[:-3] + flat_json(rows) + "}")
@@ -814,7 +939,7 @@ class Tracker:
     (messages veg_tile / veg_drop); the far buildings use one too (buildings.FAR_*)."""
 
     def __init__(self, send_m=SEND_M, drop_m=DROP_M, per_pose=BUILD_PER_POSE, kind="veg", skip_m=None, group=None,
-                 unit=1, inner=None):
+                 unit=1, inner=None, geo=False, z=None, group_z=None):
         # group G (the far buildings under the skyline tiles): every tile of a G x G group whose square comes within
         # send_m is wanted (a skyline tile shows only while none of its tiles do: no overlap, no hole). unit U (the
         # skyline tiles): keys are U x U squares of road tiles; inner (m, G): squares whose G-group comes within m are
@@ -832,6 +957,18 @@ class Tracker:
         # not one tree tile came for minutes (2026-10-17, salt flats)
         self.pool = None
         self.futs = {}
+        # geo: keys are geotiles (geotiles.Z, the global grid): what was sent stays sent across anchors (the mod
+        # re-places it at a rebase, geotile.lua), the tiles near a point found by their quads in the anchor's world
+        # (on_pose's frame); build(gx, gy) and the messages carry the tile's frame and pivot
+        self.geo = bool(geo)
+        # (geotiles of zoom z: geotiles.Z by default; group_z: whole groups, every tile under each zoom-group_z tile
+        # that comes within send_m (the far buildings under the skyline's squares); inner (m, _): the tiles within m
+        # not wanted (the skyline: where the far buildings' squares are, those being its own tiles))
+        self.z, self.group_z = z, group_z
+        self.frame = None
+        self._quads = {}            # (anchor id, key) -> its quad in that anchor's world
+        self.rebuilt = 0            # tiles built again for a key sent before (diagnostics: 0 with geo)
+        self.ever = set()
 
     def close(self):
         if self.pool is not None:
@@ -842,11 +979,13 @@ class Tracker:
         car = getattr(self, "car", ())
         return sum(1 for k in car if k in self.sent), len(car)
 
-    def on_pose(self, conn, aid, x, y, loop, build, view=None, foci=()):
+    def on_pose(self, conn, aid, x, y, loop, build, view=None, foci=(), frame=None):
         """As roads.Tracker.on_pose: the tiles within send_m of the car (x, y) and of the camera when it is away
         (view), the car's first; dropped beyond drop_m of both. foci: other vehicles' collision foci (x, y, r, ...)
         whose trees collide: the tiles within r + 128 m of each, after the car's and camera's, kept within r + 256 m."""
         import roads as roadsmod
+        if self.geo:
+            return self._on_pose_geo(conn, aid, x, y, loop, build, view, foci, frame)
         if aid != self.aid:
             for f in self.futs.values():
                 f.cancel()                  # the old anchor's that have not started
@@ -883,10 +1022,105 @@ class Tracker:
             self.building.add((tx, ty))
             fut = self.futs[(tx, ty)] = loop.run_in_executor(self.pool, build, aid, tx, ty)
             fut.add_done_callback(lambda f, k=(tx, ty), a=aid: self._built(conn, a, k, f))
-        for k in [k for k in self.sent if all(self._dist(k, *p) > self.drop_m for p in spots)
+        for k in [k for k in list(self.sent) if all(self._dist(k, *p) > self.drop_m for p in spots)
                   and all(self._dist(k, f[0], f[1]) > f[2] + roadsmod.TILE for f in foci)]:
             self.sent.discard(k)
             conn.send({"type": f"{self.kind}_drop", "anchorId": aid, "key": f"{k[0]}_{k[1]}"})
+
+    def _on_pose_geo(self, conn, aid, x, y, loop, build, view, foci, frame):
+        """on_pose for geotiles: the same rules (send_m, drop_m, the camera's, other cars' foci; group_z's whole groups,
+        inner's tiles left out), the tiles' quads in the anchor's world (frame: its EnuFrame); an anchor change keeps
+        what was sent and in flight."""
+        import geotiles
+        if frame is None:
+            return
+        if aid != self.aid:
+            self.aid, self.frame = aid, frame
+            self._quads = {k: v for k, v in self._quads.items() if k[0] == aid}
+        if self.pool is None:
+            from concurrent.futures import ThreadPoolExecutor
+            self.pool = ThreadPoolExecutor(self.per_pose, thread_name_prefix=f"{self.kind}-geo")
+        z = self.z or geotiles.Z
+        spots = [(x, y)] + ([tuple(view)] if view else [])
+
+        def near(px, py, r):
+            """Keys within r of (px, py), nearest first (each tile by its own quad)."""
+            if self.group_z is None:
+                return [(a, b) for a, b, _d in geotiles.tiles_near(frame, px, py, r, z)]
+            keys = [c for a, b, _d in geotiles.tiles_near(frame, px, py, r, self.group_z)
+                    for c in geotiles.children(a, b, self.group_z, z)]
+            return sorted(keys, key=lambda k: (self._geo_dist(k, px, py, own=True), k))
+        skip = set()
+        if self.inner is not None:
+            for p in spots:
+                skip.update((a, b) for a, b, _d in geotiles.tiles_near(frame, p[0], p[1], self.inner[0], z))
+        car = [k for k in near(x, y, self.send_m) if k not in skip]
+        self.car = set(car)
+        seen = [k for k in near(*view, self.send_m) if k not in skip] if view else []
+        others = []
+        for f in foci:
+            others += [k for k in near(f[0], f[1], min(self.send_m, f[2] + 128.0)) if k not in skip]
+        order, done = [], set()
+        for k in car + seen + others:           # (nearest first)
+            if k not in done:
+                done.add(k)
+                order.append(k)
+        want = [k for k in order if k not in self.sent and k not in self.building]
+        for gx, gy in want[:max(0, self.per_pose - len(self.building))]:
+            self.building.add((gx, gy))
+            fut = self.futs[(gx, gy)] = loop.run_in_executor(self.pool, build, gx, gy)
+            fut.add_done_callback(lambda f, k=(gx, gy): self._built_geo(conn, k, f))
+        for k in [k for k in list(self.sent) if all(self._geo_dist(k, *p) > self.drop_m for p in spots)
+                  and all(self._geo_dist(k, f[0], f[1]) > f[2] + 256.0 for f in foci)]:
+            self.sent.discard(k)
+            conn.send({"type": f"{self.kind}_drop", "anchorId": aid, "key": geotiles.key(*k, z)})
+
+    def _geo_dist(self, k, x, y, own=False):
+        """m from (x, y) to geotile k's quad in the anchor's world (to its group's, group_z, unless own)."""
+        import geotiles
+        z = self.z or geotiles.Z
+        if self.group_z is not None and not own:
+            k, z = geotiles.parent(k[0], k[1], z, self.group_z), self.group_z
+        ck = (self.aid, z, k)
+        q = self._quads.get(ck)
+        if q is None:
+            q = self._quads[ck] = geotiles.quad(self.frame, k[0], k[1], z)
+            if len(self._quads) > 20000:
+                self._quads.clear()
+        return geotiles.quad_dist(q, x, y)
+
+    def _built_geo(self, conn, key, fut):
+        import geotiles
+        self.building.discard(key)
+        self.futs.pop(key, None)
+        if fut.cancelled():
+            return
+        try:
+            res = fut.result()
+        except Exception as e:
+            log.debug("%s geotile %s: %s: %s", self.kind, key, type(e).__name__, e)
+            return
+        if res is None:
+            return
+        path, n, frame, pivot = res[:4]
+        shapes = res[4] if len(res) > 4 else None       # (the far geotiles': {what: shape file}, pooled paths below)
+        if key in self.ever:
+            self.rebuilt += 1
+        self.ever.add(key)
+        self.sent.add(key)
+        m = {"type": f"{self.kind}_tile", "anchorId": self.aid, "key": geotiles.key(*key, self.z or geotiles.Z),
+             "path": path, "n": n, "frame": [float(frame[0]), float(frame[1])], "pivot": float(pivot)}
+        s = getattr(conn, "s", None)
+        out_dir = getattr(s, "out_dir", None)
+        data = staging.inline_json(out_dir, path) if out_dir else None
+        if data is not None:
+            m["data"] = data
+        pool = getattr(s, "pool_shapes", None)
+        if shapes and pool is not None:
+            slots = pool(conn, shapes)
+            if slots:
+                m["slots"] = slots
+        conn.send(m)
 
     def _near(self, x, y, m, unit=None, group=None):
         """Keys (tiles, or unit x unit squares of tiles) whose square, or whose group's square, comes within m."""

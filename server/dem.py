@@ -590,6 +590,15 @@ class Dem:
         self._wait([self.prefetch_pool.submit(one, k) for k in keys])
         return got[0], stop.is_set()
 
+    def predownload(self, z, x, y):
+        """A saved area's tile (areas.py) at netfetch "predownload" (hosts that allow it, within its share of the daily
+        budget), unless has() says it needs nothing: True when fetched now (or a 404 remembered). Raises
+        netfetch.FetchError (Deferred, BudgetExceeded, ...) for the caller to wait or skip."""
+        if self.has(z, x, y):
+            return False
+        self._download(MAPTERHORN, z, x, y, kind="predownload")
+        return True
+
     def has(self, z, x, y):
         """True when Mapterhorn tile (z, x, y) needs no download: on disk, a 404 remembered, or not in Mapterhorn's
         file list (_listed; those never land on disk, and routeahead.py's bar stopped short of its total). For
@@ -696,7 +705,10 @@ class Dem:
                      and now - Dem._mirror_pruned >= MIRROR_PRUNE_S)
             if prune:
                 Dem._mirror_written, Dem._mirror_pruned = 0, now
-        if prune:       # (beside the read that wrote it: the walk is seconds on a Steam Deck)
+        # (only in the server's own process: every worker walked the mirror at its first write, several at once on a
+        # first visit, on the server's few CPUs while the world loaded, 2026-10-30; earthd prunes it at its start too)
+        import multiprocessing
+        if prune and multiprocessing.current_process().name == "MainProcess":
             threading.Thread(target=self._mirror_prune, daemon=True, name="dem-mirror-prune").start()
         return self._mirror_get(key)
 

@@ -366,31 +366,6 @@ class GraderTest(unittest.TestCase):
         self.assertEqual(gd.other, 42, "other attributes pass through")
 
 
-    def test_adopt_takes_other_processes_plans_without_planning(self):
-        # a provisional follow block (planned_only + adopt): graded under the plans another process made (plancache),
-        # never planning a cell itself
-        f = features([[(-300, 20), (300, 20)]], ["residential"])
-        planner = grading.Grader(FRAME, FakeMD(f), lambda la, lo: np.full(np.shape(la), 10.0))
-        la, lo, _ = FRAME.enu_to_geodetic(np.array([0.0, 0.0]), np.array([20.0, 200.0]), 0.0)
-        want = planner.apply(la, lo, np.zeros(2))
-        self.assertGreater(float(want[0]), 5.0, "on the road: graded")
-        disk = {k: (planner.cells[k], planner.keeps[k], planner.covers[k], planner.opens[k]) for k in planner.cells}
-
-        class Shared:
-            def busy(self, key):
-                return False
-
-            def load(self, key):
-                return disk.get(key)
-        md = FakeMD(f)
-        g = grading.Grader(FRAME, md, lambda la, lo: np.full(np.shape(la), 10.0))
-        self.assertTrue(np.array_equal(g.apply(la, lo, np.zeros(2), planned_only=True, adopt=True), np.zeros(2)),
-                        "nothing shared: ungraded")
-        g.shared = Shared()
-        got = g.apply(la, lo, np.zeros(2), planned_only=True, adopt=True)
-        self.assertTrue(np.allclose(got, want), "graded as the planner grades")
-        self.assertEqual(md.calls, 0, "no cell planned here")
-
     def test_points_far_apart_plan_only_their_cells(self):
         # two points 27 km apart (a straight salt-flats track's ends): the cells around each, not the ~240 of their
         # bbox (one road tile planned them all: 53 s, 2026-10-20); the same heights, in an order of their own
@@ -598,6 +573,47 @@ class UnderpassTest(unittest.TestCase):
         self.assertLess(float(np.abs(np.diff(grade)).max()), 0.01, "no kink")
         self.assertAlmostEqual(float(out[2]), 10.0, delta=0.1, msg="another road untouched")
 
+    def _dip_at(self, ground):
+        f = features([[(-200, 0), (200, 0)], [(0, -20), (0, 20)]], ["residential", "motorway"],
+                     flags=[(1, "is_bridge")])
+        g = grading.Grader(FRAME, FakeMD(f), lambda la, lo: np.full(np.shape(la), ground))
+        la, lo, _ = FRAME.enu_to_geodetic(np.array([0.0]), np.array([0.0]), 0.0)
+        return float(g.apply(la, lo, np.full(1, ground))[0])
+
+    def test_dip_stays_above_the_sea(self):
+        """Low ground by the sea (Perth's freeways by the Swan River, GitHub #515, #518): the dip stops
+        UNDER_SEA_M over the sea's surface, whose water tiles flood any ground under it; higher up it is as deep as
+        before, and ground already under the sea (a polder) is dug as before."""
+        floor = grading.seatiles.SEA_E + grading.UNDER_SEA_M
+        self.assertGreater(min(grading.UNDER_CLEAR_M, grading.UNDER_MAX_DROP_M), 3.0 - floor, "(the case digs)")
+        self.assertAlmostEqual(self._dip_at(3.0), floor, delta=0.1, msg="by the sea: dug to the floor, not under it")
+        self.assertLess(self._dip_at(3.0), 3.0 - 1.0, "still dug where there is room")
+        deep = 30.0 - min(grading.UNDER_CLEAR_M, grading.UNDER_MAX_DROP_M)
+        self.assertAlmostEqual(self._dip_at(30.0), deep, delta=0.3, msg="high ground: as deep as before")
+        polder = -4.0 - min(grading.UNDER_CLEAR_M, grading.UNDER_MAX_DROP_M)
+        self.assertAlmostEqual(self._dip_at(-4.0), polder, delta=0.3, msg="a polder: as before")
+        with unittest.mock.patch.object(grading, "UNDER_SEA_ON", False):
+            self.assertLess(self._dip_at(3.0), grading.seatiles.SEA_E, "(off: under the sea, the reported bug)")
+
+    def test_dip_from_a_low_bank_stays_above_the_sea_beside_it(self):
+        """The crossing on a river bank under the floor (#515's interchange by the Swan River): its dip's flat and
+        ramps reach the dry ground beside, which stays over the sea too; the bank itself is not lowered."""
+        f = features([[(-200, 0), (200, 0)], [(0, -20), (0, 20)]], ["residential", "motorway"],
+                     flags=[(1, "is_bridge")])
+
+        def elev(la, lo):
+            e, _, _ = FRAME.geodetic_to_enu(la, lo, 0.0)
+            return np.where(np.abs(np.asarray(e)) < 20.0, 0.3, 3.0)
+        xs = np.arange(-120.0, 120.1, 2.0)
+        la, lo, _ = FRAME.enu_to_geodetic(xs, np.zeros(len(xs)), 0.0)
+        base = elev(la, lo)
+        floor = grading.seatiles.SEA_E + grading.UNDER_SEA_M
+        z = grading.Grader(FRAME, FakeMD(f), elev).apply(la, lo, base)
+        self.assertGreaterEqual(float((z - np.minimum(base, floor)).min()), -0.1, "nowhere under the floor")
+        with unittest.mock.patch.object(grading, "UNDER_SEA_ON", False):
+            z = grading.Grader(FRAME, FakeMD(f), elev).apply(la, lo, base)
+        self.assertLess(float(z[np.abs(xs) >= 30].min()), grading.seatiles.SEA_E, "(off: the dry ground under the sea)")
+
 
 class UnderDipTest(unittest.TestCase):
     def test_a_dip_ends_inside_its_road_part(self):
@@ -640,6 +656,31 @@ class UnderpassShortfallTest(unittest.TestCase):
                                                                   "residential", "residential"])
         self.assertAlmostEqual(float(off[0]), 10.0, delta=0.3, msg="BNE_UNDERPASS_ANY=off: as before")
 
+    def test_on_lidar_a_road_level_with_the_decks_ends_keeps_its_ground(self):
+        """Pittsburgh's 28th Street Bridge (the user's report, 2026-10-29): its mapped end lay level with Sassafras Way
+        under it in the lidar, which has the alley's own ground there; dug 8 m, the dip ran on into Liberty Avenue. On
+        lidar the road keeps its ground; on the coarse models (no cutting in them: BR-381) it still dips."""
+        mway = [(-300, 0), (300, 0)]
+        lines = [mway, [(0, -20), (0, 20)], [(0, -260), (0, -20)], [(0, 20), (0, 260)],
+                 [(-150, -26), (150, -26)], [(-150, 26), (150, 26)]]
+        classes = ["motorway", "tertiary", "tertiary", "tertiary", "residential", "residential"]
+
+        class Dem:
+            def __init__(self, coarse):
+                self.coarse = coarse
+
+            def coarse_at(self, lat, lon):
+                return self.coarse
+
+        def motorway_z(coarse):
+            g = grading.Grader(FRAME, FakeMD(features(lines, classes, flags=[(1, "is_bridge")])),
+                               lambda la, lo: np.full(np.shape(la), 10.0))
+            g.dem = Dem(coarse)
+            la, lo, _ = FRAME.enu_to_geodetic(np.array([0.0]), np.array([0.0]), 0.0)
+            return float(g.apply(la, lo, np.full(1, 10.0))[0])
+        self.assertAlmostEqual(motorway_z(False), 10.0, delta=0.1, msg="lidar: the road under keeps its ground")
+        self.assertLess(motorway_z(True), 10.0 - 0.6 * grading.UNDER_CLEAR_M, "coarse: it dips as before")
+
 
 class RacewayKeepTest(unittest.TestCase):
     def test_track_surface_is_the_terrain(self):
@@ -657,131 +698,6 @@ class RacewayKeepTest(unittest.TestCase):
         self.assertAlmostEqual(float(out[0]), float(base[0]), places=6, msg="on the track: the terrain")
 
 
-class CellsMD(FakeMD):
-    """FakeMD with the cells' roads on disk (has) or not, and the cells asked for."""
-
-    def __init__(self, feats, on_disk=True):
-        super().__init__(feats)
-        self.on_disk, self.asked = on_disk, set()
-
-    def has(self, key, layer):
-        return self.on_disk
-
-    def cell(self, key, layers=None, kind=None):
-        self.asked.add(str(key))
-        return super().cell(key, layers, kind)
-
-
-class RegionTest(unittest.TestCase):
-    """A block whose cells are not planned yet graded from the plans of the roads near it (Grader.region): the heights
-    of the cells' whole plans, from its own cells' map data alone."""
-
-    @staticmethod
-    def hill(la, lo):
-        e, n, _ = FRAME.geodetic_to_enu(la, lo, 0.0)
-        return 10.0 + 0.02 * np.asarray(e) + 0.8 * np.sin(np.asarray(n) / 40.0)
-
-    def roads(self):
-        far = [[(2600 + 50 * i, -900), (2600 + 50 * i, 900)] for i in range(4)]
-        return features([[(-400, 20), (400, 20)], [(0, -400), (0, 400)], [(-400, 300), (-100, 330)]] + far,
-                        ["secondary", "residential", "residential"] + ["residential"] * 4)
-
-    def grid(self, box):
-        e, n = np.meshgrid(np.linspace(box[0], box[2], 41), np.linspace(box[1], box[3], 41))
-        la, lo, _ = FRAME.enu_to_geodetic(e.ravel(), n.ravel(), 0.0)
-        return la, lo
-
-    def test_same_heights_as_the_whole_plans(self):
-        box = (-300.0, -300.0, 300.0, 300.0)
-        g = grading.Grader(FRAME, CellsMD(self.roads()), self.hill)
-        reg = g.region(box)
-        self.assertIsNotNone(reg)
-        self.assertEqual(reg.missed, [], "every cell on disk")
-        la, lo = self.grid(box)
-        base = self.hill(la, lo)
-        got = g.apply(la, lo, base, grading.ROAD_LIFT, region=reg)
-        self.assertGreater(float(np.abs(got - base).max()), 0.1, "graded")
-        self.assertIsNone(reg.same(g), "the whole plans not made yet")
-        whole = g.apply(la, lo, base, grading.ROAD_LIFT)
-        np.testing.assert_allclose(got, whole, atol=1e-9)
-        self.assertTrue(reg.same(g))
-        far = [p for p in reg.plans if p.xy[:, 0].min() > 2000]
-        self.assertEqual(far, [], "the roads far from the block not planned")
-        self.assertIsNone(g.region(box), "its cells planned: their whole plans")
-
-    def test_reads_only_its_own_cells(self):
-        md = CellsMD(self.roads(), on_disk=False)
-        g = grading.Grader(FRAME, md, self.hill)
-        box = (-300.0, -300.0, 300.0, 300.0)
-        reg = g.region(box)
-        self.assertEqual(md.asked, {str(k) for k in reg.keys}, "not the cells around them")
-        la, lo = self.grid(box)
-        base = self.hill(la, lo)
-        got = g.apply(la, lo, base, grading.ROAD_LIFT, region=reg)
-        np.testing.assert_allclose(got, g.apply(la, lo, base, grading.ROAD_LIFT), atol=1e-9)
-        self.assertGreater(len(md.asked), len(reg.keys), "the whole plans read the cells around")
-        # a road whose plan the region made otherwise (its bridge in a cell it did not read): told apart
-        k, p = reg.rows[0]
-        q = grading.Plan(p.xy, p.z + 0.5, p.half, p.abut, p.cut, p.road_half)
-        q.rid, q.max_wall = p.rid, p.max_wall
-        reg.rows[0] = (k, q)
-        self.assertFalse(reg.same(g))
-
-    def shared(self, md):
-        import plancache
-        import shutil
-        import tempfile
-        if not hasattr(self, "dir"):
-            self.dir = tempfile.mkdtemp()
-            self.addCleanup(shutil.rmtree, self.dir, True)
-            os.environ[plancache.RUN_ENV] = "test"
-            self.addCleanup(os.environ.pop, plancache.RUN_ENV, None)
-        g = grading.Grader(FRAME, md, self.hill)
-        g.shared = plancache.for_grader(self.dir, g, None, None)
-        return g
-
-    def test_shared_with_the_other_processes(self):
-        box = (-300.0, -300.0, 300.0, 300.0)
-        reg = self.shared(CellsMD(self.roads())).region(box)
-        md = CellsMD(self.roads())
-        g = self.shared(md)                     # (another process: a road tile in the block)
-        tile = (-100.0, -100.0, 50.0, 50.0)
-        mine = g.region(tile, make=False)
-        self.assertIsNotNone(mine, "the block's region plans on disk")
-        self.assertEqual(md.asked, set(), "nothing planned here")
-        la, lo = self.grid(tile)
-        base = self.hill(la, lo)
-        np.testing.assert_allclose(g.apply(la, lo, base, grading.ROAD_LIFT, region=mine),
-                                   g.apply(la, lo, base, grading.ROAD_LIFT, region=reg), atol=1e-9)
-        self.assertIsNone(g.region((-2000.0, -2000.0, -1800.0, -1800.0), make=False), "none kept there")
-        np.testing.assert_allclose(g.apply(la, lo, base, grading.ROAD_LIFT, region=mine),
-                                   g.apply(la, lo, base, grading.ROAD_LIFT), atol=1e-9)
-        self.assertTrue(g.region(tile, make=False, whole=True).same(g), "as the whole plans make it")
-
-    def test_far_tile_regions(self):
-        import blockworker
-        g = grading.Grader(FRAME, CellsMD(self.roads()), self.hill)
-        box = (-128.0, -128.0, 128.0, 128.0)
-        region_for = blockworker._regions_for(g, box)
-
-        class Dem:
-            def sample(self, la, lo, zoom):
-                return RegionTest.hill(la, lo)
-        la, lo = self.grid(box)
-        got = grading.GradedDem(Dem(), g, region_for).sample(la, lo, 15)
-        la2, lo2 = self.grid((300.0, 300.0, 400.0, 400.0))     # (points beyond its box: a region of their own)
-        got2 = grading.GradedDem(Dem(), g, region_for).sample(la2, lo2, 15)
-        self.assertEqual(g.cells, {}, "no cell planned whole")
-        np.testing.assert_allclose(got, g.apply(la, lo, self.hill(la, lo)), atol=1e-9)
-        np.testing.assert_allclose(got2, g.apply(la2, lo2, self.hill(la2, lo2)), atol=1e-9)
-
-    def test_a_grown_box_planned_once(self):
-        md = CellsMD(self.roads())
-        g = grading.Grader(FRAME, md, self.hill)
-        g.region((-300.0, -300.0, 300.0, 300.0))
-        with unittest.mock.patch.object(grading.Grader, "_make_cell", side_effect=AssertionError("planned again")):
-            reg = g.region((-200.0, -250.0, 400.0, 350.0))      # (the next block along the way, within the grown box)
-        self.assertGreater(len(reg.plans), 0)
 
 class NeverRaisedTest(unittest.TestCase):
     def test_links_are_raised_motorways_not(self):
@@ -818,7 +734,7 @@ class JunctionTest(unittest.TestCase):
         grading.snap_junctions([main, side], specs)
         main.z = main.z - 3.0 * np.exp(-((x - 60.0) / 40.0) ** 2)     # the dip, after the first snap
         grading.snap_junctions([main, side], specs)
-        _d, zq, _e = grading._nearest_on(main, 50.0, 0.0)
+        zq = np.interp(50.0, x, main.z)        # (the main road's height where the side road meets it)
         self.assertAlmostEqual(side.z[0], zq, places=6)
         self.assertAlmostEqual(side.z[-1], 10.0, places=6)
 

@@ -121,7 +121,7 @@ class MotorwaySeamTest(unittest.TestCase):
         f.lonlat = np.concatenate([self.ll(np.arange(a, b + 1, 2.)) for a, b in ranges])
         specs = roads.road_specs(f)
         parts = [(roads.ground_parts(f, i)[0], specs[i]) for i in range(3)]
-        g = grading.Grader(FRAME, FakeMD(f), self.raw)
+        g = grading._Planner(FRAME, FakeMD(f), self.raw)      # (a planner in FRAME: its chain lookup)
         g._chain_cands(mapcells.cell_of(LAT, LON), f, specs)
         ext = g._extensions(parts, [str(fid) for fid in f.ids])
         self.assertIsNotNone(ext[0][1])
@@ -146,10 +146,11 @@ class MotorwaySeamTest(unittest.TestCase):
             for i, (cx, chunks) in enumerate(((256., None), (384., None), (256., cache), (384., cache))):
                 keep = {}
                 info = heightmap.generate(FRAME, elev, os.path.join(folder, f"block{i}.png"),
-                                          cx=cx, cy=128., size=512, q=1 / 256,
+                                          cx=cx, cy=128., size=heightmap.SIZE, q=1 / 256,
                                           chunks=chunks, keep=keep)
                 grids.append(heightmap.heights(keep["qgrid"], info["zBase"], info["maxHeight"]))
-            np.testing.assert_array_equal(grids[0][:, 64:], grids[1][:, :-64])
+            k = int(128. / heightmap.SQUARE)            # the 128 m move in samples
+            np.testing.assert_array_equal(grids[0][:, k:], grids[1][:, :-k])
             np.testing.assert_array_equal(grids[0], grids[2])
             np.testing.assert_array_equal(grids[1], grids[3])
 
