@@ -4181,7 +4181,10 @@ BAKE_FETCH = os.environ.get("BNGE_BAKE_FETCH", "off") == "on"   # the data repo'
 # there are any (the user, 2026-11-02: no cloud baking while world gen changes daily; local packs, BeamMP servers, later)
 CATCHUP_MORE_S = 10.0       # s behind all along before the catch-up boost lends half the game's cores
 HOLD_BOOST_CALM_S = 2.0     # s after an edge hold ends before its boost does (Connection.hold_boost)
-CATCHUP_LEND_SHARE = float(os.environ.get("BNGE_CATCHUP_LEND", "0.25"))     # of the game's cores (cpupin.boosted)
+# (off on Felix's test branch, as our speed boost since 25815e3: any of the game's cores lent took its 1% lows from
+# 31-55 to 23-30 fps in his drives, 2026-10-27; and overnight 35 catch-up boosts in one A4 drive. BNGE_CATCHUP_LEND=0.25:
+# upstream's)
+CATCHUP_LEND_SHARE = float(os.environ.get("BNGE_CATCHUP_LEND", "0"))     # of the game's cores (cpupin.boosted)
 CATCHUP_MIN_MS = 8.0        # m/s: only while driving (a parked player's work waits as before)
 BOOST_FULL_MAX_S = 300.0    # full priority loading (Server.load_boost's teleportPriority) ends this long after at most
 
