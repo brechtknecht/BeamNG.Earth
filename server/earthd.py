@@ -6380,7 +6380,8 @@ class Connection:
                     x0, y0, x1, y1 = self.desired[k].bbox
                     return max(x0 * ux, x1 * ux) + max(y0 * uy, y1 * uy) - (cx * ux + cy * uy) < -FAR_BEHIND_M
                 for adds, removes in self.groups:
-                    if (adds and removes and min(farfield.tile_of(k).level for k in adds)
+                    if (adds and removes and not any(farfield.is_special_key(k) for k in adds + removes)
+                            and min(farfield.tile_of(k).level for k in adds)
                             < min(farfield.tile_of(k).level for k in removes) and all(map(back, adds))):
                         behind.update(adds)
 

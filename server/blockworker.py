@@ -379,8 +379,10 @@ def build(aid, lat, lon, hm_zoom, q, cx, cy, size, out_dir, name, ter_name=None,
     idx = None
     if _s.surface is not None:
         t1 = time.perf_counter()
-        classes, complete = _s.surface.classes(keep["lat"], keep["lon"])
-        idx = surfacemod.classify(classes, keep["u"], heightmap.SQUARE, keep["lat"], keep["lon"])
+        # (kept per 128 m chunk across this process's blocks: a follow block at speed shares most of its samples with
+        # the last one; every sample anew took 1-4 s of a 1 m block, surface.base_chunked)
+        base, complete = surfacemod.base_chunked(_s.surface, frame, keep["lat"], keep["lon"], cx, cy, size)
+        idx = surfacemod.slope_rock(base, keep["u"], heightmap.SQUARE)
         if _s.sea is not None and not provisional:  # under water: the bed (no grass growing through the surface)
             idx[_s.sea.depth(keep["lat"], keep["lon"]) > WATER_BED_M] = surfacemod.MUD
         road_feats, roads_complete = _s.surface.roads(keep["lat"], keep["lon"])
