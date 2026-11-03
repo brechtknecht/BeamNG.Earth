@@ -233,12 +233,22 @@ def _read_warm(warm_q):
             _s.cv.notify()
 
 
+def _busy(g, k):
+    try:
+        return g.busy_elsewhere(k)
+    except Exception:
+        return False
+
+
 def _warm_loop():
     while True:
         with _s.cv:
             job = None
             while job is None:
-                job = next(((g, k) for g, k in _s.want if not g.planned(k)), None)
+                todo = [(g, k) for g, k in _s.want if not g.planned(k)]
+                # (a cell another process is planning skipped: the next one planned here meanwhile; when all the
+                # rest are someone else's, the first waited for as before)
+                job = next((j for j in todo if not _busy(*j)), todo[0] if todo else None)
                 if job is None:
                     _s.cv.wait()
         try:

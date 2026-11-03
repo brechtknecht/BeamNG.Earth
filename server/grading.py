@@ -2432,6 +2432,23 @@ class Grader:
         """Make cell key's plans now (worker threads: the lookahead ahead of the player)."""
         self.store.planner_of_cell(key)._cell_plans(key)
 
+    def busy_elsewhere(self, key):
+        """True while another process is planning cell key (its plancache lock is held, not by this process): the
+        lookahead plans the next cell instead of waiting for it. Every block process's lookahead walked the same list
+        and waited on the first cell another one was planning (xproc.once), so the cells ahead were planned one at a
+        time by three processes (2026-11-03)."""
+        sh = self.shared
+        if sh is None or self.planned(key):
+            return False
+        import xproc
+        lock = sh._path(key) + ".lock"
+        if lock in xproc._held:
+            return False
+        try:
+            return time.time() - os.path.getmtime(lock) < xproc.stale_s()
+        except OSError:
+            return False
+
     def _cell_plans(self, key):
         """[(fid, Plan)] of cell key, in this frame's world (mapped from its region's frame; kept)."""
         with self.lock:
