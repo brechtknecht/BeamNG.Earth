@@ -169,6 +169,38 @@ class DuckDbMissing(OvertureError):
     """duckdb / fsspec are not installed (pip install -r server/requirements.txt)."""
 
 
+# one DuckDB database per thread, a connection to it per query (Reader._thread_db); BNGE_DUCKDB_REUSE=0: a database
+# per query, as before
+REUSE_DB = os.environ.get("BNGE_DUCKDB_REUSE", "1") != "0"
+
+
+class _Session:
+    """A query's connection to its thread's database (Reader._thread_db), with the query's filesystem registered: its
+    settings and temp tables are its own (a DuckDB connection's), and close() takes the filesystem off again (the
+    database's: the next query of the thread registers its own under the same protocol)."""
+
+    def __init__(self, db, fs):
+        self._con = db.cursor()
+        self._db, self._proto = db, fs.protocol
+        try:
+            for k, v in PARQUET_CONFIG.items():
+                self._con.execute(f"SET {k} = {str(v).lower()}")
+            self._con.register_filesystem(fs)
+        except BaseException:
+            self._con.close()
+            raise
+
+    def __getattr__(self, name):
+        return getattr(self._con, name)
+
+    def close(self):
+        try:
+            self._con.unregister_filesystem(self._proto)
+        except Exception:
+            pass
+        self._con.close()
+
+
 def _duckdb():
     try:
         import duckdb
@@ -379,12 +411,28 @@ class Reader:
             f._fetch_range = guarded
             return f
         fs._open = _open
+        if REUSE_DB:
+            return _Session(self._thread_db(duckdb), fs), fs.protocol, errors
         con = duckdb.connect(config={"threads": self.threads, "autoinstall_known_extensions": False,
                                      "autoload_known_extensions": False})
         for k, v in PARQUET_CONFIG.items():
             con.execute(f"SET {k} = {str(v).lower()}")
         con.register_filesystem(fs)
         return con, fs.protocol, errors
+
+    def _thread_db(self, duckdb):
+        """This thread's DuckDB database (made once): a query opens a connection to it (_Session), ~1 ms, where a
+        database of its own (duckdb.connect) cost ~15 ms of CPU, ~110 s of a 8 km drive's server CPU on a fresh
+        place's map cells (cloud profile, 2026-11-03)."""
+        tl = self.__dict__.get("_dbs")
+        if tl is None:
+            with self._lock:
+                tl = self.__dict__.setdefault("_dbs", threading.local())
+        db = getattr(tl, "db", None)
+        if db is None:
+            db = tl.db = duckdb.connect(config={"threads": self.threads, "autoinstall_known_extensions": False,
+                                                "autoload_known_extensions": False})
+        return db
 
     def query(self, layer, cell, kind="demand"):
         """The layer's Features of one cell (lon/lat only; mapdata localises and marks `own`), and

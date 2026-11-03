@@ -728,6 +728,8 @@ class HttpsTransport:
                     kwargs = {"timeout": timeout}
                     if self._tls_context is not None:
                         kwargs["context"] = self._tls_context
+                    elif SHARED_TLS and http.client.HTTPSConnection is _HTTPS:   # (behind a proxy too: tls_context)
+                        kwargs["context"] = tls_context()
                     conn = http.client.HTTPSConnection(phost, pport, **kwargs)
                     if puser is not None:
                         creds = base64.b64encode(f"{puser}:{ppass or ''}".encode()).decode()
