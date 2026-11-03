@@ -284,6 +284,7 @@ local function now() return os.clock() * 1000 end
 local unitStats = {}
 local unitLog = {}       -- the last UNIT_LOG units: { kind, ms, shape } (status().unitLog)
 M.UNIT_LOG = 400
+M.SLOW_UNIT_MS = 300      -- a road part made slower than this is logged with its file (slow shape ...)
 local function noteUnit(kind, ms, shape)
   unitLog[#unitLog + 1] = { kind, ms, shape }
   if #unitLog > M.UNIT_LOG then table.remove(unitLog, 1) end
@@ -1743,6 +1744,15 @@ updateBody = function(gov, currentAnchor, player, view, a)
       local ms = now() - t0
       gov:charge('roadWalk', ms)
       noteUnit(tostring(q.what), ms, walk and walk.shape)
+      if ms >= M.SLOW_UNIT_MS then        -- (a single shape stalling the frame for seconds: which file, how big, how new)
+        local st = nil
+        pcall(function() st = FS:stat(walk.shape) end)
+        log('W', 'beamngEarth.roads', string.format('slow shape %s %.0f ms: %s, %s bytes, modtime %s, collision %s, tile %s',
+          tostring(q.what), ms, tostring(walk.shape), tostring(type(st) == 'table' and (st.filesize or st.size) or '?'),
+          tostring(type(st) == 'table' and (st.modtime or st.modificationTime) or '?'),
+          tostring((q.what == 'bldcol' or q.what == 'walkcol' or q.what == 'railcol') and 'mesh' or not isRoad),
+          tostring(q.key)))
+      end
       sinceChange = stopwatch.new()
     end
   end
