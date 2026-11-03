@@ -5860,7 +5860,7 @@ class Connection:
             self.veg.on_pose(self, aid, *self.focus, asyncio.get_running_loop(),
                              self.build_veg_geo if self.veg.geo else self.build_veg_tile,
                              view=self.view_at, foci=[f for f in self.foci if f[3]],
-                             frame=anchor.frame if anchor is not None else None)
+                             frame=anchor.frame if anchor is not None else None, vel=self.vel)
         if self.s.buildings and aid == self.active:
             geo = self.far_geo
             anchor = self.s.anchors.get(aid)

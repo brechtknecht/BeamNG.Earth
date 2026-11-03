@@ -680,6 +680,11 @@ TILE = 256.0                # m, as the road tiles (roads.tile_bbox)
 TILE_ROWS_MAX = 6000        # items a tile sends at most, the lowest ranks: the most the mod shows of one (trees.lua
                             # TILE_CAP). Dense forest has 10-20k a tile: Bodø's 145 tiles held 1.66 M rows in the game's
                             # Lua (394 MB of heap, 1.25 s garbage collection pauses on a Steam Deck; GitHub #66)
+LEAD_S = float(os.environ.get("BNGE_VEG_LEAD_S", "30"))   # trees tiles: s of driving ahead (Tracker lead_s; 0: off)
+LEAD_MAX_M = 3000.0
+LEAD_FAST_MS = 25.0
+LEAD_CORRIDOR_M = 160.0
+LEAD_SIDE_PENALTY = 4.0
 SEND_M = 1280.0             # tiles this close to the player (Euclidean, to the square's nearest point) are sent
 DROP_M = 1536.0             # ... and dropped beyond this
 BUILD_PER_POSE = 8
@@ -949,6 +954,7 @@ class Tracker:
         self.sent = set()
         self.building = set()
         self.send_m, self.drop_m, self.per_pose, self.kind = send_m, drop_m, per_pose, kind
+        self.lead_s = LEAD_S if kind == "veg" else 0.0     # (geotiles at speed: along the path ahead too)
         # skip_m: tiles within this (as roads.tiles_near: a disc) are not built: the far buildings under the road
         # tiles, which carry the full buildings (the mod would hide them at once; ~36 of a teleport's ~196 tiles)
         self.skip_m = skip_m
@@ -979,13 +985,13 @@ class Tracker:
         car = getattr(self, "car", ())
         return sum(1 for k in car if k in self.sent), len(car)
 
-    def on_pose(self, conn, aid, x, y, loop, build, view=None, foci=(), frame=None):
+    def on_pose(self, conn, aid, x, y, loop, build, view=None, foci=(), frame=None, vel=None):
         """As roads.Tracker.on_pose: the tiles within send_m of the car (x, y) and of the camera when it is away
         (view), the car's first; dropped beyond drop_m of both. foci: other vehicles' collision foci (x, y, r, ...)
         whose trees collide: the tiles within r + 128 m of each, after the car's and camera's, kept within r + 256 m."""
         import roads as roadsmod
         if self.geo:
-            return self._on_pose_geo(conn, aid, x, y, loop, build, view, foci, frame)
+            return self._on_pose_geo(conn, aid, x, y, loop, build, view, foci, frame, vel)
         if aid != self.aid:
             for f in self.futs.values():
                 f.cancel()                  # the old anchor's that have not started
@@ -1027,7 +1033,7 @@ class Tracker:
             self.sent.discard(k)
             conn.send({"type": f"{self.kind}_drop", "anchorId": aid, "key": f"{k[0]}_{k[1]}"})
 
-    def _on_pose_geo(self, conn, aid, x, y, loop, build, view, foci, frame):
+    def _on_pose_geo(self, conn, aid, x, y, loop, build, view, foci, frame, vel=None):
         """on_pose for geotiles: the same rules (send_m, drop_m, the camera's, other cars' foci; group_z's whole groups,
         inner's tiles left out), the tiles' quads in the anchor's world (frame: its EnuFrame); an anchor change keeps
         what was sent and in flight."""
@@ -1056,6 +1062,32 @@ class Tracker:
                 skip.update((a, b) for a, b, _d in geotiles.tiles_near(frame, p[0], p[1], self.inner[0], z))
         car = [k for k in near(x, y, self.send_m) if k not in skip]
         self.car = set(car)
+        keep = set()
+        vx, vy = vel if vel else (0.0, 0.0)
+        sp = math.hypot(vx, vy)
+        if self.lead_s and sp >= LEAD_FAST_MS:
+            # at speed: also the tiles along the path ahead (lead_s of driving, LEAD_MAX_M at most), all of them in the
+            # order the car reaches them, the ones behind it last. Nearest first in a disc, a trees tile was asked
+            # for only ~430 m (4.7 s) ahead of a 200 mph car and 107 of 434 were done behind it (A13 drive, 2026-11-03)
+            ux, uy = vx / sp, vy / sp
+            lead = min(LEAD_MAX_M, sp * self.lead_s)
+            d, extra = 0.0, []
+            while d <= lead:
+                extra += [(a, b) for a, b, _dd in geotiles.tiles_near(frame, x + ux * d, y + uy * d, LEAD_CORRIDOR_M, z)]
+                d += LEAD_CORRIDOR_M
+            have = set(car)
+            car += [k for k in extra if k not in have and k not in skip and not have.add(k)]
+            keep = set(car)
+
+            def along(k):
+                q = self._geo_quad(k)
+                cx, cy = float(np.mean(q[:, 0])), float(np.mean(q[:, 1]))
+                a = (cx - x) * ux + (cy - y) * uy
+                side = abs((cx - x) * uy - (cy - y) * ux)
+                if a < -LEAD_CORRIDOR_M:
+                    return 1e6 + self._geo_dist(k, x, y)
+                return max(0.0, a) + max(0.0, side - LEAD_CORRIDOR_M) * LEAD_SIDE_PENALTY
+            car.sort(key=along)
         seen = [k for k in near(*view, self.send_m) if k not in skip] if view else []
         others = []
         for f in foci:
@@ -1070,10 +1102,19 @@ class Tracker:
             self.building.add((gx, gy))
             fut = self.futs[(gx, gy)] = loop.run_in_executor(self.pool, build, gx, gy)
             fut.add_done_callback(lambda f, k=(gx, gy): self._built_geo(conn, k, f))
-        for k in [k for k in list(self.sent) if all(self._geo_dist(k, *p) > self.drop_m for p in spots)
+        for k in [k for k in list(self.sent) if k not in keep and all(self._geo_dist(k, *p) > self.drop_m for p in spots)
                   and all(self._geo_dist(k, f[0], f[1]) > f[2] + 256.0 for f in foci)]:
             self.sent.discard(k)
             conn.send({"type": f"{self.kind}_drop", "anchorId": aid, "key": geotiles.key(*k, z)})
+
+    def _geo_quad(self, k):
+        import geotiles
+        z = self.z or geotiles.Z
+        ck = (self.aid, z, k)
+        q = self._quads.get(ck)
+        if q is None:
+            q = self._quads[ck] = geotiles.quad(self.frame, k[0], k[1], z)
+        return q
 
     def _geo_dist(self, k, x, y, own=False):
         """m from (x, y) to geotile k's quad in the anchor's world (to its group's, group_z, unless own)."""

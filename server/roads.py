@@ -54,8 +54,8 @@ BUILD_PER_POSE = 4      # tiles started per pose at most
 # CORRIDOR_M of the path ahead are wanted too, up to LEAD_S of driving (LEAD_MAX_M at most), and every wanted tile is
 # built in the order the car reaches it (path_key): the corridor first, the ones beside and behind the car last.
 FAST_MS = 25.0          # m/s (56 mph)
-LEAD_S = 14.0           # s of driving ahead
-LEAD_MAX_M = 2000.0
+LEAD_S = float(os.environ.get("BNGE_ROADS_LEAD_S", "30"))   # s of driving ahead (was 14: requests only ~400 m ahead of a 200 mph car, A13 drive 2026-11-03)
+LEAD_MAX_M = 3000.0
 CORRIDOR_M = 160.0      # m either side of the path
 SIDE_PENALTY = 4.0      # a tile off the path counts this many times its sideways distance (path_key)
 
