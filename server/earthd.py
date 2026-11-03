@@ -261,6 +261,7 @@ AHEAD_LAYERS = ("roads", "buildings", "building_parts", "infrastructure", "water
 # 175 mph: trees geotiles p50 9 s / p90 50 s, most done behind the car (Felix's A4 drive, 2026-11-03; on his 8 cores
 # mapdata.WARM_THREADS and FETCH_AHEAD_THREADS are 0). BNGE_MAP_AHEAD=0 off.
 MAP_AHEAD = os.environ.get("BNGE_MAP_AHEAD", "1") != "0"
+VEG_PROCESS = os.environ.get("BNGE_VEG_PROCESS", "1") != "0"   # trees geotiles in a process of their own
 MAP_AHEAD_S = 120.0
 MAP_AHEAD_MIN_M = 1500.0
 MAP_AHEAD_MAX_M = 10000.0
@@ -961,6 +962,7 @@ class Server:
         self.ahead_last = None          # (anchor id, x, y) of the last round
         self.photo_last = None          # photo_ahead: (anchor id, x, y) of the last round
         self.map_ahead_pool = None      # map_ahead's process (main_async), None: off
+        self.veg_pool = None            # trees geotiles' process (main_async; None: in the road processes, submit_low)
         self.map_ahead_last = None
         self.map_ahead_want = []        # [cell key] nearest first (the last round's)
         self.map_ahead_done = set()
@@ -1342,8 +1344,10 @@ class Server:
         if self.road_pool is not None and self.mapdata is not None:
             # (in a road tile process: here they took the server's one interpreter from the far textures and plans)
             t0, waited = time.perf_counter(), []
-            # (after the road tiles: RespawningPool.submit_low)
-            submit = getattr(self.road_pool, "submit_low", self.road_pool.submit)
+            # (a process of their own, veg_pool: queued after the road tiles, submit_low, one waited 106.6 s of its
+            # 107 s in the queue while its trees took 0.01 s once map ahead had built its cell; A13 drive 2026-11-03)
+            submit = (self.veg_pool.submit if self.veg_pool is not None
+                      else getattr(self.road_pool, "submit_low", self.road_pool.submit))
             got = poolsmod.result_running(submit(blockworker.veg_geo, anchor.id, anchor.lat, anchor.lon, zoom, gx, gy,
                                                  self.out_dir, self.vfs_dir, flat), None, waited)
             if time.perf_counter() - t0 > ROAD_GEO_SLOW_S:
@@ -6949,6 +6953,12 @@ async def main_async(args):
                       roadsmod.ROADS_IN_GROUND, args.gas_stations == "on"))
         if POOL_PRESTART:
             server.stand_in_pool.prestart(blockworker.ready)
+    if VEG_PROCESS and server.road_pool is not None and server.veg is not None:
+        server.veg_pool = poolsmod.RespawningPool(
+            "trees", 1, mp_context=ctx, initializer=blockworker.init,
+            initargs=(args.cache_dir, args.offline, args.roads == "on", args.grading == "on",
+                      args.road_widths == "on", args.surface == "on", None, logging.getLogger().level,
+                      args.airports == "on", args.sea == "on", NICE_ROADS, roadsmod.ROADS_IN_GROUND))
     if MAP_AHEAD and args.block_process == "on" and server.mapdata is not None:
         # map data cells ahead (Server.map_ahead): below the road tiles, like them
         server.map_ahead_pool = poolsmod.RespawningPool(
