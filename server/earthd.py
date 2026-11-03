@@ -267,7 +267,7 @@ MAP_AHEAD_MIN_M = 1500.0
 MAP_AHEAD_MAX_M = 10000.0
 MAP_AHEAD_REACH_M = 400.0       # m beside the path whose cells are built too
 MAP_AHEAD_MOVE_M = 200.0        # m the player moves before the list is made again
-MAP_AHEAD_LAYERS = AHEAD_LAYERS + ("canopy", "landcover")
+MAP_AHEAD_LAYERS = AHEAD_LAYERS + ("canopy", "landcover", "places")     # (places: the road tiles' gas stations)
 # and the road plans of the cells ahead: off (cloud drive 2026-11-03, 60 m/s: road tiles sent 37 vs 118 without;
 # the planning took the CPU the road tiles needed). BNGE_MAP_AHEAD_PLANS=1: on
 MAP_AHEAD_PLANS = os.environ.get("BNGE_MAP_AHEAD_PLANS", "0") != "0"

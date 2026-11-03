@@ -784,8 +784,13 @@ def _tile_parts(mark, frame, tile, zoom, g, buildings, left_hand, mph, gas_stati
     tx, ty = (tile, None) if hasattr(tile, "box") else tile
     P = _Parts()
     # everything the tile will ask for, fetched at once (one after another, a fresh place's first tile took ~1 min)
-    _s.md.warm(roadsmod.tile_needs(frame, tx, ty, buildings, _s.widths is not None,
-                                   1 + seacarvemod.LINE_CELLS if _s.sea is not None else 0))
+    needs = roadsmod.tile_needs(frame, tx, ty, buildings, _s.widths is not None,
+                                1 + seacarvemod.LINE_CELLS if _s.sea is not None else 0)
+    if gas_stations:    # (the stations' places, asked cell by cell in tile_sites: 87-115 s of a drive's tiles' stages)
+        import gasstations
+        needs += [(k, "places") for k in roadsmod.cells_of_tile(frame, tx, ty,
+                                                                margin=gasstations.REACH_M + gasstations.MERGE_M)]
+    _s.md.warm(needs)
     if getattr(_s, "fra", None) is not None:       # (the US's level crossings' devices, alongside)
         _s.fra.prefetch(roadsmod.cells_of_tile(frame, tx, ty))
     mark("warm")
