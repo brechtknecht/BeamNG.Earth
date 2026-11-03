@@ -322,12 +322,24 @@ def warm_map(key, layers, veg=True):
     import vegetation as vegetationmod
     if _s.md is None:
         return 0.0
+    from concurrent.futures import ThreadPoolExecutor
     t0 = time.perf_counter()
-    try:
-        if layers:
-            _s.md.cell(key, layers=tuple(layers), kind="background")
-    except Exception as e:          # (the tile asks again, on demand)
-        log.debug("warm map %s: %s: %s", key, type(e).__name__, e)
+    z, x, y = (int(v) for v in key)
+
+    def one(k, lys):
+        try:
+            _s.md.cell(k, layers=tuple(lys), kind="background")
+        except Exception as e:      # (the tile asks again, on demand)
+            log.debug("warm map %s: %s: %s", k, type(e).__name__, e)
+    # the cell's layers and its 8 neighbours' roads, buildings and water (what Vegetation.cell reads) at once: mostly
+    # downloads; one after another a first-visit cell took 101 s on 2 cloud cores
+    jobs = [(key, layers)] if layers else []
+    if veg:
+        jobs += [((z, x + dx, y + dy), ("buildings", "roads", "water")) for dy in (-1, 0, 1) for dx in (-1, 0, 1)
+                 if (dx, dy) != (0, 0)]
+    if jobs:
+        with ThreadPoolExecutor(min(9, len(jobs)), thread_name_prefix="warm-map") as ex:
+            list(ex.map(lambda j: one(*j), jobs))
     if veg:
         try:
             if getattr(_s, "veg", None) is None:
