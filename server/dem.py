@@ -157,7 +157,7 @@ def zoom_for(lat, pixel_m, max_zoom=MAX_ZOOM):
 def terrain_zoom(lat):
     """The near terrain's DEM zoom: pixels of about its squares (heightmap.SQUARE). 2 m squares at z16's 0.75 m took four
     times the tiles of z15's 1.5 m for detail the terrain drops: on the A13 (2026-11-03) 5145 of a drive's 7026 tile
-    loads, 2043 of its 3454 DEM downloads (110 of 193 MB) and 1 MB of decoded mirror per tile."""
+    loads, 2043 of its 3457 DEM downloads (110 of 193 MB) and 1 MB of decoded mirror per tile."""
     import heightmap
     return zoom_for(lat, 1.25 * heightmap.SQUARE, FINE_ZOOM)
 
