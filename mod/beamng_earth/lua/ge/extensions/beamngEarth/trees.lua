@@ -132,6 +132,10 @@ M.WARM_KEEP_FRAMES = 30
 M.WARM_SPELLINGS = 3
 M.COLD_GAP_S = 0.5
 M.COLD_SPELLINGS = 2
+-- Every shape of the catalog loaded ahead from the level's start, not those of the tiles that have come: a car setting off
+-- soon met 60-110 first loads at speed, each holding the frame in createNewItem and the tick, up to 2.7 s (A13 drives,
+-- 2026-11-03: 16 of them over 200 ms took 18.7 s of a run).
+M.WARM_ALL = true
 
 local ECA = '/levels/east_coast_usa/art/shapes/'
 local WCA = '/levels/west_coast_usa/art/shapes/'
@@ -682,7 +686,16 @@ local function coldOk(shape)
 end
 
 -- The shapes of a tile's groups to load ahead (each once).
-local function queueWarm(groups)
+local queueWarm
+local function queueWarmAll()
+  M.warmAllQueued = true
+  local groups = {}
+  for g in pairs(M.CATALOG) do groups[#groups + 1] = g end
+  table.sort(groups)
+  queueWarm(groups)
+end
+
+queueWarm = function(groups)
   for _, g in ipairs(groups or {}) do
     local list = M.CATALOG[g] or {}
     local body = vienna.body(g)
@@ -1262,7 +1275,9 @@ function M.spareWanted(frameMs)
 end
 
 function M.update(anchorId, player, view, frameMs)
-  if not next(tiles) then return end
+  if M.FIRST_LOADS and M.WARM_ALL and not M.warmAllQueued then queueWarmAll() end
+  local warming = M.FIRST_LOADS and M.WARM_ALL and (#warmBases > 0 or #warmSpells > 0 or #warmItems > 0)
+  if not next(tiles) and not warming then return end
   if frameMs and frameMs <= 0 then M.yielded = (M.yielded or 0) + 1; return end
   if not setup() then return end
   frameN = frameN + 1
@@ -1276,6 +1291,7 @@ function M.update(anchorId, player, view, frameMs)
   local sp = vel and math.sqrt(vel.x * vel.x + vel.y * vel.y) or 0
   slowNow = sp < M.WARM_MAX_MS
   if player and slowNow and M.FIRST_LOADS then warmStep(player, frameN) end
+  if not next(tiles) then return end
   -- (the car starting or stopping changes what collides: M.cellMask's corridor from FAST_MS on)
   if not dirty and not ghostSince and #foci == 0 and lastPass and lastPass.anchor == anchorId and player
       and lastPass.fast == (sp >= M.FAST_MS)
@@ -1562,6 +1578,7 @@ function M.reset()
   tiles, types, ready, pool, forestCount, pop = {}, {}, false, {}, 0, {}
   dirty, lastPass = true, nil
   loaded, loadedBase, warmBases, warmSpells, warmQueued, warmItems, warmForestId = {}, {}, {}, {}, {}, {}, nil
+  M.warmAllQueued = false
   coldLast, M.coldRecent, clock, M.coldLoads, M.warmLoads = nil, {}, nil, 0, 0
 end
 

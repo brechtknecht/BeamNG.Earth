@@ -45,6 +45,7 @@ jsonDecode = function(s)
 end
 local trees = require('beamngEarth/trees')
 trees.FIRST_LOADS = false      -- (every shape at once here; the first loads are tested below)
+trees.WARM_ALL = false          -- (those of the tiles' groups: tested below with them)
 trees.EVERY_N = 1               -- (every update works here; the batching is tested below)
 -- (no time budget, no spare Forests: both tested at the end)
 local FRAME_MS, POOL_SPARE = trees.FRAME_MS, trees.POOL_SPARE
