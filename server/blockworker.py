@@ -314,6 +314,33 @@ def veg_geo(aid, lat, lon, zoom, gx, gy, out_dir, vfs_dir, flat=False):
     return path, n, frame, pivot
 
 
+def warm_map(key, layers, veg=True):
+    """Map data cell key ((z, x, y)) built into the disk caches ahead of the car (earthd.Server.map_ahead): its
+    vector layers (MapData.cell) and its vegetation cell (Vegetation.cell, which reads its 3 x 3 neighbours' roads,
+    buildings and water). On a first visit a trees geotile spent 56 s here on the cell's map data and 0.01 s on its
+    trees, and the tiles asked for it only when the car was ~200 m away (Felix's A4 drive, 2026-11-03). Seconds."""
+    import vegetation as vegetationmod
+    if _s.md is None:
+        return 0.0
+    t0 = time.perf_counter()
+    try:
+        if layers:
+            _s.md.cell(key, layers=tuple(layers), kind="background")
+    except Exception as e:          # (the tile asks again, on demand)
+        log.debug("warm map %s: %s: %s", key, type(e).__name__, e)
+    if veg:
+        try:
+            if getattr(_s, "veg", None) is None:
+                v = vegetationmod.Vegetation(_s.md, _s.cache_dir)
+                v.dem = _s.dem
+                v.surface, v.widths = _s.surface, _s.widths
+                _s.veg = v
+            _s.veg.cell(key)
+        except Exception as e:
+            log.debug("warm veg %s: %s: %s", key, type(e).__name__, e)
+    return time.perf_counter() - t0
+
+
 def _take_pads(fuel_pads):
     """The server's gas station pads for this job's area (earthd.Server.block_fuel_pads) as this process's Surface's:
     only these (none when the server's gas stations are switched off)."""
