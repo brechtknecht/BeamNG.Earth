@@ -363,6 +363,25 @@ def warm_map(key, layers, veg=True):
     return time.perf_counter() - t0
 
 
+def warm_plans(key, plan):
+    """Cell key's road plans made ahead of the player (Server.map_ahead, after the map data of the cells ahead; shared
+    through plancache), unless another process is planning it: the block processes' lookahead reached 6 km at most
+    and fell behind a fast car, and the road tiles then waited for their cells' plans (up to 54 s, A13 2026-11-03).
+    plan: (anchor id, lat, lon) whose grader plans. Seconds taken."""
+    import mapcells
+    if not getattr(_s, "grading", False):
+        return 0.0
+    t0 = time.perf_counter()
+    try:
+        g, _ = _s.anchor(*plan)
+        ck = mapcells.CellKey(*(int(v) for v in key))
+        if g is not None and not g.planned(ck) and not g.busy_elsewhere(ck):
+            g.warm(ck)
+    except Exception as e:
+        log.debug("warm plans %s: %s: %s", key, type(e).__name__, e)
+    return time.perf_counter() - t0
+
+
 def _take_pads(fuel_pads):
     """The server's gas station pads for this job's area (earthd.Server.block_fuel_pads) as this process's Surface's:
     only these (none when the server's gas stations are switched off)."""

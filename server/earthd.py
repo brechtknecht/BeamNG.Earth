@@ -964,6 +964,9 @@ class Server:
         self.map_ahead_pool = None      # map_ahead's process (main_async), None: off
         self.veg_pool = None            # trees geotiles' process (main_async; None: in the road processes, submit_low)
         self.map_ahead_last = None
+        self.map_ahead_plan = None      # (anchor id, lat, lon) whose grader plans the cells ahead, None: no grading
+        self.map_ahead_plans = []       # [cell key] whose road plans are made once no map cell is left (nearest first)
+        self.map_ahead_planned = set()
         self.map_ahead_want = []        # [cell key] nearest first (the last round's)
         self.map_ahead_done = set()
         self.map_ahead_cv = threading.Condition()
@@ -2301,7 +2304,8 @@ class Server:
         if not path:
             return
         self.map_ahead_last = (anchor.id, x, y)
-        want, seen = [], set()
+        self.map_ahead_plan = (anchor.id, anchor.lat, anchor.lon) if self.grading else None
+        want, seen, seen_all = [], set(), {}      # (seen_all: every cell ahead in order, for their road plans)
         for _t, px, py, _sp in path:
             la, lo, _ = anchor.frame.enu_to_geodetic(px, py, 0.0)
             la, lo = float(la), float(lo)
@@ -2313,11 +2317,17 @@ class Server:
                 continue
             for k in keys:
                 kk = (int(k.z), int(k.x), int(k.y))
+                if kk not in seen_all:
+                    seen_all[kk] = None
                 if kk not in seen and kk not in self.map_ahead_done:
                     seen.add(kk)
                     want.append(kk)
+        plans = []
+        if self.map_ahead_plan is not None:
+            plans = [k for k in seen_all if k not in self.map_ahead_planned]
         with self.map_ahead_cv:
             self.map_ahead_want = want
+            self.map_ahead_plans = plans
             if self.map_ahead_thread is None:
                 self.map_ahead_thread = threading.Thread(target=self._map_ahead_loop, daemon=True, name="map-ahead")
                 self.map_ahead_thread.start()
@@ -2326,9 +2336,25 @@ class Server:
     def _map_ahead_loop(self):
         while True:
             with self.map_ahead_cv:
-                while not self.map_ahead_want:
+                while not self.map_ahead_want and not self.map_ahead_plans:
                     self.map_ahead_cv.wait()
-                key = self.map_ahead_want.pop(0)
+                if not self.map_ahead_want:     # (every map cell ahead made: their road plans, nearest first)
+                    key, plan = self.map_ahead_plans.pop(0), self.map_ahead_plan
+                    self.map_ahead_planned.add(key)
+                    if len(self.map_ahead_planned) > 50000:
+                        self.map_ahead_planned.clear()
+                else:
+                    key, plan = self.map_ahead_want.pop(0), None
+            if plan is not None:
+                try:
+                    dt = self.map_ahead_pool.submit(blockworker.warm_plans, key, plan).result()
+                    if dt and dt > 1.0:
+                        log.info("map ahead: plans of cell %d_%d in %.1f s (%d to plan)", key[1], key[2], dt,
+                                 len(self.map_ahead_plans))
+                except Exception as e:  # only costs the lookahead
+                    log.debug("map ahead plans %s: %s: %s", key, type(e).__name__, e)
+                continue
+            with self.map_ahead_cv:
                 if key in self.map_ahead_done:
                     continue
                 self.map_ahead_done.add(key)
