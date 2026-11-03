@@ -110,9 +110,69 @@ def base_entry(user_dir, base_vfs, ao_vfs, rgb, ao_value):
     os.makedirs(d, exist_ok=True)
     rgb = np.asarray(rgb, np.uint8)
     rgba = np.concatenate([rgb, np.full(rgb.shape[:2] + (1,), ao_value, np.uint8)], 2)
-    path = os.path.join(d, base_key(base_vfs, ao_vfs) + ".dds")
+    key = base_key(base_vfs, ao_vfs)
+    path = os.path.join(d, key + ".dds")
     tmp = staging.tmp_for(path)
     with open(tmp, "wb") as f:
         f.write(bc7.dds(rgba))
     staging.replace(tmp, path)
+    _note(user_dir, base_vfs, key)
     return path
+
+
+# Every entry the server writes is noted (session id, key) in LEDGER beside the sessions: one whose session folder is
+# gone (a killed server, a folder deleted by hand) was left in the game's cache for good, ~5 MB a block, 14 GB of
+# them on a test PC by 2026-11-03 (the session's own sweep finds its entries only from the photos still in its folder).
+LEDGER = "terraincache-written.txt"
+
+
+def _ledger(user_dir):
+    return os.path.join(user_dir, "temp", "beamngEarth", LEDGER)
+
+
+def _note(user_dir, base_vfs, key):
+    parts = base_vfs.replace("\\", "/").split("/")
+    try:
+        sid = parts[parts.index("beamngEarth") + 1]
+    except (ValueError, IndexError):
+        return
+    try:
+        with open(_ledger(user_dir), "a", encoding="ascii") as f:
+            f.write(f"{sid} {key}\n")          # (one short write: whole lines from several processes)
+    except OSError:
+        pass
+
+
+def prune_ledger(user_dir, live):
+    """The noted entries of sessions not in live (session ids) removed from the game's cache, and from the ledger.
+    Returns how many files were removed."""
+    path = _ledger(user_dir)
+    try:
+        with open(path, encoding="ascii", errors="replace") as f:
+            rows = [ln.split() for ln in f]
+    except OSError:
+        return 0
+    d = cache_dir(user_dir)
+    keep, n = [], 0
+    for r in rows:
+        if len(r) != 2:
+            continue
+        sid, key = r
+        if sid in live:
+            keep.append(f"{sid} {key}\n")
+            continue
+        try:
+            os.remove(os.path.join(d, key + ".dds"))
+            n += 1
+        except FileNotFoundError:
+            pass
+        except OSError:
+            keep.append(f"{sid} {key}\n")      # (in use: next time)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        with open(tmp, "w", encoding="ascii") as f:
+            f.writelines(keep)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+    return n

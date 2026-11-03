@@ -1088,6 +1088,15 @@ class Server:
                 self.orphans[sid] = now
                 log.info("session %s of an earlier run (%.0f min old) kept until the game says whether it still "
                          "shows its tiles", sid, age / 60)
+        # the game's terrain cache entries of sessions whose folders are gone (terraincache.LEDGER)
+        try:
+            live = {os.path.basename(os.path.dirname(d)) for d in glob.glob(os.path.join(self.root, "*", SESSION_MARKER))}
+            live.add(self.sid)
+            n = terraincache.prune_ledger(self.user_dir, live)
+            if n:
+                log.info("terrain cache: %d entries of gone sessions removed", n)
+        except Exception as e:      # (only costs disk)
+            log.debug("terrain cache ledger: %s", e)
 
     def _rmtree_session(self, sid):
         # detail mode's packed copies of its base photos in the game's terrain texture cache (terraincache.py) go
