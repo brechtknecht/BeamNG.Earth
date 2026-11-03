@@ -194,6 +194,17 @@ class OsmTags:
             con.close()
 
     def _groups(self, con, uri, remote, kind):
+        with self._lock:
+            got = self._meta
+            ml = self.__dict__.setdefault("_meta_lock", threading.Lock())
+        if got is not None and got[0] is remote:
+            return got[1]
+        # (one thread parses, the others wait for it: a fresh process's first cells all parsed the footer at once,
+        # ~20 s of a block process's busy threads in a cloud profile, 2026-11-03)
+        with ml:
+            return self._groups1(con, uri, remote, kind)
+
+    def _groups1(self, con, uri, remote, kind):
         """{row group: {"first", "n", "bbox": {leaf: (min, max)}, "cols": {column: [byte ranges]}}} of the file,
         parsed once per version (0.6 s of every cell's two queries, 2026-10-22: Central Park's first block waited
         90 s for its cells)."""
