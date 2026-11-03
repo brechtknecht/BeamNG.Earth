@@ -49,9 +49,15 @@ def materials():
         for name, v in vars(mod).items():
             if name.isupper():
                 _marks(v, out)
-    for name in ("DECK_SIDE", "TRUSS_STEEL", "TUNNEL_INNER", "TUNNEL_STONE", "TUNNEL_STONE_IN", "TUNNEL_SOIL", "WALL_SCREE",
-                 "TUNNEL_LIGHT"):
+    for name in ("DECK_SIDE", "DECK_TOP", "TRUSS_STEEL", "TUNNEL_INNER", "TUNNEL_STONE", "TUNNEL_STONE_IN", "TUNNEL_SOIL",
+                 "WALL_SCREE", "TUNNEL_LIGHT"):
         out.add(getattr(roadmesh, name))
+    # (the rails' and the bridges' tops were left out: every shape of a drive that stalled the frame for seconds held one
+    # of these, A13 2026-11-03)
+    import markings
+    import rails
+    import railways
+    out |= set(railways.BALLAST_WORN) | {railways.SLEEPER, railways.STEEL, rails.STREET_TRACK["m"], markings.ARROW_MATERIAL}
     return sorted(out)
 
 
