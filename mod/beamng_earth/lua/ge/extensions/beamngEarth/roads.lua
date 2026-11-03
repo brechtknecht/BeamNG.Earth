@@ -479,7 +479,12 @@ local function isCollider(o)
 end
 
 -- collide: true ('Visible Mesh Final'), a collision type name, or false / nil (render only)
+-- ms of createWalk's steps for the last object (the slow shape log: which engine call held the frame)
+local walkClock = nil
+M.lastWalkSplit = ''
 local function createWalk(walk, collide)
+  walkClock = walkClock or stopwatch.clock()
+  local t0 = walkClock()
   local o = createObject('TSStatic')
   o:setField('shapeName', 0, walk.shape)
   -- 'Visible Mesh Final' (the engine's own suggestion: 'Performance: Mesh is using visible collision ... switch the
@@ -489,12 +494,18 @@ local function createWalk(walk, collide)
   o:setField('dynamic', 0, 'true')    -- no redraw of the cached sun shadow map for each tile (farfield.lua spawn)
   o.canSave = false
   o:setPosition(vec3(walk.pos[1], walk.pos[2], walk.pos[3]))
+  local t1 = walkClock()
   o:registerObject('')
+  local t2 = walkClock()
   if walk.rot then        -- (a geotile's part: placed from its tile's frame, M.geoWalk)
     local r = walk.rot
     o:setPosRot(walk.pos[1], walk.pos[2], walk.pos[3], r[1], r[2], r[3], r[4])
   end
+  local t3 = walkClock()
   group():addObject(o)
+  local t4 = walkClock()
+  M.lastWalkSplit = string.format('fields %.0f, register %.0f, place %.0f, group %.0f ms', t1 - t0, t2 - t1, t3 - t2,
+    t4 - t3)
   return o:getID()
 end
 
@@ -1747,7 +1758,7 @@ updateBody = function(gov, currentAnchor, player, view, a)
       if ms >= M.SLOW_UNIT_MS then        -- (a single shape stalling the frame for seconds: which file, how big, how new)
         local st = nil
         pcall(function() st = FS:stat(walk.shape) end)
-        log('W', 'beamngEarth.roads', string.format('slow shape %s %.0f ms: %s, %s bytes, modtime %s, collision %s, tile %s',
+        log('W', 'beamngEarth.roads', string.format('slow shape %s %.0f ms: %s, %s bytes, modtime %s, collision %s, tile %s; ' .. M.lastWalkSplit,
           tostring(q.what), ms, tostring(walk.shape), tostring(type(st) == 'table' and (st.filesize or st.size) or '?'),
           tostring(type(st) == 'table' and (st.modtime or st.modificationTime) or '?'),
           tostring((q.what == 'bldcol' or q.what == 'walkcol' or q.what == 'railcol') and 'mesh' or not isRoad),

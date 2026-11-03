@@ -310,6 +310,20 @@ local MATERIALS = {
 }
 
 local stopwatch = require('beamngEarth/stopwatch')
+-- One engine call slower than SLOW_CALL_MS logged with what it was (tree hitches of 1-2.7 s inside the trees' frame,
+-- whose budget is checked between items: one call held the frame; A13 2026-11-03)
+M.SLOW_CALL_MS = 150
+local callClock = nil
+local function slowCall(what, ms, shape, n, extra)
+  if ms >= M.SLOW_CALL_MS then
+    log('W', 'beamngEarth.trees', string.format('slow %s %.0f ms: %s, items of shape %s, %s', what, ms,
+      tostring(shape), tostring(n or '?'), tostring(extra or '')))
+  end
+end
+local function callStart()
+  callClock = callClock or stopwatch.clock()
+  return callClock()
+end
 M.clock = stopwatch.new      -- the tree frame's clock (FRAME_MS; tests: their own)
 local tiles = {}        -- key "a:tx_ty" -> { anchor, cx, cy, f (flat items), s (stride), n, made = { i -> item }, shown }
 local foci = {}         -- other vehicles' collision foci { x, y, r, trees } (M.setFoci, collisionfoci.lua)
@@ -428,9 +442,11 @@ end
 local function newForest()
   forestCount = forestCount + 1
   newForests = newForests + 1
+  local t0 = callStart()
   local f = createObject('Forest')
   f:registerObject(M.forestName(forestCount))
   if scenetree.MissionGroup then scenetree.MissionGroup:addObject(f) end
+  slowCall('newForest', callClock() - t0, nil, nil, 'forest ' .. tostring(forestCount))
   M.forests = forestCount
   return f
 end
@@ -518,11 +534,13 @@ local function itemType(shape, solid)
     d = (worldEditorCppApi and worldEditorCppApi.createObject) and worldEditorCppApi.createObject('TSForestItemData')
       or createObject('TSForestItemData')
     if not d then return nil end
+    local t0 = callStart()
     d:setField('shapeFile', 0, shape .. '.dae')
     d:setField('collidable', 0, solid and '1' or '0')
     d:setField('windScale', 0, '0.4'); d:setField('branchAmp', 0, '0.1'); d:setField('detailAmp', 0, '0.2')
     d:registerObject(name)
     if Sim and Sim.getDataBlockSet then Sim.getDataBlockSet():addObject(d) end
+    slowCall('itemType', callClock() - t0, shape, nil, 'solid ' .. tostring(solid))
   end
   types[key] = d
   return d
@@ -781,7 +799,11 @@ local function makeItem(fd, t, i, shape, sc, solid, group, variant)
     m:setFromEuler(itemVec)
     m:setPosition(itemPos)
   end
+  local first = not loaded[shape]
+  local t0 = callStart()
   local ok, it = pcall(function() return fd:createNewItem(d, m, sc) end)
+  slowCall('createNewItem', callClock() - t0, shape, pop[shape], string.format('first load %s, solid %s, group %s', tostring(first),
+    tostring(solid), tostring(group)))
   if not ok then M.errors = M.errors + 1; return nil end
   local body = vienna.body(group)
   if body then
@@ -795,7 +817,9 @@ local function makeItem(fd, t, i, shape, sc, solid, group, variant)
 end
 
 local function removeItem(fd, it, shape)
+  local t0 = callStart()
   if not vienna.remove(fd, it) then pcall(function() fd:removeItem(it) end) end
+  slowCall('removeItem', callClock() - t0, shape, shape and pop[shape])
   M.removed = M.removed + 1
   if shape then pop[shape] = math.max((pop[shape] or 1) - 1, 0) end
 end
