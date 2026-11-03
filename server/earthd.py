@@ -317,6 +317,7 @@ RECENT_FULL = 2                 # full ground photos kept for the stand-ins' ove
 QUICK_MIN_COVER = 0.8          # share of a stand-in's texels real imagery must cover (else no stand-in)
 QUICK_SHARE_WAIT_S = 30.0       # Server._quick_once: a caller waits this long for the stand-in being made
 QUICK_MADE_KEPT = 256           # blocks whose stand-in file names _quick_once remembers
+PASSED_MIN_V = 15.0             # m/s: from here on a stand-in for a block the car has left behind is skipped (_passed)
 QUICK_BASE_PX = 512             # a block's stand-in photo (write_quick_base): the imagery alone, 2 m texels
 BASE_WAIT_S = 2.5               # ... and slower, this long: a slow photo held the heightmap thread and the blocks behind
                                 # it (a city's first visit at 127 mph: 4.75 s for one photo, the next block 7.8 s and the
@@ -2943,6 +2944,8 @@ class Server:
         info = self.hm.get(key)
         if info is not None and info.get("base"):
             return                              # (its own photo came while this waited its turn)
+        if self._passed(anchor, cx, cy):
+            return                              # (the car has left it behind: its stand-in would be wasted)
         name = self._quick_once(anchor, cx, cy, lambda: self._quick_elsewhere(anchor, cx, cy, LANE_PREFETCH)
                                 or self.write_quick_base(anchor, cx, cy))
         conns = [c for c in list(self.connections) if getattr(c, "loop", None) is not None]
@@ -2965,6 +2968,22 @@ class Server:
             conns[0].loop.call_soon_threadsafe(apply)
         except RuntimeError:
             pass                                # (the loop has closed)
+
+    def _passed(self, anchor, cx, cy):
+        """Whether the car (a connection's, on this anchor) moving faster than PASSED_MIN_V has left block (cx, cy)
+        behind by more than a block: one queued stand-in after another (quick_pool, one thread) waited for blocks the
+        car had passed long ago, 6472 thread-s of queue in a 32 km drive at 168 mph (A13 2026-11-04)."""
+        half = self.layout.block * heightmap.SQUARE / 2
+        for c in list(self.connections):
+            if getattr(c, "active", None) != anchor.id:
+                continue
+            (x, y), (vx, vy) = getattr(c, "focus", (0.0, 0.0)), getattr(c, "vel", (0.0, 0.0))
+            v = math.hypot(vx, vy)
+            if v < PASSED_MIN_V:
+                return False
+            along = ((cx - x) * vx + (cy - y) * vy) / v
+            return along < -3 * half
+        return False
 
     def _base_later(self, key, fut, tries=4):
         """A block sent without its photo (not done BASE_WAIT_S after its heights): the photo, once rendered, onto the block's entry (later
