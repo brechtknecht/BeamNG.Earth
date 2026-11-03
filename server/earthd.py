@@ -268,6 +268,9 @@ MAP_AHEAD_MAX_M = 10000.0
 MAP_AHEAD_REACH_M = 400.0       # m beside the path whose cells are built too
 MAP_AHEAD_MOVE_M = 200.0        # m the player moves before the list is made again
 MAP_AHEAD_LAYERS = AHEAD_LAYERS + ("canopy", "landcover")
+# and the road plans of the cells ahead: off (cloud drive 2026-11-03, 60 m/s: road tiles sent 37 vs 118 without;
+# the planning took the CPU the road tiles needed). BNGE_MAP_AHEAD_PLANS=1: on
+MAP_AHEAD_PLANS = os.environ.get("BNGE_MAP_AHEAD_PLANS", "0") != "0"
 # the layers whose bytes warm_roads fetches ahead along its path (mapdata.fetch_ahead), per cell in this order: the road
 # plans' (roads, buildings for the widths) first
 FETCH_AHEAD_LAYERS = ("roads", "buildings", "water", "land_use", "infrastructure", "building_parts")
@@ -2304,7 +2307,7 @@ class Server:
         if not path:
             return
         self.map_ahead_last = (anchor.id, x, y)
-        self.map_ahead_plan = (anchor.id, anchor.lat, anchor.lon) if self.grading else None
+        self.map_ahead_plan = (anchor.id, anchor.lat, anchor.lon) if self.grading and MAP_AHEAD_PLANS else None
         want, seen, seen_all = [], set(), {}      # (seen_all: every cell ahead in order, for their road plans)
         for _t, px, py, _sp in path:
             la, lo, _ = anchor.frame.enu_to_geodetic(px, py, 0.0)
