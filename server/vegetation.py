@@ -680,7 +680,7 @@ TILE = 256.0                # m, as the road tiles (roads.tile_bbox)
 TILE_ROWS_MAX = 6000        # items a tile sends at most, the lowest ranks: the most the mod shows of one (trees.lua
                             # TILE_CAP). Dense forest has 10-20k a tile: Bodø's 145 tiles held 1.66 M rows in the game's
                             # Lua (394 MB of heap, 1.25 s garbage collection pauses on a Steam Deck; GitHub #66)
-LEAD_S = float(os.environ.get("BNGE_VEG_LEAD_S", "30"))   # trees tiles: s of driving ahead (Tracker lead_s; 0: off)
+LEAD_S = float(os.environ.get("BNGE_VEG_LEAD_S", "0"))    # trees tiles: s of driving ahead (Tracker lead_s; 0: off. 30 tried 2026-11-03: no gain, 96 % ready either way)
 LEAD_MAX_M = 3000.0
 LEAD_FAST_MS = 25.0
 LEAD_CORRIDOR_M = 160.0
