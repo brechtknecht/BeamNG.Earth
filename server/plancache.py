@@ -68,9 +68,11 @@ HCHUNKS = "hchunks"
 
 def chunks_dir(cache_dir, aid, lat, lon):
     """This run's folder of an anchor's shared block heights (heightmap.ChunkCache disk), or None outside a server
-    run or with BNGE_SHARED_CHUNKS=0."""
+    run or without BNGE_SHARED_CHUNKS=1 (off by default: on the test PC, 2026-11-04, the blocks' heights took longer
+    with it, 2-4 s against 1.2-2.2 s, though far fewer samples were computed: a block's 64 small files read and
+    written under the virus scanner)."""
     run = os.environ.get(RUN_ENV)
-    if not run or os.environ.get("BNGE_SHARED_CHUNKS", "1") == "0":
+    if not run or os.environ.get("BNGE_SHARED_CHUNKS", "0") != "1":
         return None
     return os.path.join(cache_dir, HCHUNKS, run, f"{aid}_{lat:.7f}_{lon:.7f}")
 
