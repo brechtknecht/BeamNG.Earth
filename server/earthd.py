@@ -312,6 +312,9 @@ PHOTO_PROCESS_MIN_CPUS = 12
 # A block waits at most this long for its stand-in photo started beside it (cold: the photo process queued behind
 # imagery downloads and a block built in 1.4 s waited 99.5 s for it, nyc_speed.py --cold 2026-11-02)
 STANDIN_WAIT_S = 1.0
+# ... and a block built ahead takes its stand-in only if it is done already: 106 of 109 blocks waited the whole second and
+# went without it (a stand-in took ~8 s; A13 at 200 mph, 2026-11-04), 120 s of blocks late for nothing. BNGE_STANDIN_AHEAD_WAIT_S
+STANDIN_AHEAD_WAIT_S = float(os.environ.get("BNGE_STANDIN_AHEAD_WAIT_S", "0") or 0)
 QUICK_SYNC_MAX_V = 150.0        # m/s (335 mph): slower, a block built ahead gets its stand-in photo before it is ready (224 mph left a player at 230 mph with brown flashes)
 RECENT_FULL = 2                 # full ground photos kept for the stand-ins' overlap (write_quick_base)
 QUICK_MIN_COVER = 0.8          # share of a stand-in's texels real imagery must cover (else no stand-in)
@@ -2926,7 +2929,7 @@ class Server:
             if early is not None:
                 t1 = time.perf_counter()
                 try:
-                    info["base"] = early.result(timeout=STANDIN_WAIT_S)
+                    info["base"] = early.result(timeout=STANDIN_AHEAD_WAIT_S)
                 except concurrent.futures.TimeoutError:
                     self.quick_pool.submit(self._quick_later, anchor, cx, cy)
                 except Exception as e:
