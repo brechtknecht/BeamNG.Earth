@@ -120,6 +120,10 @@ a, cx, cy = d(129, 0, 11, 0, 0, 0, nil, 0, 0)
 T.check(a == 'prepare' and cx == 384 and cy == 0, '512 at 25 mph: prepare snap128(p + 256 m)')
 a, cx, cy = d(129, 0, 0, 0, 0, 0, nil, 0, 0)
 T.check(a == 'prepare' and cx == 128, '512 standing: the block round the player')
+-- at 200 mph too: a block committed in time, its centre still over PREPARE_DIST ahead, is no reason for another request
+T.check(d(-200, 0, 90, 0, 0, 0, nil, 0, 0) == nil, '512 at 90 m/s: the centre 200 m ahead: no request')
+a, cx, cy = d(129, 0, 90, 0, 0, 0, nil, 0, 0)
+T.check(a == 'prepare' and cx == 384 and cy == 0, '512 at 90 m/s: past the centre by 128 m: prepare (384, 0)')
 -- town drives: half the moves, never nearer than 225 m to the block's edge (1 s and 4 s heightmap latency)
 do
   local function moves(speed, hdg, lat)

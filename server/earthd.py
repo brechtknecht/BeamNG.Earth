@@ -659,7 +659,7 @@ def predict_request(px, py, vx, vy, cx, cy, rule=FOLLOW_RULES[2048.0], at=None):
     follow table; in its fast mode the box test is on the point v * fast_ahead ahead."""
     lead, reach, ahead = rule.mode(vx, vy)
     v2 = vx * vx + vy * vy
-    if (rule.min_lead > 0 and rule.min_lead_v ** 2 < v2 and v2 * lead * lead < rule.min_lead ** 2
+    if (rule.min_lead > 0 and rule.min_lead_v ** 2 < v2 and ahead == 0
             and (cx - px) * vx + (cy - py) * vy > 0
             and max(abs(px - cx), abs(py - cy)) <= rule.min_lead + rule.grid):
         # (follow.lua centreAhead: the centre just committed is ahead; the next request once the player is past it)
@@ -737,7 +737,11 @@ def predict_route_chain(xy, px, py, vx, vy, cx, cy, rule, n, at=None):
         x, y, gone = x + ux * step, y + uy * step, gone + step
         lvx, lvy = ux * sp, uy * sp
         _lead, _reach, ahead = rule.mode(lvx, lvy)
-        if max(abs(x + lvx * ahead - cx), abs(y + lvy * ahead - cy)) > rule.prepare:
+        if (max(abs(x + lvx * ahead - cx), abs(y + lvy * ahead - cy)) > rule.prepare
+                and not (rule.min_lead > 0 and ahead == 0 and (cx - x) * lvx + (cy - y) * lvy > 0
+                         and max(abs(x - cx), abs(y - cy)) <= rule.min_lead + rule.grid)):
+            # (not while the centre is still ahead: follow.lua centreAhead, as predict_request, which would go on from
+            # here in a straight line)
             where = []
             c = predict_request(x, y, lvx, lvy, cx, cy, rule, where)
             if c != (cx, cy) and c not in out:

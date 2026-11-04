@@ -189,13 +189,16 @@ end
 --   latency: the last measured heightmap latency, s (the 512² re-check; nil = LATENCY_S)
 -- Returns 'prepare' (+ new cx, cy), 'commit', 'discard' or nil. 'commit' is a request: the caller
 -- runs it in a governor heavy slot (governor.lua), so it may be returned on several frames.
--- Pure: is the block's centre still ahead of a player moving at town speed, the target set by MIN_LEAD (decide)?
+-- Pure: is the block's centre still ahead of a moving player (decide)? Then the next request waits until it is past: the
+-- box test, symmetric, took a block committed in time, still over PREPARE_DIST ahead, for one being left, and asked at once
+-- for a target one grid step further that nobody had predicted: 23 of 33 late blocks at 200 mph, the block guessed ahead
+-- 256 m from it out of the player's reach (A13, 2026-11-04). Not in fast mode (its test point is ahead of the player).
 function M.centreAhead(px, py, vx, vy, cx, cy)
   vx, vy = vx or 0, vy or 0
   local v2 = vx * vx + vy * vy
-  if M.MIN_LEAD <= 0 or v2 <= M.MIN_LEAD_V * M.MIN_LEAD_V or v2 * M.LOOKAHEAD_S * M.LOOKAHEAD_S >= M.MIN_LEAD * M.MIN_LEAD then
-    return false
-  end
+  if M.MIN_LEAD <= 0 or v2 <= M.MIN_LEAD_V * M.MIN_LEAD_V then return false end
+  local _, _, ahead = mode(vx, vy)
+  if ahead ~= 0 then return false end
   return (cx - px) * vx + (cy - py) * vy > 0 and M.cheb(px, py, cx, cy) <= M.MIN_LEAD + M.GRID
 end
 
