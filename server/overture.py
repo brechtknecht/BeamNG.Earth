@@ -55,6 +55,7 @@ REMOTE_FILES = 32               # open RemoteFiles kept (their blocks share rang
 PARQUET_CONFIG = {"disable_parquet_prefetching": True}
 RG_DIR = "rows"                 # the row groups' local copies (Reader._local_rows), beside a file's blocks
 RG_ROWS = 2048                  # rows a row group of a local copy: a cell's bbox filter skips the others by their stats
+BOX_DISK = os.environ.get("BNGE_OVERTURE_BOX_DISK", "1") != "0"   # row groups' boxes kept on disk too
 RG_WAIT_S = 60.0                # a copy another process makes is waited for this long
 META_FILE = "rowgroups.json"     # a file's parsed row groups, beside its cached blocks (_meta_load)
 BOX_ROWS = 2_000_000           # row groups' bbox rows kept per Reader (_plan: ~16 B a row as float32)
@@ -387,6 +388,43 @@ class Reader:
                 _, old = self._boxes.popitem(last=False)
                 self._box_rows -= len(old[0])
 
+    def _box_file(self, files, k):
+        path, rg = k
+        return os.path.join(files[path].cache_dir, RG_DIR, f"boxes_{int(rg)}.npz")
+
+    def _box_load(self, files, k):
+        """A row group's boxes from the copy another process (or an earlier run) left on disk (_box_save): True when
+        found. Every server process decoded the same row groups' boxes from the remote file's blocks (~20 s of a
+        fresh place's 8 km drive, 2026-11-04); release files never change."""
+        if not BOX_DISK:
+            return False
+        try:
+            with np.load(self._box_file(files, k), allow_pickle=False) as z:
+                arrays = tuple(np.array(z[c]) for c in ("x0", "x1", "y0", "y1"))
+        except (OSError, ValueError, KeyError, EOFError):
+            return False
+        self._box_put(k, arrays)
+        return True
+
+    def _box_save(self, files, k):
+        if not BOX_DISK:
+            return
+        got = self._box_get(k)
+        if got is None:
+            return
+        f = self._box_file(files, k)
+        tmp = f"{f}.{os.getpid()}.{threading.get_ident()}.tmp"
+        try:
+            os.makedirs(os.path.dirname(f), exist_ok=True)
+            with open(tmp, "wb") as fh:
+                np.savez(fh, **dict(zip(("x0", "x1", "y0", "y1"), got)))
+            os.replace(tmp, f)
+        except OSError:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
     def _connect(self, files, kind):
         """A DuckDB connection whose filesystem serves `files` ({path: RemoteFile}) with `kind`."""
         duckdb = _duckdb()
@@ -608,7 +646,7 @@ class Reader:
         # each row group's boxes decoded once (BOX_ROWS kept): a place's cells share their row groups (a fresh
         # place's first block: 69 queries over 210 row groups of 19, 2026-10-30), and the bbox pass was ~13 s of its
         # layer threads; compared in the column's own type, as DuckDB compares it
-        need = [k for k in cand if self._box_get(k) is None]
+        need = [k for k in cand if self._box_get(k) is None and not self._box_load(files, k)]
         if need:
             wanted = {}
             for path, rg in need:
@@ -631,6 +669,7 @@ class Reader:
                     g = groups[(path, rg)]
                     sel = (fr >= g["first"]) & (fr < g["first"] + g["n"])
                     self._box_put((path, rg), tuple(c[sel] for c in cols))
+                    self._box_save(files, (path, rg))
         matched = set()
         for k in cand:
             x0, x1, y0, y1 = self._box_get(k)
