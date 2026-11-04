@@ -2,8 +2,9 @@
 """High-speed drives through dense Manhattan, for world-generation speed (the user, 2026-11-02: "create a tool where
 you can simulate high speed driving down dense new york streets ... even cached places are too slow to generate").
 
-The car is moved by tools/drive.py's in-game driver (a scripted profile: the speed held whatever the traffic, the
-ground followed, no AI) along a route of avenues and cross streets, while this tool records what keeping up means:
+The vehicle (a ball prop by default: --vehicle) is moved by tools/drive.py's in-game driver (a scripted profile: the
+speed held whatever the traffic, the ground followed, no AI) along a route of avenues and cross streets, while this
+tool records what keeping up means:
 
   - the edge guard: frames in "warn" / "hold" (the mod's banner / pause), polled every POLL_S;
   - every terrain block the mod asked for: request -> ready (server.log terrain_ready), provisional ones, their
@@ -38,7 +39,22 @@ LOG = os.path.expanduser("~/.cache/beamng-earth/logs/server.log")
 LOG_SSH = os.environ.get("BNGE_LOG_SSH")
 
 
+# a Windows machine (BNGE_LOG_WIN=1 with BNGE_LOG_SSH): its log at %LOCALAPPDATA%\beamng-earth\logs, read with PowerShell
+LOG_WIN = os.environ.get("BNGE_LOG_WIN") == "1"
+WIN_LOG = "$env:LOCALAPPDATA\\beamng-earth\\logs\\server.log"
+
+
+def _win(script, timeout=60):
+    import base64
+    enc = base64.b64encode(script.encode("utf-16-le")).decode()
+    return subprocess.run(["ssh", "-o", "BatchMode=yes", LOG_SSH, f"powershell -NoProfile -EncodedCommand {enc}"],
+                          capture_output=True, timeout=timeout)
+
+
 def log_size():
+    if LOG_SSH and LOG_WIN:
+        r = _win(f"(Get-Item {WIN_LOG}).Length", 30)
+        return int(r.stdout.decode().strip() or 0)
     if LOG_SSH:
         r = subprocess.run(["ssh", "-o", "BatchMode=yes", LOG_SSH, "stat -c %s ~/.cache/beamng-earth/logs/server.log"],
                            capture_output=True, text=True, timeout=30)
@@ -71,7 +87,7 @@ local b, tp = s.block or {}, s.terrainPending
 local sp = math.sqrt(u.x ^ 2 + u.y ^ 2)
 local arr, road = nil, nil
 if sp > 5 then
-  local ok, list = pcall(require('beamngEarth/roads').ahead, p.x, p.y, u.x / sp, u.y / sp, 1500)
+  local ok, list = pcall(require('beamngEarth/roads').ahead, p.x, p.y, u.x / sp, u.y / sp, AHEAD_PROBE_M)
   if ok and list then
     for _, e in ipairs(list) do
       if not arr and not e.arrived then arr = e.d end
@@ -84,6 +100,9 @@ return jsonEncode({ t = os.clock(), x = p.x, y = p.y, mph = sp * 2.237, guard = 
   pready = tp and tp.ready and true or false, pask = tp and tp.sentAt and (s.clock - tp.sentAt) or nil,
   arrived = arr, roadLead = road })
 """
+# how far ahead the road tiles are looked for (BNGE_AHEAD_PROBE_M; road lead past it reads as no gap)
+AHEAD_PROBE_M = int(os.environ.get("BNGE_AHEAD_PROBE_M", "1500"))
+WATCH_LUA = WATCH_LUA.replace("AHEAD_PROBE_M", str(AHEAD_PROBE_M))
 
 
 def lua(code, timeout=30):
@@ -150,6 +169,24 @@ def heading_of(path):
     return math.degrees(math.atan2((lo1 - lo0) * kx, la1 - la0)) % 360
 
 
+def use_vehicle(model):
+    """The player's vehicle as `model` (a jbeam name), replaced in place when it is another one. The user, 2026-11-03:
+    "Instead of using a full car. Use a simple prop to reduce the chance of instability": the scripted driver places
+    the vehicle every frame, and a car's soft body blew up (NaN) at 150 mph under overpasses; the ball prop has a few
+    nodes. 'car' keeps whatever the session spawned."""
+    if model in (None, "", "car"):
+        return
+    got = lua(f"local v = getPlayerVehicle(0) if v and v:getJBeamFilename() == '{model}' then return 'same' end "
+              f"core_vehicles.replaceVehicle('{model}', {{}}) return 'replaced'")
+    for _ in range(20):
+        time.sleep(1)
+        if lua(f"local v = getPlayerVehicle(0) return tostring(v ~= nil and v:getJBeamFilename() == '{model}')") == "true":
+            break
+    else:
+        raise SystemExit(f"could not make the player vehicle a {model}")
+    print(f"vehicle: {model} ({got})", flush=True)
+
+
 def teleport(lat, lon, heading, wait_s=240):
     """The car to (lat, lon) facing heading, and the world around it built (the edge guard clear, the road tiles near)."""
     lua(f"beamngEarth_core.teleport({lat}, {lon}, nil, {{record = false}}) return 1")
@@ -197,6 +234,11 @@ class Watch(threading.Thread):
 
 
 def log_lines(since_pos):
+    if LOG_SSH and LOG_WIN:     # (shared read: the server has it open)
+        r = _win(f"$f = [IO.File]::Open(\"{WIN_LOG}\".Replace('$env:LOCALAPPDATA', $env:LOCALAPPDATA), 'Open', 'Read', "
+                 f"'ReadWrite'); $null = $f.Seek({int(since_pos)}, 0); $r = New-Object IO.StreamReader($f); "
+                 "[Console]::Out.Write($r.ReadToEnd()); $r.Close()")
+        return r.stdout.decode("utf-8", "replace").splitlines()
     if LOG_SSH:
         r = subprocess.run(["ssh", "-o", "BatchMode=yes", LOG_SSH,
                             f"tail -c +{since_pos + 1} ~/.cache/beamng-earth/logs/server.log"],
@@ -228,7 +270,8 @@ def summarize(rows, lines, drive):
     def pct(a, p):
         a = sorted(a)
         return round(a[min(len(a) - 1, int(p * len(a)))], 2) if a else None
-    lead = [r["arrived"] for r in moving if r.get("arrived") is not None]
+    # (every tile within the probe in: its whole length, not left out, which read the lead low)
+    lead = [r["arrived"] if r.get("arrived") is not None else AHEAD_PROBE_M for r in moving]
     geo = {}                    # slow road / trees geotiles (earthd ROAD_GEO_SLOW_S): build time and queue
     for l in lines:
         m = re.search(r"(road|trees) geotile \S+ in ([\d.]+) s \(queue ([\d.]+)[);]", l)
@@ -281,6 +324,8 @@ def main():
     ap.add_argument("--warm-first", action="store_true", help="drive the route once at 40 mph first (untimed)")
     ap.add_argument("--label", default=None)
     ap.add_argument("--bake", action="append", help="with --cold: a baked pack (.bnge) put in the fresh cache first")
+    ap.add_argument("--vehicle", default=os.environ.get("BNGE_DRIVE_VEHICLE", "ball"),
+                    help="the driven vehicle: a jbeam model ('ball': a simple prop, the default) or 'car' (the session's)")
     ap.add_argument("--accel", type=float, default=0.0, help="m/s^2: set off from a near standstill (0: at speed at once)")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
@@ -300,11 +345,14 @@ def main():
         speeds = [40.0] + speeds
     for i, mph in enumerate(speeds):
         label = f"{'custom' if a.start else a.route}_{int(mph)}mph" + ("_warmup" if a.warm_first and i == 0 else "")
+        if a.label:     # (each labelled run keeps its own data: runs with one --out overwrote each other's, 2026-11-03)
+            label = f"{a.label}_{label}"
         d = os.path.join(a.out, label)
         os.makedirs(d, exist_ok=True)
         start, end = ROUTES.get(a.route) if not a.start else (
             tuple(map(float, a.start.split(","))), tuple(map(float, a.end.split(","))))
         print(f"{label}: teleport to {start}", flush=True)
+        use_vehicle(a.vehicle)
         teleport(*start, 0.0)
         path = gps_path(start, end)
         prof = profile(path, mph, a.km, a.accel)

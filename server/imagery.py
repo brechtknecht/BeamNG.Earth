@@ -37,6 +37,7 @@ Output: DDS DXT1 with a full mip chain (write_dds): linear-light 2 x 2 levels, e
 (earthfast.dds_levels: the GPU's encoder when there is one) under our own header (DDSD_MIPMAPCOUNT,
 DDSCAPS_MIPMAP|COMPLEX).
 """
+from runtimeprofiler import step as profile_step
 import contextlib
 import hashlib
 import io
@@ -46,7 +47,7 @@ import os
 import struct
 import threading
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor
+from runtimeprofiler import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import numpy as np
@@ -192,9 +193,10 @@ class ImageryError(IOError):
     """Imagery could not be fetched (network or server errors, not a missing tile). deferred: a
     prefetch / background request the limiter dropped (a demand fetch may still get it)."""
 
-    def __init__(self, msg, deferred=False):
+    def __init__(self, msg, deferred=False, unavailable=False):
         super().__init__(msg)
         self.deferred = deferred
+        self.unavailable = unavailable      # the host's circuit breaker was open (netfetch logged that once)
 
 
 # netfetch errors of a non-demand request that a demand request would not get
@@ -441,6 +443,11 @@ class Imagery:
     # standing in, so a far-tile worker's texture (blockworker.far_tile, from the disk alone) is the one the server
     # would render, or none (the server renders it)
     strict = False
+    # finished_only: the finished tiles on disk alone (their directories the server's, _fin_sigs preset: its de-shadow
+    # and colour match applied): one missing, or with a correction still to come, fails the render (ImageryError) and
+    # nothing is made from a raw tile here (that would be the uncorrected picture, kept under the server's names).
+    # A far-tile worker's texture with the analyses on (blockworker._imagery, tex["fin"])
+    finished_only = False
 
     def __init__(self, cache_dir, chain=DEFAULT_CHAIN, fetch_workers=FETCH_WORKERS, mem_tiles=None,
                  tone=1.0, deshadow=None, colormatch=None, fetcher=None, leaf_on=True, season_mode="off"):
@@ -567,7 +574,8 @@ class Imagery:
             deferred = kind not in ("demand", "urgent") and isinstance(e, _DEFERRED)
             self._count(src.name + (":deferred" if deferred else ":skipped" if isinstance(e, netfetch.HostUnavailable)
                                     else ":error"))
-            raise ImageryError(f"imagery fetch failed: {url}: {e}", deferred) from None
+            raise ImageryError(f"imagery fetch failed: {url}: {e}", deferred,
+                               unavailable=isinstance(e, netfetch.HostUnavailable)) from None
         data = r.body
         with self._lock:
             self.fetch_ms.append(r.elapsed * 1000)
@@ -616,7 +624,8 @@ class Imagery:
                 deferred = kind not in ("demand", "urgent") and isinstance(e, _DEFERRED)
                 self._count(src.name + (":deferred" if deferred else ":skipped" if isinstance(e, netfetch.HostUnavailable)
                                         else ":error"))
-                raise ImageryError(f"imagery fetch failed: {url}: {e}", deferred) from None
+                raise ImageryError(f"imagery fetch failed: {url}: {e}", deferred,
+                               unavailable=isinstance(e, netfetch.HostUnavailable)) from None
             with self._lock:
                 self.fetch_ms.append(r.elapsed * 1000)
                 del self.fetch_ms[:-2000]
@@ -1297,6 +1306,14 @@ class Imagery:
         if not need:
             return out
         raw = self.tiles(need)
+        if self.finished_only:
+            # (no data there, a remembered 404 or outside the coverage probes: none, as for the server; one with
+            # data but not finished as the server finishes it fails the render)
+            if any(raw.get(k) is not None for k in need):
+                raise ImageryError(f"{sum(raw.get(k) is not None for k in need)} finished tile(s) not on disk")
+            for k in need:
+                out[k] = None
+            return out
         for k in need:
             t = raw.get(k)
             if t is None:
@@ -1339,6 +1356,7 @@ class Imagery:
         return tx0, ty0, nx, ny, {(tx, ty): (src, z, tx % n, ty) for ty in range(ty0, ty1 + 1)
                                   for tx in range(tx0, tx1 + 1)}
 
+    @profile_step('Imagery render')
     def render(self, frame, x0, y0, size, px, pending=None):
         """_render(); texels from a lazy source (NAIP) then take their large-scale colour from the rest of
         the chain (match_colours): NAIP's detail, USGS's colours, so the block's photo meets the far tiles
@@ -1346,12 +1364,14 @@ class Imagery:
         NAIP block was a darker, greener square, its water much darker)."""
         return self.render_where(EnuSquare(frame, x0, y0, size), px, pending)
 
+    @profile_step('Imagery render')
     def render_merc(self, z, x, y, px, pending=None):
         """render() of Web-Mercator tile (z, x, y) with a gutter(px) border: px x px, the tile itself covering texels
         g .. px - g on both axes (gutter_uv of its Mercator position), row 0 north (the far field's global tiles,
         farfield.GTile: the same texture for every anchor)."""
         return self.render_where(MercSquare(z, x, y, px), px, pending)
 
+    @profile_step('Imagery source assembly')
     def render_where(self, where, px, pending=None):
         """render() of a square (EnuSquare, MercSquare)."""
         rgb, used = self._render(where, px, pending)

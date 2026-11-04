@@ -118,6 +118,8 @@ You can help support development by reporting [issues](https://github.com/TecnaG
   vehicle menu work on it.
 - **Traffic**: stock BeamNG traffic and police can be switched on, and parked cars line the streets and fill
   parking lots (stock BeamNG parking).
+- Distant headlights and taillights move along the mapped roads at night while traffic is on, with density
+  following the local time. Returning to a recently viewed road keeps established lights bright.
 
 **Multiplayer (BeamMP, in testing)**
 - Play the real world together on a BeamMP server (every player runs the BeamNG.Earth app, which starts BeamMP with
@@ -158,7 +160,8 @@ You can help support development by reporting [issues](https://github.com/TecnaG
 
 **Interface and tools**
 - A slim status bar (street, town, country, and under it the loading progress of the ground, roads & buildings, trees and
-  distant land after a teleport), the Earth coordinates above the minimap, a connection banner when something is
+  distant land after a teleport; the names come from the map data the app downloads, your position is not sent to a
+  lookup service), the Earth coordinates above the minimap, a connection banner when something is
   wrong and the data credits on screen, as BeamNG UI apps in a ".Earth" app layout (based on Freeroam's;
   move or resize them in the UI apps editor), and a one-time welcome page about the project.
 - Settings in the pause menu, keybinds, in-game reports (notes and performance recordings to share), and a
@@ -181,10 +184,16 @@ You can help support development by reporting [issues](https://github.com/TecnaG
     about twice as many distant ground pieces).
   - **Ground photo** (1024 / 2048 / 4096): the sharpness of the aerial photo and the painted roads on the
     ground around you; from the next level load.
-  - **Tree density** and **Tree draw distance** (about 0.6 to 1.7 miles; 0.8 miles at Normal).
+  - **Tree density** (Lowest to Extreme) and **Tree draw distance** (about 0.5 to 1.7 miles; 0.8 miles at Normal).
   - **Building draw distance**: the simple far buildings, the skyline and far bridges (Near to Max, twice Normal's 1
     and 3 miles).
   - **Object detail**: how far out objects keep their detailed models (Game setting = the game's Mesh Quality).
+  - **Distant traffic lights**: moving headlights and taillights on distant roads (needs Roads and nighttime).
+    **Distant lights without traffic** keeps them on even when game traffic is off; otherwise they follow traffic.
+    Density follows road class, length and local hour, with quieter evenings and sparse overnight traffic.
+    Cars persist around the player when turning or zooming;
+    **Distant traffic quality** offers Low, Medium and High populations; lower levels reduce resource use.
+    Off-screen motion updates less often. See [the implementation guide](docs/DISTANT_TRAFFIC.md) for bounds.
   - **Grass and shrubs**, **Grass draw distance**, **Rocks**, **Street lamp lights**, **View distance** (the real
     horizon or a fixed distance).
   - What loads around you reaches the same distance in every direction (a circle; before it was a square, whose
@@ -226,7 +235,8 @@ connection (the map is downloaded while you play).
      "Allow executing", or `chmod +x`).
 2. **Run it** (with Steam running). A console window opens (like BeamMP's launcher); it copies the mod into the
    game, starts the world server and starts BeamNG.drive. Closing the game stops the server.
-   - **Linux, native game:** started with the grass patch (`tools/gcpatch`) already applied, no Steam launch
+   - **Linux, native game:** started with the engine patches (`tools/gcpatch`: grass kept across block moves,
+     with two more opt-in patches for testing) already applied, no Steam launch
      options needed.
    - **Linux, Windows build under Proton:** the AppImage sees the Proton setting and starts that build through
      Steam (the server runs natively). The `.exe` also works inside the game's Proton prefix (for example with
@@ -298,7 +308,8 @@ false positives); GitHub Actions (`.github/workflows/release.yml`) builds both a
 whenever `main` gets a `VERSION` without one. Release zip of the source: `python3 tools/package.py`.
 
 Tests: `cd server && python3 -m unittest discover -s tests -t tests` and
-`cd mod/tests && for f in test_*.lua; do luajit $f; done`.
+`cd mod/tests && for f in test_*.lua; do luajit $f; done` (no luajit: `pip install lupa`, then
+`python3 tools/run_lua_tests.py`).
 
 ## Multiplayer (BeamMP)
 
@@ -329,7 +340,8 @@ BeamNG.Earth runs on [BeamMP](https://beammp.com/) servers (in testing): drive t
      (a `BeamMP-Launcher` folder in your home folder or one folder down, e.g. `~/Games/BeamMP-Launcher`, or
      `~/.local/share`; or answer "Have it already", or set `BEAMMP_LAUNCHER`).
    - The setting **Start BeamMP with BeamNG.Earth** (Pause menu > BeamNG.Earth > Multiplayer) turns this off or
-     back on; `--no-beammp` starts the game without BeamMP once.
+     back on; `--no-beammp` starts the game without BeamMP once. If BeamMP is not ready within 30 seconds the app
+     stops it and carries on in single player (`--beammp-wait SECONDS` waits longer, up to 600).
 2. In the game: main menu > More > BeamMP, log in (an account or a guest).
 3. Pick the **BeamNG.Earth** category in BeamMP's server browser: the servers running BeamNG.Earth (search,
    filters, favorites and details as for the other servers), the official server at the top. They are listed only there, for players who have BeamNG.Earth. A private server: Direct Connect with its address (the
@@ -344,9 +356,16 @@ world map (**M**) as green arrows; players far away (another country) are hidden
 you watch keeps the damage your own game worked out; a car that crashed out of your sight takes on its owner's damage
 (broken parts and dents) once it comes within about 0.6 miles.
 
-Each player's app builds the world around them on their own computer.
+Each player's app builds the world around them on their own computer. **Sharing the work** (in testing): the BeamMP
+server keeps what its players build of the slowest part of the world, the road levelling plans of each map area
+(compressed, a few hundred KB each), and sends it to every player who comes there later, this session or the next. A
+player near the others gets much of it from the server instead of building it, which is quickest on slower
+computers. It all goes through the BeamMP connection itself, nothing to set up or forward, and only between players
+running the same BeamNG.Earth version with the same settings. A server can also hold baked packs of whole areas (put
+`.bnge` files in `Resources/Server/BeamNGEarth/bake/`), and the machine running the server can build ahead of
+the players itself (the share helper, below).
 
-<!-- Shared world building: commented out 2026-10-27 (off since 2026-10-23; not coming back for a while).
+<!-- v1 shared world building: commented out 2026-10-27 (off since 2026-10-23; not coming back for a while).
 **Sharing the work** (turned off for now: each player builds their own world)**:** players near each other share one
 world origin and split the building of the distant landscape (each piece is built once and sent to the others; faster computers take more), while a player far from
 everyone builds their own. For that the other players must reach your computer on a TCP port, 47621 unless the server
@@ -366,7 +385,21 @@ players use Direct Connect. The plugin lists the server once a minute with `curl
 Update the server zip with every release: it carries the mod the server sends to players. The server's time and weather for everyone
 (`G.TIME`: real or a fixed / running time such as `'20:30'`; `G.WEATHER`: real or clear, cloudy, rain, storm, snow,
 fog) are set near the top of `Resources/Server/BeamNGEarth/main.lua`. The server needs no world data and
-little CPU. From the source, `python3 tools/package.py --beammp` builds the same zip.
+little CPU. From the source, `python3 tools/package.py --beammp` builds the same zip. Releases may also carry
+ready-made host bundles (`BeamNG.Earth-Host-<version>-Windows.zip` / `-Linux-x86_64.zip`, built by
+`tools/build_host.py`): the zip above plus BeamMP's own unmodified server program (v3.9.3, checked against the
+checksum BeamMP publishes), its licence and source, and a `ServerConfig.toml` with an empty AuthKey for your own.
+
+**Shared road plans** (experimental, off by default): `BeamNG.Earth --world-cache export|serve|fetch|verify` packs
+the road plans one machine has built into a checked bundle that other players can fetch and reuse, so their
+companions skip planning those roads; see [docs/SHARED_WORLD.md](docs/SHARED_WORLD.md).
+
+The server keeps its players' shared world building in `Resources/Server/BeamNGEarth/store` (up to `G.SHARE_STORE_MB`,
+2 GB by default; the pieces used longest ago go first) and sends at most `G.SHARE_OUT_KBPS` (1 MB/s) of it, both near
+the top of `main.lua`. **Share helper** (in testing): to let the server's machine build ahead of its players, run
+BeamNG.Earth's world server next to it, from the source:
+`python3 server/sharehelper.py --share-dir <BeamMP server>/Resources/Server/BeamNGEarth --cache <a folder for its map
+data> --procs 4`. It needs the same BeamNG.Earth version as the players and a few GB of disk for each area.
 
 ## Data sources and attribution
 The repository contains only code; all map data is downloaded at runtime and cached locally.

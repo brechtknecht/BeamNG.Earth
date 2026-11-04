@@ -35,6 +35,60 @@ def way_id(record):
     return m.group(1) if m else None
 
 
+class Ways:
+    """A shard's "ways" ({way id: tags}) kept compact: the ids sorted (int64) and each way's tags an index into the
+    shard's distinct tag sets. A dense shard decoded to ~57 MB of Python objects for 156k ways in every server process
+    that read it (rail and lane tags: 1-2 GB over a Steam Deck's ~9 processes, 2026-11-02); the same lookups. The tags
+    handed out are shared: read them, do not change them."""
+
+    def __init__(self, ways):
+        tags, at, ids, idx = [], {}, [], []
+        for k in sorted(ways, key=int):
+            t = ways[k]
+            sig = tuple(sorted(t.items())) if isinstance(t, dict) else ("", repr(t))
+            n = at.get(sig)
+            if n is None:
+                n = at[sig] = len(tags)
+                tags.append(t)
+            ids.append(int(k))
+            idx.append(n)
+        self.ids = np.array(ids, np.int64)
+        self.idx = np.array(idx, np.int32)
+        self.tags = tags
+
+    @staticmethod
+    def of(ways):
+        """A Ways of a shard's ways dict, or the dict itself when an id is not a plain number."""
+        if not isinstance(ways, dict) or not all(isinstance(k, str) and k.isdigit() for k in ways):
+            return ways
+        return Ways(ways)
+
+    def get(self, key, default=None):
+        try:
+            k = int(key)
+        except (TypeError, ValueError):
+            return default
+        i = int(np.searchsorted(self.ids, k))
+        if i < len(self.ids) and self.ids[i] == k:
+            return self.tags[self.idx[i]]
+        return default
+
+    def get_many(self, keys):
+        """[tags or None] of each key (one search for all)."""
+        ks = np.array([int(k) if isinstance(k, str) and k.isdigit() else -1 for k in keys], np.int64)
+        if not len(ks) or not len(self.ids):
+            return [None] * len(ks)
+        i = np.minimum(np.searchsorted(self.ids, ks), len(self.ids) - 1)
+        hit = self.ids[i] == ks
+        return [self.tags[self.idx[j]] if h else None for j, h in zip(i.tolist(), hit.tolist())]
+
+    def __len__(self):
+        return len(self.ids)
+
+    def __bool__(self):
+        return len(self.ids) > 0
+
+
 class Shards:
     """A dataset of BeamNG.Earth-data's GitHub Pages (name: its folder, e.g. "rail", "fra"): z7 shards
     <PAGES>/<name>/<x>/<y>.json.gz and its manifest, each shard fetched once and kept on disk per build."""
@@ -52,8 +106,24 @@ class Shards:
         self.down_at = 0.0
 
     def known(self):
-        """The build in use as far as known without asking the network (versions(): every tile's cache key)."""
-        return self.built
+        """The build in use as far as known without asking the network (versions(): every tile's cache key); before
+        this run has asked for it, the last build pinned on disk. (None until the manifest came: the tiles built in
+        a run's first minutes had other keys than the same tiles built later, in the revisit cache: a warm drive
+        rebuilt and stored again ~1.5 GB of far tiles, 2026-11-04.)"""
+        if self.built is not None or not ON:
+            return self.built
+        got = getattr(self, "_pinned", False)
+        if got is False:
+            got = None
+            pin = os.path.join(self.dir, "manifest.json") if self.dir else None
+            if pin and os.path.exists(pin):
+                try:
+                    with open(pin, encoding="utf-8") as fh:
+                        got = json.load(fh).get("built")
+                except (OSError, ValueError):
+                    got = None
+            self._pinned = got
+        return self.built if self.built is not None else got
 
     def version(self):
         """The build in use ("built" of its manifest), or None (none reachable yet)."""
@@ -138,6 +208,8 @@ class Shards:
                 with open(path + ".part", "wb") as fh:
                     fh.write(body if body is not None else gzip.compress(b"{}"))
                 os.replace(path + ".part", path)
+        if isinstance(got, dict) and isinstance(got.get("ways"), dict):
+            got["ways"] = Ways.of(got["ways"])
         with self.lock:
             self.shards[(x, y)] = got
         return got
@@ -168,8 +240,8 @@ class RailTags(Shards):
         ways = sh.get("ways", {})
         rec = feats.attrs.get("src_record")
         cols = {c: np.full(len(feats), None, object) for c in COLUMNS}
-        for i in rail:
-            t = ways.get(way_id(str(rec[i])) or "") if rec is not None else None
+        found = _tags_of(ways, [way_id(str(rec[i])) or "" for i in rail]) if rec is not None else []
+        for i, t in zip(rail, found):
             if t:
                 for c in COLUMNS:
                     cols[c][i] = t.get(c)
@@ -189,6 +261,13 @@ LANE_COLUMNS = ("turn:lanes", "turn:lanes:forward", "turn:lanes:backward", "turn
                 "lanes:forward", "lanes:backward", "lanes:both_ways", "overtaking", "overtaking:forward",
                 "overtaking:backward", "divider", "lane_markings", "bus:lanes", "busway", "hov:lanes",
                 "junction")     # (roundabout rings: roads._rings, attrs osm_junction)
+
+
+def _tags_of(ways, keys):
+    """[tags or None] of each way id key (a Ways or a plain dict)."""
+    if isinstance(ways, Ways):
+        return ways.get_many(keys)
+    return [ways.get(k) if k else None for k in keys]
 
 
 def lane_attr(key):
@@ -215,8 +294,7 @@ class LaneTags(Shards):
         rec = feats.attrs.get("src_record")
         cols = {c: np.full(len(feats), None, object) for c in LANE_COLUMNS}
         if rec is not None and ways:
-            for i in road:
-                t = ways.get(way_id(str(rec[i])) or "")
+            for i, t in zip(road, _tags_of(ways, [way_id(str(rec[i])) or "" for i in road])):
                 if t:
                     for c in LANE_COLUMNS:
                         if c in t:

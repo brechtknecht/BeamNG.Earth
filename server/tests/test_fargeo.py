@@ -227,7 +227,11 @@ class RealDataTest(unittest.TestCase):
         # (both put back after: left off, every later test in the run had no revisit cache, and test_grading /
         # test_plancache / test_revisit failed in the full suite only)
         import railways
+        import roadz
         self.addCleanup(setattr, revisit, "ON", revisit.ON)
+        # (_State sets the measured road heights' provider: left set, test_grading's far-apart points read a cell more
+        # in the full suite only, 31 of 30)
+        self.addCleanup(setattr, roadz, "PROVIDER", roadz.PROVIDER)
         self.addCleanup(setattr, revisit, "CACHE_DIR", revisit.CACHE_DIR)      # (_State points it at CACHE)
         self.addCleanup(setattr, railways, "COARSE_AT", railways.COARSE_AT)
         self.addCleanup(setattr, bw, "_s", getattr(bw, "_s", None))
@@ -251,7 +255,7 @@ class RealDataTest(unittest.TestCase):
         near = {}
         for k in keys[5:7]:
             t = geotiles.geobox(*k)
-            items = buildings.road_tile_items(t.frame, t, None, bw._s.md, raw)
+            items, _custom = buildings.road_tile_items(t.frame, t, None, bw._s.md, raw)
             near[k] = {s.seed for s, _a, _b in items}
             for i in near[k]:
                 self.assertIn(seen.get(i, k), (k,), "a road geotile's building in another key's far tile")

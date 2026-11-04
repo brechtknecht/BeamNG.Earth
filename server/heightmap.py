@@ -23,6 +23,7 @@ functions that depend on the block size take it as a parameter (`size`, samples 
 Layout's `block`), defaulting to SIZE; nothing reads a module setting at call time. The far field's near tiles keep a
 2 m lattice (FAR_SQUARE): every second block sample, the same values.
 """
+from runtimeprofiler import step as profile_step
 import math
 import os
 import struct
@@ -267,9 +268,11 @@ def write_png(path, u, q=Q_DEFAULT):
     qgrid = np.clip(g, 0, 65535).astype(np.uint16)
     img = Image.fromarray(np.ascontiguousarray(qgrid[::-1]))   # flip: row 0 = north (max gy)
     tmp = staging.tmp_for(path)
-    # Uncompressed: the game decodes it on the main thread during the terrain-follow commit,
-    # and level 0 imports ~7 ms faster than level 1 (43 vs 50 ms for 1024², measured in-game).
-    img.save(tmp, format="PNG", compress_level=0)
+    # Deflate level 1: 1.2 MB in 29 ms here, level 0 2.1 MB in 55 ms (1024², 2026-11-04). The game decodes it only
+    # when it imports a block (an anchor's first, or when the .ter swap cannot be used: terrain.lua swap); level 0
+    # imported ~7 ms faster (43 vs 50 ms) when every commit imported, now a few per session. The rest of the time it
+    # was ~0.3 GB of SSD writes in a warm 8 min drive at 150 mph.
+    img.save(tmp, format="PNG", compress_level=1)
     staging.replace(tmp, path)
     return q, z_base, max_height, qgrid
 
@@ -325,6 +328,7 @@ def height_at(qgrid, z_base, max_height, cx, cy, x, y, square=SQUARE):
     return float((h[0, 0] * (1 - wx) + h[0, 1] * wx) * (1 - wy) + (h[1, 0] * (1 - wx) + h[1, 1] * wx) * wy)
 
 
+@profile_step('Heightmap generation')
 def generate(frame, elev_fn, path, cx=0.0, cy=0.0, ground_at=(0.0, 0.0), q=Q_DEFAULT, size=SIZE, keep=None,
              chunks=None):
     """Build the size² block centred at (cx, cy) with height quantum q and write it to path.

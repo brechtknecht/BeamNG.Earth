@@ -41,6 +41,7 @@ user name, e-mail, machine name, location or session id is ever sent.
 """
 import collections
 import concurrent.futures
+import ioprofiler
 import email.utils
 import http.client
 import json
@@ -668,16 +669,30 @@ class HttpsTransport:
         self._tls_context = windows_ssl_context()
 
     # --- proxy helpers ---------------------------------------------------------------
-    @staticmethod
-    def _resolve_proxy(scheme, host):
+    SYSTEM_PROXIES_S = 60.0     # the system's proxy settings (getproxies: the registry on Windows) read at most this often
+
+    _system = {"fn": None, "at": float("-inf"), "val": {}}
+
+    @classmethod
+    def _system_proxies(cls):
+        """urllib.request.getproxies(), kept SYSTEM_PROXIES_S: it was read up to three times per request (on Windows
+        from the registry), every tile's download (2026-11-02). A different getproxies (a test's mock) is read anew."""
+        fn, now, got = urllib.request.getproxies, time.monotonic(), cls._system
+        if got["fn"] is not fn or now - got["at"] > cls.SYSTEM_PROXIES_S:
+            try:
+                val = fn() or {}
+            except Exception:
+                val = {}
+            got.update(fn=fn, at=now, val=val)
+        return got["val"]
+
+    @classmethod
+    def _resolve_proxy(cls, scheme, host):
         """Return (proxy_host, proxy_port, proxy_user, proxy_pass) or None when no proxy applies."""
         # NO_PROXY / no_proxy: comma-separated list of hosts (or suffixes) to bypass.
         no_proxy = os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or ""
         if not no_proxy:
-            try:
-                no_proxy = urllib.request.getproxies().get("no", "")
-            except Exception:
-                no_proxy = ""
+            no_proxy = cls._system_proxies().get("no", "") or ""
         for entry in (e.strip() for e in no_proxy.split(",") if e.strip()):
             if entry == "*" or host == entry or host.endswith("." + entry):
                 return None
@@ -687,10 +702,8 @@ class HttpsTransport:
             if val:
                 break
         else:
-            try:
-                val = urllib.request.getproxies().get(scheme) or urllib.request.getproxies().get("all")
-            except Exception:
-                val = None
+            sysp = cls._system_proxies()
+            val = sysp.get(scheme) or sysp.get("all")
         if not val:
             log.debug("net: no proxy for %s (no env var / system proxy)", host)
             return None
@@ -778,6 +791,7 @@ class HttpsTransport:
                 else:
                     conn.request("GET", path, headers=req_headers)
                 r = conn.getresponse()
+                ioprofiler.headers_received()
                 body = r.read()
                 return r.status, {k.lower(): v for k, v in r.getheaders()}, body
             except (http.client.HTTPException, OSError):
@@ -1043,18 +1057,18 @@ class Fetcher:
         its socket gives up, not the caller. Nothing in hedge_deadline: TimeoutError, the attempt has failed."""
         p = h.policy
         if not HEDGE or not p.hedge_s:
-            return self.transport.request(url, hd, p.timeout)
+            return ioprofiler.request(self.transport, url, hd, p.timeout)
         with self._lock:
             if self._hedge_pool is None:
                 self._hedge_pool = concurrent.futures.ThreadPoolExecutor(HEDGE_THREADS, thread_name_prefix="net-hedge")
             pool = self._hedge_pool
-        first = pool.submit(self.transport.request, url, hd, p.timeout)
+        first = pool.submit(ioprofiler.request, self.transport, url, hd, p.timeout)
         done, _ = concurrent.futures.wait([first], timeout=p.hedge_s)
         if done:
             return first.result()
         self._count(h, "requests")
         self._bump(h, "retries")
-        pending = {first, pool.submit(self.transport.request, url, hd, p.timeout)}
+        pending = {first, pool.submit(ioprofiler.request, self.transport, url, hd, p.timeout)}
         end, err = time.monotonic() + max(0.0, p.hedge_deadline - p.hedge_s), None
         while pending:
             done, pending = concurrent.futures.wait(pending, timeout=max(0.0, end - time.monotonic()),
@@ -1183,6 +1197,7 @@ class Fetcher:
         if h.breaker.success():
             log.info("net: %s: circuit closed", h.name)
 
+    @ioprofiler.session_request
     @contextmanager
     def session(self, url, kind="demand"):
         """For a caller that does its own HTTP (gravity.py's resumable download through urllib, which

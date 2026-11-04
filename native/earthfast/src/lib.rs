@@ -1,6 +1,8 @@
 //! Geometry kernels for the world server (server/fast.py wraps them, with the Python versions as the fallback).
 //! All coordinates are metres in the anchor's local frame, f64.
+mod cdaez;
 mod gpu;
+mod traffic;
 mod dsm;
 mod vegmask;
 mod roadgeom;
@@ -15,6 +17,7 @@ mod tunnelcover;
 mod gradesep;
 mod lamps;
 mod decks;
+mod levels;
 mod tapers;
 mod islands;
 mod ribbons;
@@ -5300,6 +5303,7 @@ fn earthfast(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(underpass::underpass_offsets, m)?)?;
     m.add_function(wrap_pyfunction!(coarseease::ease_coarse, m)?)?;
     m.add_function(wrap_pyfunction!(junctionsnap::snap_junctions, m)?)?;
+    m.add_function(wrap_pyfunction!(junctionsnap::hold_junction_corridors, m)?)?;
     m.add_function(wrap_pyfunction!(bc7_encode_gpu, m)?)?;
     m.add_function(wrap_pyfunction!(tunnelcover::tunnel_cover_roads, m)?)?;
     m.add_function(wrap_pyfunction!(tunnelcover::tunnel_reach, m)?)?;
@@ -5320,6 +5324,9 @@ fn earthfast(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(tapers::lane_flow, m)?)?;
     m.add_function(wrap_pyfunction!(tapers::lane_shifts, m)?)?;
     m.add_function(wrap_pyfunction!(decks::deck_gaps, m)?)?;
+    m.add_function(wrap_pyfunction!(decks::deck_tents, m)?)?;
+    m.add_function(wrap_pyfunction!(levels::tag_level_ranges, m)?)?;
+    m.add_function(wrap_pyfunction!(gradesep::gradesep_gather, m)?)?;
     m.add_function(wrap_pyfunction!(decks::deck_end_on, m)?)?;
     m.add_function(wrap_pyfunction!(decks::deck_pad, m)?)?;
     m.add_function(wrap_pyfunction!(decks::deck_pad_rim, m)?)?;
@@ -5451,6 +5458,8 @@ fn earthfast(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(farglobal::far_clip_mesh, m)?)?;
     m.add_function(wrap_pyfunction!(geocontent::geo_owns, m)?)?;
     m.add_function(wrap_pyfunction!(geocontent::clip_tris_convex, m)?)?;
+    m.add_function(wrap_pyfunction!(cdaez::cdae_pack, m)?)?;
+    m.add_function(wrap_pyfunction!(cdaez::cdae_unpack, m)?)?;
     m.add_function(wrap_pyfunction!(geocontent::cdae_zstats, m)?)?;
     m.add_function(wrap_pyfunction!(geocontent::cdae_shear, m)?)?;
     m.add_function(wrap_pyfunction!(geocontent::clip_segments_convex, m)?)?;
@@ -5460,6 +5469,7 @@ fn earthfast(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(fartex::season_img, m)?)?;
     m.add_function(wrap_pyfunction!(fartex::dds_levels, m)?)?;
     m.add_function(wrap_pyfunction!(fartex::jpeg_rgb, m)?)?;
-    m.add("VERSION", 140)?;
+    m.add_class::<traffic::Routes>()?;
+    m.add("VERSION", 145)?;
     Ok(())
 }

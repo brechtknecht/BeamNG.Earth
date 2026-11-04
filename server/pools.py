@@ -9,6 +9,7 @@ import functools
 import collections
 import concurrent.futures
 import logging
+import runtimeprofiler
 import threading
 import time
 from concurrent.futures import ProcessPoolExecutor
@@ -39,6 +40,24 @@ def result_running(fut, timeout, waited=None):
     return fut.result(timeout=timeout)
 
 
+def _call(fn, args, kwargs):
+    """A job in the worker, then its memory ceiling (budget.maybe_shed: on a small machine a worker over it drops its
+    caches between jobs)."""
+    try:
+        return fn(*args, **kwargs)
+    finally:
+        try:
+            import budget
+            budget.maybe_shed()
+        except Exception:
+            pass
+
+
+def _shedding(submit):
+    """pool.submit with every job wrapped in _call."""
+    return lambda fn, *args, **kwargs: submit(_call, fn, args, kwargs)
+
+
 class RespawningPool:
     """ProcessPoolExecutor(*args, **kwargs) made again when broken. submit / shutdown as the executor's."""
 
@@ -66,9 +85,9 @@ class RespawningPool:
         with self._lock:
             pool = self._pool
         try:
-            fut = pool.submit(fn, *args, **kwargs)
+            fut = runtimeprofiler.collector.submit(_shedding(pool.submit), self.name, fn, args, kwargs)
         except BrokenProcessPool:
-            fut = self._renew(pool).submit(fn, *args, **kwargs)
+            fut = runtimeprofiler.collector.submit(_shedding(self._renew(pool).submit), self.name, fn, args, kwargs)
         with self._count_lock:
             self.inflight += 1
         fut.add_done_callback(self._done)

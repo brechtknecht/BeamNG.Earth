@@ -15,6 +15,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -1085,12 +1086,48 @@ class SessionCleanupTest(unittest.TestCase):
                 self.assertFalse(os.path.exists(old))
                 self.assertFalse(os.path.exists(cache))
                 self.assertTrue(os.path.exists(foreign))
-                # moved out of the game's folder before the delete (one notification for its file watcher, not one a
-                # file), and gone from the trash too
+                # moved out of the game's folder (one rename, at the start), and gone from the trash too (the trash
+                # thread deletes it)
                 trash = os.path.join(tmp, "cache", earthd.TRASH_DIR)
                 self.assertTrue(os.path.isdir(trash))
+                self.assertIsNotNone(server.trash_thread)
+                server.trash_thread.join(10)
                 self.assertEqual(os.listdir(trash), [])
                 self.assertEqual(server.cdae_dir, os.path.join(tmp, "temp", "temp", "beamngearth", server.sid.lower()))
+            finally:
+                server.tile_pool.shutdown()
+                server.hm_pool.shutdown()
+
+
+class TrashLeftoversTest(unittest.TestCase):
+    """GitHub #599 (GBs of old sessions): a server ended mid-delete (the game closing ends it) left the rest of a session
+    in the cache's trash for good. The next start deletes it, but not a running server's own delete."""
+
+    def test_leftovers_deleted_at_start_a_live_servers_kept(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            trash = os.path.join(tmp, "cache", earthd.TRASH_DIR)
+            dead = os.path.join(trash, "20261028-204450-0eea_999999999_123")      # (no such pid)
+            live = os.path.join(trash, f"20261030-101010-beef_{os.getppid()}_456")  # a process that runs
+            odd = os.path.join(trash, "something-else")
+            for d in (dead, live, odd):
+                os.makedirs(os.path.join(d, "sub"))
+                open(os.path.join(d, "sub", "far_1_0_0_0.cdae"), "w").close()
+            server = earthd.Server(tmp, os.path.join(tmp, "cache"))
+            try:
+                self.assertIsNotNone(server.trash_thread)
+                server.trash_thread.join(10)
+                self.assertFalse(os.path.exists(dead), "left by a run that ended mid-delete")
+                self.assertFalse(os.path.exists(odd))
+                self.assertTrue(os.path.exists(live), "another server's delete under way")
+            finally:
+                server.tile_pool.shutdown()
+                server.hm_pool.shutdown()
+
+    def test_nothing_there(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = earthd.Server(tmp, os.path.join(tmp, "cache"))
+            try:
+                self.assertIsNone(server.trash_thread)
             finally:
                 server.tile_pool.shutdown()
                 server.hm_pool.shutdown()
@@ -1148,6 +1185,77 @@ class DeleteQueueTest(unittest.TestCase):
         self.assertLess(len(times), 2.0 * earthd.DELETE_MAX_RATE + 5)
         dt = np.diff(times)
         self.assertGreater(float(np.median(dt)), 0.5 / earthd.DELETE_MAX_RATE)
+
+
+class _GeoConn:
+    def __init__(self, roads):
+        self.roads = roads
+
+
+class GeoFilesTest(unittest.TestCase):
+    """GitHub #599: a geotile every game dropped loses its session files after GEO_FILES_GRACE_S (a road geotile's
+    content, skins and exact variants; a far geotile's json, shape and pieces), unless one has it again; an anchor's
+    pruned files include its geotile skins (rs_ / rx_) and its rail and tunnel shapes."""
+
+    def make(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        server = earthd.Server(tmp.name, os.path.join(tmp.name, "cache"), near_visual="mesh", imagery=None)
+        self.addCleanup(server.tile_pool.shutdown)
+        self.addCleanup(server.hm_pool.shutdown)
+        os.makedirs(server.out_dir, exist_ok=True)
+        return server
+
+    def touch(self, server, *names):
+        for n in names:
+            open(os.path.join(server.out_dir, n), "w").close()
+
+    def test_files_of_a_geotile(self):
+        s = self.make()
+        mine = ["rg_g17_5_7.json", "rg_g17_5_7.skin.pkl", "rg_g17_5_7_bld.cdae", "rs_1_g17_5_7.json",
+                "rs_12_g17_5_7_road.cdae", "rx_3_g17_5_7_deck.cdae"]
+        others = ["rg_g17_5_77.json", "rg_g17_55_7_bld.cdae", "rs_1_g17_5_70_road.cdae", "bf_g17_5_7.json"]
+        self.touch(s, *mine, *others)
+        self.assertEqual([os.path.basename(p) for p in s.geo_files("roads", "g17_5_7")], sorted(mine))
+        self.touch(s, "bb_g15_2_3.json", "bb_g15_2_3_g17_8_12.cdae", "bb_g15_2_33.json")
+        self.assertEqual([os.path.basename(p) for p in s.geo_files("brfar", "g15_2_3")],
+                         ["bb_g15_2_3.json", "bb_g15_2_3_g17_8_12.cdae"])
+        self.assertEqual(s.geo_files("veg", "g15_2_3"), [])
+
+    def test_dropped_then_deleted_unless_held(self):
+        s = self.make()
+        gone = ["rg_g17_5_7.json", "rg_g17_5_7_road.cdae"]
+        held = ["rg_g17_6_7.json"]
+        self.touch(s, *gone, *held)
+        s.connections.add(_GeoConn(types.SimpleNamespace(geo=True, sent={(6, 7)}, building=set())))
+
+        async def run():
+            s.geo_dropped("roads", (5, 7), "g17_5_7", grace=0.05)
+            s.geo_dropped("roads", (6, 7), "g17_6_7", grace=0.05)      # (another game still has it)
+            await asyncio.sleep(1.0)
+        asyncio.run(run())
+        for n in gone:
+            self.assertFalse(os.path.exists(os.path.join(s.out_dir, n)), n)
+        self.assertTrue(os.path.exists(os.path.join(s.out_dir, held[0])))
+
+    def test_sent_again_before_its_turn_keeps_its_files(self):
+        s = self.make()
+        self.touch(s, "rg_g17_5_7.json")
+        tracker = types.SimpleNamespace(geo=True, sent=set(), building=set())
+        s.connections.add(_GeoConn(tracker))
+        s.delete_queue.extend([("x", None)] * 5)        # (a queue ahead of it)
+
+        async def run():
+            s.geo_dropped("roads", (5, 7), "g17_5_7", grace=0.01)
+            await asyncio.sleep(0.05)
+            tracker.building.add((5, 7))                    # requested again meanwhile
+            await asyncio.sleep(1.5)
+        asyncio.run(run())
+        self.assertTrue(os.path.exists(os.path.join(s.out_dir, "rg_g17_5_7.json")))
+
+    def test_prune_takes_the_anchors_skins_and_rails(self):
+        for stem in ("rs", "rx", "rail", "railcol", "tunnel"):
+            self.assertIn(stem, earthd.ANCHOR_TILE_FILES)
 
 
 class WarmPlaceTest(unittest.TestCase):
@@ -1295,6 +1403,42 @@ class PredictTest(unittest.TestCase):
                     self.assertEqual(earthd.predict_request(px, py, vx, vy, cx, cy, rule),
                                      mod_request(px, py, vx, vy, cx, cy), (cx, cy, vx, vy, t))
         self.assertGreater(n, 40)
+
+
+
+class MachineProfileTest(unittest.TestCase):
+    """earthd.machine_profile: a small machine gets the small process counts and the analyses off (from 1.7.3 to
+    1.8.1 that only happened with the BNGE_FAST_BASE_V A/B switch set)."""
+
+    def _args(self):
+        import argparse
+        return argparse.Namespace(road_processes=earthd.ROAD_PROCESSES, workers=earthd.WORKERS, deshadow="full",
+                                  colormatch="s2")
+
+    def test_small(self):
+        import budget
+        old = earthd.FAST_BASE_V
+        try:
+            a = self._args()
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("BNGE_FAST_BASE_V", None)
+                earthd.machine_profile(a, True)
+            self.assertEqual(a.road_processes, budget.SMALL_ROAD_PROCESSES)
+            self.assertEqual(a.workers, budget.SMALL_FAR_WORKERS)
+            if budget.SMALL_ANALYSES_OFF:
+                self.assertEqual((a.deshadow, a.colormatch), ("off", "off"))
+            self.assertEqual(earthd.FAST_BASE_V, earthd.SMALL_FAST_BASE_V)
+        finally:
+            earthd.FAST_BASE_V = old
+
+    def test_desktop(self):
+        import budget
+        a = self._args()
+        with mock.patch.object(budget, "road_processes", return_value=4):
+            earthd.machine_profile(a, False)
+        self.assertEqual(a.road_processes, 4)
+        self.assertEqual(a.workers, earthd.WORKERS)
+        self.assertEqual((a.deshadow, a.colormatch), ("full", "s2"))
 
 
 if __name__ == "__main__":

@@ -168,6 +168,32 @@ for _ = 1, 20 do trees.update(3, { x = 50, y = 50 }) end
 T.check(count() == 20 and trees.status().tiles == 1, 'drained over frames, the kept tile untouched')
 trees.SHAPE_ITEMS_PER_FRAME = saved
 trees.clear()
+
+-- new shapes (never made this session) come one a frame while driving (a frame budget under LOADING_FRAME_MS): their
+-- first items load the shape in the engine's tick (75-255 ms frames, Windows 2026-11-03); any number while loading
+local savedF = trees.FORESTS_PER_FRAME
+trees.FORESTS_PER_FRAME = 99   -- (new Forests have a limit of their own: not this test's)
+trees.reset()
+tile('0_0', 4, 10)
+tile('0_1', 25, 10)
+trees.update(3, { x = 50, y = 50 }, nil, 4.0)
+T.check(count() == 10, 'driving: one new shape a frame (' .. count() .. ')')
+trees.update(3, { x = 50, y = 50 }, nil, 4.0)
+T.check(count() > 10 and count() < 20, 'driving: the next new shape the frame after (the tall tile has two)')
+trees.update(3, { x = 50, y = 50 }, nil, 4.0)
+T.check(count() == 20, 'driving: its third shape the frame after that')
+tile('1_0', 4, 10)
+tile('1_1', 25, 10)
+trees.update(3, { x = 50, y = 50 }, nil, 4.0)
+T.check(count() == 40, 'shapes made before: not new, both in one frame (' .. count() .. ')')
+trees.clear()
+trees.reset()
+tile('0_0', 4, 10)
+tile('0_1', 25, 10)
+trees.update(3, { x = 50, y = 50 }, nil, trees.LOADING_FRAME_MS)
+T.check(count() == 20, 'loading: every new shape at once (' .. count() .. ')')
+trees.clear()
+trees.FORESTS_PER_FRAME = savedF
 trees.SHAPE_VARIANTS = savedV
 
 -- shape path variants: the same file spelled differently (the engine counts them as shapes of their own)
@@ -181,6 +207,23 @@ do
   end
   T.check(trees.tileVariant('1:0_0') ~= trees.tileVariant('1:1_0') and trees.tileVariant('1:0_0') ~= trees.tileVariant('1:0_1'),
     'neighbouring tiles: different variants')
+end
+
+-- a rare prop's group keeps one spelling in every tile (each spelling is a first load: 40-130 ms on Windows); trees
+-- keep the tile's variant
+do
+  T.check(trees.tileVariant('5:1_0') > 0, 'a tile with a variant')
+  files['/t/dv'] = '{ groups = { "door", "deciduous" }, items = { {0, 5, 10, 5, 0, 1, 2.2, 0.0}, {1, 6, 10, 5, 0, 1, 12, 0.0} } }'
+  trees.onTile({ anchorId = 5, key = '1_0', path = '/t/dv', n = 2 }, 5)
+  trees.update(5, { x = 300, y = 50 })
+  local door, tree = nil, nil
+  for it in pairs(items) do
+    local name = tostring(it.d and (it.d.shapeFile or it.d.name or it.d))
+    if name:find('door') then door = name elseif name:find('tree') then tree = name end
+  end
+  T.check(door ~= nil and not door:find('___', 1, true), 'a door: its one spelling (' .. tostring(door) .. ')')
+  T.check(tree ~= nil and tree:find('___', 1, true) ~= nil, 'a tree: the tile\'s variant (' .. tostring(tree) .. ')')
+  trees.clear()
 end
 
 -- bushes only near the player
@@ -449,6 +492,17 @@ do -- the median barriers' groups (server guardrails.GROUPS): shapes at scale 1,
   end
   T.check(trees.isBarrier('guardrail_back_end') and not trees.isBarrier('deciduous') and not trees.isBarrier(nil),
     'guard rails are barriers, trees not')
+end
+do -- stock world props (server worldprops.py): the catalog height is the mesh, so that height is 1:1
+  local props = {
+    { 'celltower', 28.93 }, { 'watertower', 26.16 }, { 'barn', 8.41 }, { 'container', 2.59 }, { 'billboard', 11.95 },
+  }
+  for _, it in ipairs(props) do
+    local shape, sc = trees.pick(it[1], it[2], 0)
+    T.check(trees.CATALOG[it[1]] and shape == trees.CATALOG[it[1]][1][1] and math.abs(sc - 1) < 1e-6,
+      it[1] .. ': its model at 1:1')
+    T.check(trees.GROUP_MAX_M[it[1]] and trees.GROUP_MAX_M[it[1]] > 0, it[1] .. ': a draw distance')
+  end
 end
 trees.FRAME_MS, trees.POOL_SPARE = FRAME_MS, POOL_SPARE
 -- a pass with nothing to do is skipped (the game speed pulsing, 2026-10-28): until a tile comes or goes, the car moves
@@ -728,5 +782,38 @@ do
   for _ = 1, 3 do trees.update(21, { x = 0, y = 0 }) end
   T.check(count() == 0 and trees.status().tiles == 0, 'dropped')
   trees.RECHECK_S = 1.0
+end
+
+-- a suppress rule's refresh re-runs only the tiles holding that group (navgraph: 'signal'), not every tile
+do
+  trees.onRows(31, 'sigA', { { 0, 1, 1, 0, 0, 1, 5, 0.1 }, { 1, 3, 3, 0, 0, 1, 5, 0.1 } }, { 'deciduous', 'signal' })
+  trees.onRows(31, 'treeB', { { 0, 5, 5, 0, 0, 1, 5, 0.1 } }, { 'deciduous', 'signal' })
+  for _ = 1, 30 do trees.update(31, { x = 0, y = 0 }) end
+  local tl = {}
+  for i = 1, 200 do local n, v = debug.getupvalue(trees.update, i) if not n then break end if n == 'tiles' then tl = v end end
+  local a, b
+  for k, t in pairs(tl) do
+    if k:find('sigA', 1, true) then a = t elseif k:find('treeB', 1, true) then b = t end
+  end
+  T.check(a and b and not a.pending and not b.pending, 'refresh: both tiles done first')
+  T.check(trees.tileHasGroup(a, 'signal') and not trees.tileHasGroup(b, 'signal'), 'refresh: which tile holds signals')
+  trees.refresh('signal')
+  T.check(a.pending == true and not b.pending, 'refresh: only the tile with signals again')
+  trees.refresh()
+  T.check(b.pending == true, 'refresh: no group: every tile')
+  trees.onDrop({ anchorId = 31, key = 'sigA' })
+  trees.onDrop({ anchorId = 31, key = 'treeB' })
+  for _ = 1, 30 do trees.update(31, { x = 0, y = 0 }) end
+end
+
+-- the pass order's sort keys: nearer first, the index only between equal quarter metres, the index recoverable
+do
+  local ks = { trees.orderKey(300.2, 1), trees.orderKey(12.0, 2), trees.orderKey(12.3, 3), trees.orderKey(0, 4),
+    trees.orderKey(12.0, 5) }
+  table.sort(ks)
+  local at = {}
+  for i, k in ipairs(ks) do at[i] = k % 2 ^ 20 end
+  T.check(table.concat(at, ',') == '4,2,5,3,1', 'pass order: ' .. table.concat(at, ','))
+  T.check(trees.orderKey(1e9, 7) % 2 ^ 20 == 7 and trees.orderKey(1e9, 7) < 2 ^ 53, 'pass order: far tiles capped')
 end
 T.done('test_trees')

@@ -98,6 +98,7 @@ MOD_TO_SERVER = {
               # the mod places geotiles itself (geotile.lua's zoom: 17): the server sends their content once, kept
               # across rebases (geotiles.py, --geo-tiles on)
               "geoTiles": F(int, OPT),
+              "trafficVisuals": F(int, OPT),
               # ... the road tiles too (roads.lua ROAD_GEO: content kept, a skin per anchor; roads.GeoTracker)
               "roadGeo": F(int, OPT),
               # ... and the far buildings, skyline and far bridges (roads.lua FAR_GEO: blockworker.far_geo)
@@ -106,6 +107,7 @@ MOD_TO_SERVER = {
               "globalFar": F(int, OPT),
               # it takes a built block near its target (follow.preferReady: 'terrain_ready_set')
               "readySet": F(int, OPT)},
+    "traffic_visuals": {"enabled": F(bool), "reset": F(bool, OPT)},
     "prepare_anchor": {"requestId": F(int), "lat": F(NUM), "lon": F(NUM), "cx": F(NUM, OPT), "cy": F(NUM, OPT),
                        # 2026-10-22: the player's spot when not the origin (BeamMP: onto another player's anchor)
                        "px": F(NUM, OPT), "py": F(NUM, OPT),
@@ -135,6 +137,7 @@ MOD_TO_SERVER = {
     # the ground's collision patch under another vehicle's collision island off the block (terrainpatch.lua / .py)
     "terrain_patch": {"anchorId": F(int), "key": F(str), "x0": F(NUM), "y0": F(NUM), "x1": F(NUM), "y1": F(NUM)},
     # the performance log (perflog.lua; additive): lines for the server's log (hitches, drops, minutes, the machine)
+    "runtime_profiler": {"enabled": F(bool), "mode": F(str, OPT), "probe": F(int, OPT)},
     "perf_log": {"lines": F((list, dict))},
     # BeamMP shared generation (peerwork.py, mpsession.lua): our world server serves our group; the players on our
     # anchor ({id, host, port, code, weight} each). (Commented out 2026-10-27: shared world building is off.)
@@ -168,6 +171,11 @@ MOD_TO_SERVER = {
               "download": F(str, OPT)},  # the "Download along route" setting: off / ahead / route (route_download)
     "where": {"id": F(int), "lat": F(NUM), "lon": F(NUM), "online": F(bool)},   # the status bar (geocode.py)
     "server_list": {},                  # the BeamNG.Earth servers for the tab in BeamMP's browser (serverlist.lua)
+    # BeamMP shared world generation v2 (mpsession.lua <-> mpshare.py): our share code asked once a session, the
+    # plugin's messages and groups passed through untouched
+    "share_hello": {},
+    "share_in": {"d": F(str)},
+    "share_group": {"d": F(str)},
     # the update notice's button: the server opens the releases page (updates.open_page; additive)
     "open_page": {"url": F(str)},
     "update_now": {},                   # the update notice's "Update now" (selfupdate.py)
@@ -184,7 +192,9 @@ TERRAIN = {"cx": F(NUM), "cy": F(NUM), "heightmap": F(str), "size": F(int), "squ
            "ter": F(str, OPT)}                                     # the block as a .ter (swapped in, no import)
 SERVER_TO_MOD = {
     "server_list": {"servers": F(list, OPT), "error": F(str, OPT)},   # earthd.server_list (the list service)
-    "geocode_result": {"id": F(int), "results": F(list), "error": F(str, OPT)},   # geocode.py (Photon)
+    "share_info": {"code": F(str), "weight": F(NUM)},     # BeamMP sharing v2: our share code for the poses
+    "share_out": {"to": F(str), "d": F(str)},             # ... a message for the plugin ("S") or a player
+    "geocode_result": {"id": F(int), "results": F(list), "error": F(str, OPT), "text": F(str, OPT)},   # geocode.py (Photon)
     # covermap.py: w x h levels (base64, north row first) for the asked box, clipped to the world; gen changes with
     # the index; ready: false while the index is being built
     "cache_map_result": {"id": F(int), "z": F(int), "x0": F(int), "y0": F(int), "w": F(int), "h": F(int),
@@ -212,7 +222,9 @@ SERVER_TO_MOD = {
     "random_place_result": {"id": F(int), "lat": F(NUM, OPT), "lon": F(NUM, OPT), "name": F(str, OPT)},
     "place_previews_ready": {"keys": F(list)},
     "map_tiles_ready": {"tiles": F(list)},  # [z, x, y, ok, layer] each: written to <user>/temp/beamngEarth/maptiles
-    "hello": {"protocol": F(int), "format": F(int), "serverVersion": F(str), "appVersion": F(str), "sessionId": F(str),
+    "runtime_profiler_pong": {"probe": F(int)},
+    "runtime_profiler": {"profile": F(dict)},
+    "hello": {"runtimeProfiler": F(int, OPT), "protocol": F(int), "format": F(int), "serverVersion": F(str), "appVersion": F(str), "sessionId": F(str),
               "farFormat": F(str), "material": F(str),
               "nearVisual": F(str), "attribution": F(str),          # protocol 4
               "cells": F(int, OPT),             # v1.4 M1: cells per tile edge, FORMAT 4 only
@@ -220,6 +232,7 @@ SERVER_TO_MOD = {
               "squareSize": F(NUM),             # ... and their spacing, m (1 m; without both the mod takes 1024 x 2 m)
               "horizon": F(bool, OPT),          # v1.4 M1h: true with --horizon only
               "geoTiles": F(int, OPT),          # geotiles: the zoom of the tiles it sends (hello.geoTiles, --geo-tiles on)
+              "trafficVisuals": F(int, OPT),    # visual roads, independent of the AI graph's physics window
               "roadGeo": F(int, OPT),           # road tiles as geotiles (hello.roadGeo, the road processes on)
               "farGeo": F(int, OPT),            # far buildings / skyline / far bridges as geotiles (hello.farGeo)
               "globalFar": F(int, OPT),         # far levels >= 3 as global tiles (hello.globalFar, --global-far)
@@ -304,6 +317,12 @@ SERVER_TO_MOD = {
     "veg_tile": {"anchorId": F(int), "key": F(str), "path": F(str), "n": F(int), "data": F(dict, OPT),
                  "frame": F(list, OPT), "pivot": F(NUM, OPT)},
     "veg_drop": {"anchorId": F(int), "key": F(str)},
+    "traffic_tile": {"anchorId": F(int), "key": F(str), "path": F(str), "n": F(int), "data": F(dict, OPT),
+                     "frame": F(list), "pivot": F(NUM)},
+    "traffic_drop": {"anchorId": F(int), "key": F(str)},
+    "traffic_far_tile": {"anchorId": F(int), "key": F(str), "path": F(str), "n": F(int), "data": F(dict, OPT),
+                         "frame": F(list), "pivot": F(NUM)},
+    "traffic_far_drop": {"anchorId": F(int), "key": F(str)},
     # far buildings (buildings.far_tile, --buildings on): a JSON file naming a render-only mesh
     # (a geotile, key "g17_x_y", hello.farGeo: frame [lat, lon] of its centre and pivot, m in that frame: the mod
     # places it and keeps it across rebases; the skyline's and far bridges' keys "g15_x_y")
@@ -338,6 +357,7 @@ WEATHER_NESTED = {"cover": {"total", "low", "mid", "high"}, "wind": {"ms", "from
 EXERCISED_ELSEWHERE = {"far_retex", "roads_tile", "roads_drop",   # roads: needs map data (roads tests)
                        "roads_skin", "roads_exact",                  # road geotiles (test_roadgeo)
                        "terrain_refresh",                            # a provisional first block: --grading (map data)
+                       "runtime_profiler", "runtime_profiler_pong",  # opt-in feed/probe (test_runtimeprofiler_server)
                        "update_status",                              # the player's "Update now" (test_selfupdate)
                        "where_result",                               # the status bar: asked by the mod while driving
                        "random_place_result", "place_previews_ready",  # the level select: map data / imagery
@@ -348,6 +368,8 @@ EXERCISED_ELSEWHERE = {"far_retex", "roads_tile", "roads_drop",   # roads: needs
                        "bldfar_tile", "bldfar_drop",                 # --buildings on: needs map data
                        "bldsky_tile", "bldsky_drop", "brfar_tile", "brfar_drop",
                        "navgraph",                                   # --traffic on: needs map data
+                       "traffic_tile", "traffic_drop",                # visual traffic: negotiated, needs map data
+                       "traffic_far_tile", "traffic_far_drop",        # major roads beyond the detailed stream
                        "map_tiles_ready",                            # only when the world map asks (map_tiles)
                        "update",                                     # only when GitHub has a newer version (online)
                        "geocode_result", "route_result",             # only when the map / GPS asks
@@ -355,7 +377,8 @@ EXERCISED_ELSEWHERE = {"far_retex", "roads_tile", "roads_drop",   # roads: needs
                        "area_plan_result", "areas",                  # saved areas: a Server with a Cache (test_areas)
                        "route_download",                             # only when the GPS plans a route (routeahead.py)
                        "terrain_ready_set",                          # only to a fast player's mod that says readySet
-                       "server_list"}                                # only when the BeamMP tab asks (online)
+                       "server_list",                                # only when the BeamMP tab asks (online)
+                       "share_info", "share_out"}                    # only in a BeamMP session (test_mpshare)
 # events the mod's net.lua makes up itself (not on the wire)
 MOD_INTERNAL = {"_connected": set(), "_disconnected": {"error"}}
 
@@ -409,8 +432,9 @@ def mod_sends():
     mpsession.lua (require('beamngEarth/net').send), and every send({...}) in terrainpatch.lua (core hands it
     net.send)."""
     out = {}
-    for names, pattern in ((("core.lua", "places.lua", "mpsession.lua", "serverlist.lua"), r"net(?:'\))?\.send\(\{"),
-                           (("terrainpatch.lua",), r"\bsend\(\{")):
+    for names, pattern in ((("core.lua", "places.lua", "mpsession.lua", "serverlist.lua", "trafficvisuals.lua"), r"net(?:'\))?\.send\(\{"),
+                           (("terrainpatch.lua",), r"\bsend\(\{"),
+                           (("profiler.lua",), r"\b(?:send|lastSend)\(\{")):
         text = code_only("\n".join((LUA / n).read_text(encoding="utf-8") for n in names), "--")
         for m in re.finditer(pattern, text):
             t = lua_tables(text, m.end() - 1)
