@@ -92,6 +92,7 @@ import covermap as covermapmod  # noqa: E402
 import areas as areasmod  # noqa: E402
 import surface as surfacemod  # noqa: E402
 import navgraph as navgraphmod  # noqa: E402
+import nearestfirst  # noqa: E402
 import prewarm as prewarmmod  # noqa: E402
 import parking as parkingmod  # noqa: E402
 import gasstations as gasstationsmod  # noqa: E402
@@ -1004,7 +1005,9 @@ class Server:
         self.base_stale = set()         # blocks whose base photo lacks lazy imagery (NAIP) still to come
         self.base_skipped = set()      # blocks built without their photo (a fast player's prefetch: base_refresh)
         self.quick_pool = ThreadPoolExecutor(1, thread_name_prefix="quick-base")   # stand-in photos (_quick_later)
-        self.quick_early = ThreadPoolExecutor(2, thread_name_prefix="quick-early")   # ... started with a block (fast)
+        # ... started with a block (fast), the one the car reaches next first (one worker: the photo process does one at
+        # a time, a second only queued there, its place fixed before the car had moved on)
+        self.quick_early = nearestfirst.NearestFirst(self._stand_in_rank, 1, "quick-early")
         self.quick_lock = threading.Lock()  # (_quick_once: a block's stand-in made once)
         self.quick_made, self.quick_running = {}, {}
         self.quick_futs = {}            # (aid, cx, cy) -> a requested block's stand-in photo started with it (fast)
@@ -2561,7 +2564,7 @@ class Server:
             except Exception:
                 info["base"] = None
             if not info.get("base"):
-                self.quick_pool.submit(self._quick_later, anchor, cx, cy)
+                self._quick_after(early, anchor, cx, cy)
         info["seconds"] = time.perf_counter() - t0
         info["zoom"] = anchor.hm_zoom
         log.info("provisional block %s in %.2f s in a worker (%s)", key, info["seconds"],
@@ -2905,7 +2908,7 @@ class Server:
                 # painted ground", the user at 230 mph, 2026-10-30; faster, right after it) and its own when done
                 info["base"] = quick
                 if not quick:
-                    self.quick_pool.submit(self._quick_later, anchor, cx, cy)
+                    self._quick_after(early, anchor, cx, cy)
                 info["stages"]["baseWait"] = time.perf_counter() - t1
                 info["stages"]["baseLater"] = 1.0
                 base.add_done_callback(lambda f, key=(anchor.id, cx, cy): self._base_later(key, f))
@@ -2931,7 +2934,7 @@ class Server:
                 try:
                     info["base"] = early.result(timeout=STANDIN_AHEAD_WAIT_S)
                 except concurrent.futures.TimeoutError:
-                    self.quick_pool.submit(self._quick_later, anchor, cx, cy)
+                    self._quick_after(early, anchor, cx, cy)
                 except Exception as e:
                     log.info("stand-in photo %s: %s", (anchor.id, cx, cy), e)
                 info.setdefault("stages", {})["standIn"] = time.perf_counter() - t1
@@ -2960,7 +2963,7 @@ class Server:
         info = self.hm.get(key)
         if info is not None and info.get("base"):
             return                              # (its own photo came while this waited its turn)
-        if self._passed(anchor, cx, cy):
+        if self._stand_in_rank(anchor, cx, cy) is None:
             return                              # (the car has left it behind: its stand-in would be wasted)
         name = self._quick_once(anchor, cx, cy, lambda: self._quick_elsewhere(anchor, cx, cy, LANE_PREFETCH)
                                 or self.write_quick_base(anchor, cx, cy))
@@ -2984,6 +2987,33 @@ class Server:
             conns[0].loop.call_soon_threadsafe(apply)
         except RuntimeError:
             pass                                # (the loop has closed)
+
+    def _stand_in_rank(self, anchor, cx, cy):
+        """quick_early's order: metres from the car (a connection's, on this anchor, faster than PASSED_MIN_V) along its
+        way to block (cx, cy); None once the block's centre is half a block behind it, where blocks that follow the car
+        have long moved on. 0 (arrival order) for a slower car or none: its blocks are all around it."""
+        half = self.layout.block * heightmap.SQUARE / 2
+        for c in list(self.connections):
+            if getattr(c, "active", None) != anchor.id:
+                continue
+            (x, y), (vx, vy) = getattr(c, "focus", (0.0, 0.0)), getattr(c, "vel", (0.0, 0.0))
+            v = math.hypot(vx, vy)
+            if v < PASSED_MIN_V:
+                return 0
+            along = ((cx - x) * vx + (cy - y) * vy) / v
+            return None if along < -half else abs(along)
+        return 0
+
+    def _quick_after(self, early, anchor, cx, cy):
+        """A block that went without its stand-in gets it from _quick_later, once the early one (if any) is over: queued
+        at once, the one quick_pool thread waited out each early one in turn (_quick_once), 16 s in the median and the
+        finished photos late to the mod (A13 at 200 mph, 2026-11-04)."""
+        def later(_fut=None):
+            self.quick_pool.submit(self._quick_later, anchor, cx, cy)
+        if early is None or early.done():
+            later()
+        else:
+            early.add_done_callback(later)
 
     def _passed(self, anchor, cx, cy):
         """Whether the car (a connection's, on this anchor) moving faster than PASSED_MIN_V has left block (cx, cy)
