@@ -506,6 +506,40 @@ def bend_zone(xy):
     return np.abs(s[:, None] - sb[None, :]).min(axis=1) <= HAIRPIN_PAD_M
 
 
+def _probes_geodetic(frame, jobs):
+    """(lat, lon) of sharp_probes' points of every job (p, q, o), in order: the exact inverse only at each vertex and a
+    metre east and north of it, each probe from there by that local Jacobian (its probes lie within SHARP_REACH_M +
+    half of their vertex: the second order term is under 0.1 mm). The exact inverse at every probe, ~40 per vertex at
+    ~1 us each, was most of a cell's planning (_add_cuts 31 of ~70 s of plan_cell in an 8 km drive, 2026-11-04)."""
+    f64 = np.float64
+    base = []
+    for p, q, o in jobs:
+        n, m = len(p.xy), len(o)
+        idx = np.tile(np.repeat(np.arange(n), m), 2) if len(q) == 2 * n * m else None
+        if idx is None:                                     # (not the layout sharp_probes makes: exact)
+            return _exact_probes(frame, jobs)
+        base.append((np.asarray(p.xy[:, :2], f64), idx))
+    v = np.concatenate([b for b, _ in base])
+    pts = np.concatenate([v, v + (1.0, 0.0), v + (0.0, 1.0)])
+    la, lo, _ = frame.enu_to_geodetic(pts[:, 0], pts[:, 1], 0.0)
+    la, lo = np.asarray(la, f64).reshape(3, -1), np.asarray(lo, f64).reshape(3, -1)
+    outa, outo, k = [], [], 0
+    for (b, idx), (_, q, _) in zip(base, jobs):
+        sl = slice(k, k + len(b))
+        k += len(b)
+        d = np.asarray(q, f64) - b[idx]
+        a0, o0 = la[0, sl][idx], lo[0, sl][idx]
+        outa.append(a0 + (la[1, sl][idx] - a0) * d[:, 0] + (la[2, sl][idx] - a0) * d[:, 1])
+        outo.append(o0 + (lo[1, sl][idx] - o0) * d[:, 0] + (lo[2, sl][idx] - o0) * d[:, 1])
+    return np.concatenate(outa), np.concatenate(outo)
+
+
+def _exact_probes(frame, jobs):
+    allp = np.concatenate([q for _, q, _ in jobs])
+    la, lo, _ = frame.enu_to_geodetic(allp[:, 0], allp[:, 1], 0.0)
+    return np.asarray(la), np.asarray(lo)
+
+
 def _add_cuts(frame, plans, elev):
     """Sets Plan.cut on the plans (None entries skipped): per segment and side a cutting's wall (SHARP_*), from the raw
     ground elev(lat, lon) sampled outward from the carriageway's edge: the ground rising SHARP_MIN_M or more at
@@ -523,8 +557,7 @@ def _add_cuts(frame, plans, elev):
         jobs.append((p, q, o))
     if not jobs:
         return
-    allp = np.concatenate([q for _, q, _ in jobs])
-    la, lo, _ = frame.enu_to_geodetic(allp[:, 0], allp[:, 1], 0.0)
+    la, lo = _probes_geodetic(frame, jobs)
     g = np.asarray(elev(np.asarray(la), np.asarray(lo)), f64)       # (as plan_roads' heights)
     k = 0
     for p, q, o in jobs:
