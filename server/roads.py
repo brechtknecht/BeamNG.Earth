@@ -647,6 +647,24 @@ def _structure_width(feats, i):
     return carriageway(cls, kind, False, rule_w, ow, lanes)
 
 
+def _shape_specs(feats):
+    """road_specs without the lane counts lane_flow finds (the map's or OSM's lanes only): what the level ranges'
+    reaches (_bridge_reach, _tunnel_reach, _deck_gaps) read, the widths of the roads crossing under or over. lane_flow
+    solves over a cell's home 3 x 3 and its neighbours' (two rings), and the ranges are made for a whole cell at a time
+    and its roads' home copies: one cell's plans loaded the roads of ~59 cells out to 4 rings (~6 km to the side,
+    168 of a 10 km drive's 212 road cells, 2026-11-04). The same whatever is loaded (no order dependence). Remembered
+    on feats. BNGE_SHAPE_SPECS=0: road_specs as before."""
+    if not SHAPE_SPECS_ON:
+        return road_specs(feats)
+    got = feats.__dict__.get("_shape_specs")
+    if got is None:
+        got = feats.__dict__["_shape_specs"] = _road_specs(feats, None, False, flow=False)
+    return got
+
+
+SHAPE_SPECS_ON = os.environ.get("BNGE_SHAPE_SPECS", "1") != "0"
+
+
 def _bridge_reach(feats, i):
     """Bridge feature i's ranges lengthened over the ground roads crossing under them (SKEW_*), and how far past each
     end of the feature they would reach: {"ranges": [...], "over": [m past its start, m past its end]} (_skew_decks
@@ -658,7 +676,7 @@ def _bridge_reach(feats, i):
     rngs = raw_level_ranges(feats, i)
     got = {"ranges": rngs, "over": [0.0, 0.0]}
     memo[i] = got
-    specs = road_specs(feats)
+    specs = _shape_specs(feats)
     up_w = specs[i].width if specs[i] is not None else _structure_width(feats, i)
     rings = [np.asarray(r, np.float64) for part in feats.parts(i) for r in part if len(r) >= 2]
     if up_w is None or not rings or not any(k == "bridge" for _, _, k in rngs):
@@ -735,7 +753,7 @@ TUNNEL_PORTAL_MIN_M = 8.0
 def _tunnel_reach(feats, i, rngs):
     """rngs with feature i's tunnel ranges grown over the ground roads crossing it at their portals
     (TUNNEL_PORTAL_*), never into a neighbouring range. Pure given feats."""
-    specs = road_specs(feats)
+    specs = _shape_specs(feats)
     rings = [np.asarray(r, np.float64) for part in feats.parts(i) for r in part if len(r) >= 2]
     if specs[i] is None or not rings:
         return rngs
@@ -932,7 +950,7 @@ def _deck_gaps(feats, i, rngs):
     L = float(np.hypot(*np.diff(m, axis=0).T).sum())
     if L <= 0:
         return rngs
-    specs = road_specs(feats)
+    specs = _shape_specs(feats)
     ends = _first_ring_ends(feats)
     boxes = _feature_boxes(feats)
     end_deck = []
@@ -2165,7 +2183,7 @@ def unbuilt(feats, i):
     return share >= UNBUILT_SHARE
 
 
-def _road_specs(feats, urban_fn, left_hand):
+def _road_specs(feats, urban_fn, left_hand, flow=True):
     out = []
     rules = feats.rules
     ask = []                                    # (index in out, cls, kind, rule_w, coordinate range)
@@ -2187,7 +2205,7 @@ def _road_specs(feats, urban_fn, left_hand):
         if rule_w is None:
             rule_w = _osm(feats, "width", i, *OSM_WIDTH_M)      # OpenStreetMap's width (osmtags.py)
         lanes = _osm(feats, "lanes", i, *OSM_LANES)
-        lanes = int(lanes) if lanes is not None else lane_flow(feats)[i]     # (through merges / splits: lane_flow)
+        lanes = int(lanes) if lanes is not None else (lane_flow(feats)[i] if flow else None)  # (merges / splits: lane_flow)
         surf = _rule_value(rules.get("surface"), i)
         kind = surface_kind(cls, surf)
         ow = _rule_value(rules.get("oneway"), i) is not None
