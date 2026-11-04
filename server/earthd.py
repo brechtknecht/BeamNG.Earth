@@ -426,6 +426,13 @@ PREFETCH_START = 200.0      # m (Chebyshev) from the block centre before prefetc
 PREFETCH_CHAIN = 4
 READY_STEPS = 2             # grid steps a built block may be from the mod's target and still be taken (follow.lua)
 PREFETCH_PARALLEL = 2
+SKIP_PASSED_GRADED = os.environ.get("BNGE_SKIP_PASSED_GRADED", "1") != "0"   # make_heightmap: BlockPassed
+
+
+class BlockPassed(Exception):
+    """A follow block's graded build skipped: its provisional one was sent and the car has passed it."""
+
+
 READY_SET_M = 3000.0        # m: the built blocks round the player the mod is told of (terrain_ready_set)
 # The mod's terrain-follow rule (mod follow.lua): it asks once the player is more than
 # FOLLOW_PREPARE (Chebyshev) from the block centre, for snap256(player + v * FOLLOW_LEAD),
@@ -2442,6 +2449,12 @@ class Server:
         t0 = time.perf_counter()
         if queued_at is not None and t0 - queued_at > 0.5:
             log.info("terrain %s waited %.2f s for a heightmap worker", (anchor.id, cx, cy), t0 - queued_at)
+        if (SKIP_PASSED_GRADED and progress is None and (anchor.id, cx, cy) in self.prov_info
+                and self._passed(anchor, cx, cy)):
+            # (its provisional block was sent and the car has left it behind: its graded one would come too late to
+            # matter; queued request lane builds of such blocks held the next ones' workers, 17-30 s waits at 200 mph
+            # on 2 cores, 2026-11-04. A later request for it builds it then.)
+            raise BlockPassed(f"terrain {(anchor.id, cx, cy)}: passed, its provisional block stays")
         q = self.anchor_q(anchor)
         key = (anchor.id, cx, cy)
         fb, base = anchor.first_base, None
@@ -5574,6 +5587,9 @@ class Connection:
         key = (anchor.id, cx, cy)
         try:
             info = await job
+        except BlockPassed:
+            log.info("graded block %s skipped: the car has passed it (the provisional one stays)", key)
+            return
         except Exception:
             log.exception("graded block %s failed (the provisional one stays)", key)
             return
