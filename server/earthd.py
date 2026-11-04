@@ -434,6 +434,11 @@ FAR_BEHIND_M = 64.0         # ... a refinement whose tiles all lie this far behi
 # BNGE_FAR_DEPTH: far tiles in flight beyond the workers while the far-tile processes build them: a tile spent as
 # long in this process (its shape written, its record) as in its worker, and the workers idled 60 % of a drive.
 FAR_DEPTH = int(os.environ.get("BNGE_FAR_DEPTH", "2") or 0)
+# BNGE_FAR_FAST_V: from this speed on (m/s) the far field builds with one worker fewer and none in flight beyond them
+# (FAR_DEPTH): the real 3-core drive at 200 mph (2026-11-04) spent 947 CPU-s on far tiles, as much as the road tiles,
+# while trees waited 0.3 s p50 in their queue and photos 32 s: the near things the driver sees first get the CPU.
+# 0: off
+FAR_FAST_V = float(os.environ.get("BNGE_FAR_FAST_V", "45") or 0)
 HM_BUSY_TILE_WORKERS = 1    # far tiles built at once while a physics block is building in the server process (an
                             # anchor's first, or every one with --block-process off; the block processes' blocks do
                             # not share its interpreter: far tiles one at a time behind them were most of a Steam
@@ -6795,7 +6800,10 @@ class Connection:
             workers = HM_BUSY_TILE_WORKERS if self.s.hm_here else self.s.quality.far_workers(self.s.tile_workers)
             # plus the helpers' slots (compute sharing): their tiles cost this process only the files (26 ms a
             # tile); kept to the local workers, a Steam Deck sent 2 at a time to 12 idle helper workers (2026-10-22)
-            if self.s.far_pool is not None and not self.s.hm_here and workers >= self.s.tile_workers:
+            fast = FAR_FAST_V > 0 and math.hypot(*self.vel) >= FAR_FAST_V
+            if fast:
+                workers = max(1, workers - 1)
+            elif self.s.far_pool is not None and not self.s.hm_here and workers >= self.s.tile_workers:
                 workers += FAR_DEPTH        # (not while the governor keeps a far process free for the blocks)
             workers += self.s.remote_slots()
             while anchor is not None and not self.teleport_pending and len(self.inflight) < workers:
