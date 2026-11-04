@@ -72,7 +72,9 @@ def for_grader(cache_dir, grader, widths, wet):
     if not run:
         return None
     md = getattr(grader, "md", None)
-    pc = PlanCache(os.path.join(cache_dir, "plans", run), f"w{int(widths is not None)}s{int(wet is not None)}")
+    import grading
+    pc = PlanCache(os.path.join(cache_dir, "plans", run), f"w{int(widths is not None)}s{int(wet is not None)}"
+                   + ("" if grading.PROFILE_ZOOM == 16 else f"z{grading.PROFILE_ZOOM}"))
     pc.persist = (cache_dir, (FRAMES, pc.signature,
                               md.versions() if md is not None and hasattr(md, "versions") else None))
     return pc
