@@ -276,6 +276,7 @@ function M.decide(px, py, vx, vy, cx, cy, pending, now, retryAt, gate, latency)
   if tx == cx and ty == cy then return nil end -- heading back towards the centre: nothing to gain
   local r = M.preferReady(px, py, vx, vy, tx, ty, cx, cy, reach)
   if r then return 'prepare', r[1], r[2], true end      -- (preferred: see retargets)
+  if ahead == 0 and M.readySoon(px, py, vx, vy, tx, ty, cx, cy, reach) then return nil end
   return 'prepare', tx, ty
 end
 
@@ -305,6 +306,30 @@ function M.preferReady(px, py, vx, vy, tx, ty, cx, cy, reach)
     end
   end
   return best
+end
+
+-- Pure (but for M.ready): will a ready centre near the target come within reach in READY_WAIT_S, the car still inside the
+-- hard commit distance of the current block then? Then the request waits for it (decide): a block guessed ahead, built
+-- and a grid step past the target but not yet in reach was passed over for a new block, 16 of 29 late blocks at 200 mph
+-- (A13, 2026-11-04). 0: no waiting.
+M.READY_WAIT_S = 2
+M.READY_WAIT_STEP_S = 0.25
+function M.readySoon(px, py, vx, vy, tx, ty, cx, cy, reach)
+  vx, vy = vx or 0, vy or 0
+  if M.MIN_LEAD <= 0 or M.READY_WAIT_S <= 0 or vx * vx + vy * vy <= M.MIN_LEAD_V * M.MIN_LEAD_V then return nil end
+  local hard = M.hardCommitDist(vx, vy)
+  for _, c in pairs(M.ready) do
+    if not (c[1] == cx and c[2] == cy) and M.cheb(c[1], c[2], tx, ty) <= M.READY_STEPS * M.GRID then
+      local t = M.READY_WAIT_STEP_S
+      while t <= M.READY_WAIT_S do
+        local qx, qy = px + vx * t, py + vy * t
+        if M.cheb(qx, qy, cx, cy) > hard then break end
+        if M.cheb(qx, qy, c[1], c[2]) <= reach then return c end
+        t = t + M.READY_WAIT_STEP_S
+      end
+    end
+  end
+  return nil
 end
 
 -- Distances for the UI: to the prepare threshold and to the commit threshold (<= 0 = passed).

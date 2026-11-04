@@ -124,6 +124,15 @@ T.check(a == 'prepare' and cx == 128, '512 standing: the block round the player'
 T.check(d(-200, 0, 90, 0, 0, 0, nil, 0, 0) == nil, '512 at 90 m/s: the centre 200 m ahead: no request')
 a, cx, cy = d(129, 0, 90, 0, 0, 0, nil, 0, 0)
 T.check(a == 'prepare' and cx == 384 and cy == 0, '512 at 90 m/s: past the centre by 128 m: prepare (384, 0)')
+-- a ready block near the target, in reach in a moment: the request waits for it, then takes it; too far off: as before
+f.setReady({ { 128, 384 } })
+T.check(d(140, 10, 0, 90, 0, 0, nil, 0, 0) == nil, '512 at 90 m/s: a ready block in reach in 1.3 s: no request yet')
+a, cx, cy = d(140, 130, 0, 90, 0, 0, nil, 0, 0)
+T.check(a == 'prepare' and cx == 128 and cy == 384, '... in reach: taken')
+f.setReady({ { 128, 512 } })
+a, cx, cy = d(140, 10, 0, 90, 0, 0, nil, 0, 0)
+T.check(a == 'prepare' and cx == 128 and cy == 256, '512 at 90 m/s: in reach only in 2.7 s: the target asked for')
+f.setReady({})
 -- town drives: half the moves, never nearer than 225 m to the block's edge (1 s and 4 s heightmap latency)
 do
   local function moves(speed, hdg, lat)
