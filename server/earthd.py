@@ -384,6 +384,8 @@ TILE_CACHE = {32: 6000, 64: 2500}
 HM_THREADS = 4
 HM_REQUEST_THREADS = 2          # Server.hm_req_pool: the request lane's (they wait on its block process)
 LAG_TICK_S, LAG_REPORT_S = 0.1, 0.25     # the event-loop stall report (-v)
+LAG_TRACE_S = 1.0                        # ... with a perf trace on (BNGE_TRACE), from this long at any log level
+LOOP_RAISE = os.environ.get("BNGE_LOOP_RAISE", "1") != "0"     # main(): the event loop's thread a step above the others
 ROAD_PROCESSES = 2              # road-tile processes (--block-process on, --roads on)
 # s a road tile may take in its worker before it is given up and its workers restarted (build_roads_tile): a first
 # visit's slowest tiles take ~1 min on a busy 6-core laptop and several times that on a Steam Deck, where a tile given
@@ -4290,7 +4292,8 @@ TERRAIN_BASE_TEX = int(os.environ.get("BNGE_TERRAIN_BASE_TEX", "0") or 0)
 # (tools/gcpatch prevents the drop on Linux only). The mod spreads that rebuild over the frames after the swap
 # (groundcover.SPREAD, its default 2); BNGE_GRASS_SPREAD=0 rebuilds it in the swap's frame as before, 1-4 frames.
 GRASS_SPREAD = os.environ.get("BNGE_GRASS_SPREAD", "")
-SWITCH_MS = float(os.environ.get("BNGE_SWITCH_MS", "0") or 0)
+# (2 ms, not Python's 5: the event loop's turn comes sooner among the many threads of this process; 2026-11-04)
+SWITCH_MS = float(os.environ.get("BNGE_SWITCH_MS", "2") or 0)
 # Once a follow block was stood in for (its graded one came after the car), the next one's stand-in starts at the
 # usual time without asking whether its graded one would be in time: quality.build_s is measured on the graded blocks
 # in time only, and stayed at ~3 s while the graded ones took 10-21 s behind each other at 300 km/h on 2 cores: three
@@ -7068,6 +7071,11 @@ async def main_async(args):
     # logs the main thread's stack when a beat is late, so the stall names its cause.
     beat = [time.perf_counter()]
     main_ident = threading.get_ident()
+    # (a step above the server's other threads: every message the game sends waits for this one, and the loop lagged
+    # 0.5-1 s in the median and up to 15 s with the process at half a core, a block built 17 s before held the car for
+    # the 5 s until its request was answered: A13 at 200 mph, 2026-11-04. BNGE_LOOP_RAISE=0: as the others.)
+    if LOOP_RAISE:
+        _raise_thread()
 
     async def loop_beat():
         while True:
@@ -7083,14 +7091,16 @@ async def main_async(args):
             lag = time.perf_counter() - b - LAG_TICK_S
             if perftrace.ON and lag > 0.05:
                 perftrace.counter("loop lag", s=round(lag, 3))
-            if lag > LAG_REPORT_S and reported != b and log.isEnabledFor(logging.DEBUG):
+            traced = perftrace.ON and lag > LAG_TRACE_S     # (a perf trace: the long stalls named at any log level)
+            if ((traced or (lag > LAG_REPORT_S and log.isEnabledFor(logging.DEBUG))) and reported != b):
                 reported = b
                 f = sys._current_frames().get(main_ident)
                 stack = []
                 while f is not None and len(stack) < 12:
                     stack.append(f"{os.path.basename(f.f_code.co_filename)}:{f.f_code.co_name}:{f.f_lineno}")
                     f = f.f_back
-                log.debug("event loop stalled > %.2f s in %s", lag, " < ".join(stack))
+                log.log(logging.INFO if traced else logging.DEBUG, "event loop stalled > %.2f s in %s", lag,
+                        " < ".join(stack))
     threading.Thread(target=watch_lag, daemon=True, name="lag-watch").start()
 
     # Debug: where this process's memory is (BNGE_TRACEMALLOC=1; numpy arrays included): the top allocation sites every
