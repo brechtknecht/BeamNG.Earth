@@ -266,6 +266,71 @@ class ColdStartTest(unittest.TestCase):
         self.assertLessEqual(tr.max_inflight, 8)
 
 
+class HedgeTest(unittest.TestCase):
+    """HostPolicy.hedge_s: a request that hangs gets a second one beside it, the first answer wins."""
+
+    class Transport:
+        """The n-th request: script[n], "hang" (until released), an exception, or a status."""
+
+        def __init__(self, script):
+            self.script, self.calls, self.lock, self.release = list(script), 0, threading.Lock(), threading.Event()
+
+        def request(self, url, headers, timeout):
+            with self.lock:
+                what = self.script[min(self.calls, len(self.script) - 1)]
+                self.calls += 1
+            if what == "hang":
+                self.release.wait(10)
+                return 200, {}, b"late"
+            if isinstance(what, Exception):
+                raise what
+            return what, {}, b"fast"
+
+    def fetch(self, script, **kw):
+        pol = nf.with_policy(nf.POLICIES, EOX, hedge_s=0.05, rate=1e6, burst=1e6, base_delay=0.0, **kw)
+        tr = self.Transport(script)
+        self.addCleanup(tr.release.set)
+        return nf.Fetcher(transport=tr, policies=pol), tr
+
+    def test_second_request_wins_over_a_hanging_first(self):
+        f, tr = self.fetch(["hang", 200])
+        t0 = time.monotonic()
+        self.assertEqual(f.get(url(EOX)).body, b"fast")
+        self.assertLess(time.monotonic() - t0, 5.0)
+        self.assertEqual(tr.calls, 2)
+        self.assertEqual(f.host(EOX).day["requests"], 2)
+
+    def test_a_quick_answer_sends_no_second_request(self):
+        f, tr = self.fetch([200])
+        self.assertEqual(f.get(url(EOX)).body, b"fast")
+        time.sleep(0.1)
+        self.assertEqual(tr.calls, 1)
+
+    def test_one_failure_waits_for_the_other(self):
+        f, tr = self.fetch(["hang", OSError("reset")])
+        tr.release_later = threading.Timer(0.2, tr.release.set)
+        tr.release_later.start()
+        self.addCleanup(tr.release_later.cancel)
+        self.assertEqual(f.get(url(EOX)).body, b"late")
+
+    def test_nothing_within_the_deadline_is_a_failed_attempt_retried(self):
+        f, tr = self.fetch(["hang", "hang", 200], hedge_deadline=0.15, max_attempts=2)
+        self.assertEqual(f.get(url(EOX)).body, b"fast")
+        self.assertEqual(tr.calls, 3)
+        self.assertGreaterEqual(f.host(EOX).day["errors"], 1)
+
+    def test_switch_off(self):
+        f, tr = self.fetch(["hang", 200])
+        tr.release.set()
+        with mock.patch.object(nf, "HEDGE", False):
+            self.assertEqual(f.get(url(EOX)).body, b"late")
+        self.assertEqual(tr.calls, 1)
+
+    def test_canopy_host_is_hedged_and_others_not(self):
+        self.assertEqual(nf.POLICIES["dataforgood-fb-data.s3.amazonaws.com"].hedge_s, 2.0)
+        self.assertEqual(nf.POLICIES[EOX].hedge_s, 0.0)
+
+
 class ConcurrencyTest(unittest.TestCase):
     def test_cap(self):
         """16 threads against a host with max_conc=2: never more than 2 in flight."""

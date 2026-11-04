@@ -40,6 +40,7 @@ One User-Agent for the whole project (USER_AGENT): the app, its version and the 
 user name, e-mail, machine name, location or session id is ever sent.
 """
 import collections
+import concurrent.futures
 import email.utils
 import http.client
 import json
@@ -88,6 +89,8 @@ TOKEN_EPS = 1e-4                # a token short by rounding (clock resolution) c
 OFFLINE_TEXT = "Offline - using cached data"
 
 NETLOG = os.environ.get("BNGE_NETLOG")      # debugging: every network request, one line each, from every process
+HEDGE = os.environ.get("BNGE_NET_HEDGE", "1") != "0"     # HostPolicy.hedge_s; 0: off
+HEDGE_THREADS = 16
 
 
 def _netlog(url, headers, status, body):
@@ -124,6 +127,9 @@ class HostPolicy:
     max_attempts: int = 3
     base_delay: float = 0.5                 # s, backoff base (full jitter)
     max_delay: float = 60.0
+    hedge_s: float = 0.0                    # s a request runs before a second one goes out beside it, the first answer
+                                            # wins (Fetcher._transfer; 0: none)
+    hedge_deadline: float = 40.0            # s a hedged request has in all, then the attempt has failed
     breaker_threshold: int = 5              # failed attempts ...
     breaker_window: float = 30.0            # ... within this many seconds open the breaker
     breaker_open: float = 30.0              # s open, doubled after a failed probe ...
@@ -201,8 +207,12 @@ POLICIES = {
     **{h: HostPolicy(rate=20.0, burst=40.0, max_conc=4, daily_budget=None, allow_prefetch=True,
                      offline_ok=True, miss_ttl=None, binary=True, timeout=30.0)
        for h in ("esa-worldcover.s3.eu-central-1.amazonaws.com",
-                 "dataforgood-fb-data.s3.amazonaws.com",
                  "copernicus-dem-30m.s3.amazonaws.com")},      # the polar caps' DEM (polardem.py)
+    # the canopy heights' range reads: 0.3 s the median, but 42 of 227 over 5 s and up to 60 s in a 200 mph drive (no
+    # other host had one), a trees tile waiting up to 77 s behind them (2026-11-04): a second request after 2 s
+    "dataforgood-fb-data.s3.amazonaws.com": HostPolicy(rate=20.0, burst=40.0, max_conc=4, daily_budget=None,
+                                                       allow_prefetch=True, offline_ok=True, miss_ttl=None, binary=True,
+                                                       timeout=30.0, hedge_s=2.0),
     # British Columbia's lidar DEMs (lidarbc.py): range reads of the Province's open bucket; optional
     "nrs.objectstore.gov.bc.ca": HostPolicy(rate=20.0, burst=40.0, max_conc=6, daily_budget=None, allow_prefetch=True,
                                             offline_ok=True, miss_ttl=None, binary=True, timeout=30.0, optional=True),
@@ -842,6 +852,7 @@ class Fetcher:
         self._flushed = clock()
         self._load_stats()
         self._rates = collections.deque(maxlen=64)     # (clock, MB/s) of the large responses (throughput)
+        self._hedge_pool = None         # (_transfer's threads, made at the first hedged request)
 
     def throughput(self):
         """The median speed (MB/s) the large responses of the last RATE_WINDOW_S came in at, or None (too few)."""
@@ -1026,6 +1037,37 @@ class Fetcher:
         with self._rng_lock:
             return self.rng.uniform(0.0, min(p.max_delay, p.base_delay * 2 ** attempt))
 
+    def _transfer(self, h, url, hd):
+        """transport.request; under a policy's hedge_s on pool threads (their keep-alive connections are their own), a
+        second request beside the first after hedge_s, the first answer wins. A request that hangs holds its thread until
+        its socket gives up, not the caller. Nothing in hedge_deadline: TimeoutError, the attempt has failed."""
+        p = h.policy
+        if not HEDGE or not p.hedge_s:
+            return self.transport.request(url, hd, p.timeout)
+        with self._lock:
+            if self._hedge_pool is None:
+                self._hedge_pool = concurrent.futures.ThreadPoolExecutor(HEDGE_THREADS, thread_name_prefix="net-hedge")
+            pool = self._hedge_pool
+        first = pool.submit(self.transport.request, url, hd, p.timeout)
+        done, _ = concurrent.futures.wait([first], timeout=p.hedge_s)
+        if done:
+            return first.result()
+        self._count(h, "requests")
+        self._bump(h, "retries")
+        pending = {first, pool.submit(self.transport.request, url, hd, p.timeout)}
+        end, err = time.monotonic() + max(0.0, p.hedge_deadline - p.hedge_s), None
+        while pending:
+            done, pending = concurrent.futures.wait(pending, timeout=max(0.0, end - time.monotonic()),
+                                                    return_when=concurrent.futures.FIRST_COMPLETED)
+            if not done:
+                raise TimeoutError(f"no answer in {p.hedge_deadline:.0f} s (two requests)")
+            for f in done:
+                e = f.exception()
+                if e is None:
+                    return f.result()
+                err = err or e
+        raise err
+
     def get(self, url, *, kind="demand", headers=None, lane=None):
         """GET url under its host's policy: a Response with status 2xx, or one of the errors above. lane: a name of
         its own (its own rate bucket, breaker and day's count under the host's policy): one kind of request whose
@@ -1061,7 +1103,7 @@ class Fetcher:
                     self._count(h, "requests")
                     t0 = self.clock()
                     try:
-                        status, rh, body = self.transport.request(url, hd, p.timeout)
+                        status, rh, body = self._transfer(h, url, hd)
                     except (http.client.HTTPException, OSError) as e:
                         self._count(h, "errors")
                         self._failed(h)
