@@ -2560,7 +2560,7 @@ class Server:
         info.pop("finished", None)
         if early is not None:
             try:
-                info["base"] = early.result(timeout=STANDIN_WAIT_S)
+                info["base"] = early.result(timeout=self._standin_wait())
             except Exception:
                 info["base"] = None
             if not info.get("base"):
@@ -2888,7 +2888,7 @@ class Server:
             early = self.quick_futs.pop((anchor.id, cx, cy), None)
             if not base.done() and early is not None:
                 try:
-                    quick = early.result(timeout=STANDIN_WAIT_S)
+                    quick = early.result(timeout=self._standin_wait())
                 except concurrent.futures.TimeoutError:
                     quick = None        # (the block goes without it: _quick_later / the photo when done)
                 except Exception as e:
@@ -3003,6 +3003,11 @@ class Server:
             along = ((cx - x) * vx + (cy - y) * vy) / v
             return None if along < -half else abs(along)
         return 0
+
+    def _standin_wait(self):
+        """How long a requested or provisional block waits for its stand-in: a moving car not at all (STANDIN_AHEAD_WAIT_S:
+        the stand-in queue goes by distance, so a block asked for now is seldom first and the wait was lost)."""
+        return STANDIN_AHEAD_WAIT_S if getattr(self, "speed", 0.0) >= PASSED_MIN_V else STANDIN_WAIT_S
 
     def _quick_after(self, early, anchor, cx, cy):
         """A block that went without its stand-in gets it from _quick_later, once the early one (if any) is over: queued
