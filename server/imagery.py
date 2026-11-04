@@ -665,13 +665,20 @@ class Imagery:
         None when it is outside the data (a miss marker written)."""
         k = src.export
         out = None
+        # (each texel's brightest / darkest channel once for the whole image, channel by channel: numpy's max over a
+        # 3-long last axis was ~4x slower, 13 s of an 8 km drive's photo threads, 2026-11-04)
+        r, g, b3 = a[..., 0], a[..., 1], a[..., 2]
+        amax = np.maximum(np.maximum(r, g), b3)
+        amin = np.minimum(np.minimum(r, g), b3) if src.nodata == "white" else None
         for j in range(1 << k):
             for i in range(1 << k):
                 cx, cy = ((x >> k) << k) + i, ((y >> k) << k) + j
                 cpath, cmiss = self._paths(src, z, cx, cy)
                 child = a[j * TILE:(j + 1) * TILE, i * TILE:(i + 1) * TILE]
-                if (child.max(axis=2) <= NODATA_MAX).mean() > NODATA_SHARE or (
-                        src.nodata == "white" and (child.min(axis=2) >= NODATA_WHITE_MIN).mean() > NODATA_WHITE_SHARE):
+                cmax = amax[j * TILE:(j + 1) * TILE, i * TILE:(i + 1) * TILE]
+                if (cmax <= NODATA_MAX).mean() > NODATA_SHARE or (amin is not None and (
+                        amin[j * TILE:(j + 1) * TILE, i * TILE:(i + 1) * TILE] >= NODATA_WHITE_MIN).mean()
+                        > NODATA_WHITE_SHARE):
                     # outside the flights (the image is black there): missing, the next source fills it
                     os.makedirs(os.path.dirname(cmiss), exist_ok=True)
                     open(cmiss, "wb").close()
