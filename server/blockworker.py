@@ -182,6 +182,16 @@ def init(cache_dir, offline, roads, grading, road_widths, surface, warm_q, log_l
         threading.Thread(target=_warm_loop, daemon=True, name="roads-ahead").start()
 
 
+def init_photo(*args, **kwargs):
+    """init for the photos' process, above the server's other processes (budget.photo_priority)."""
+    import budget
+    try:
+        budget.photo_priority()
+    except (OSError, AttributeError):
+        pass
+    init(*args, **kwargs)
+
+
 def _watch_parent(ppid):
     """Exit with the server: a killed server (SIGTERM) left its block processes running. Windows: os.getppid() keeps
     the parent's id after it is gone, so the poll never saw it go (from Madderose's PR #41: orphaned workers held the

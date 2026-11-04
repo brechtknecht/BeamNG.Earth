@@ -101,6 +101,18 @@ class PriorityTest(unittest.TestCase):
             self.assertEqual(self.run_child("import os; b=os.nice(0); budget.lower_priority(3); print(os.nice(0)-b)"),
                              "3")
 
+    def test_photo_process_above_the_others(self):
+        # Windows: from the server's "below normal" to "normal"; elsewhere, or switched off, nothing
+        with unittest.mock.patch.dict(os.environ, {"BNGE_PHOTO_PRIORITY": "0"}):
+            self.assertIsNone(budget.photo_priority())
+        if sys.platform == "win32":
+            get = ("import ctypes; from ctypes import wintypes; k=ctypes.WinDLL('kernel32'); "
+                   "k.GetCurrentProcess.restype=wintypes.HANDLE; k.GetPriorityClass.argtypes=(wintypes.HANDLE,); "
+                   "budget.lower_priority(10); print(budget.photo_priority(), hex(k.GetPriorityClass(k.GetCurrentProcess())))")
+            self.assertEqual(self.run_child(get), "normal 0x20")
+        else:
+            self.assertIsNone(budget.photo_priority())
+
     def test_request_lane_thread_raised(self):
         # Windows: the request lane's build thread a step above its class (still below the game); elsewhere nothing
         if sys.platform == "win32":

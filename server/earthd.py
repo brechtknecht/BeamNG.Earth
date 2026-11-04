@@ -6996,7 +6996,7 @@ async def main_async(args):
         if args.near_visual == "detail" and (os.cpu_count() or 0) >= PHOTO_PROCESS_MIN_CPUS:
             # requested blocks' photos and stand-ins in a process of their own (Server._base_process / _stand_in)
             photo_pool = poolsmod.RespawningPool(
-                "photo", 1, mp_context=ctx, initializer=blockworker.init,
+                "photo", 1, mp_context=ctx, initializer=blockworker.init_photo,
                 initargs=(args.cache_dir, args.offline, args.roads == "on",
                           args.grading == "on" and args.roads == "on",
                           args.road_widths == "on" and args.roads == "on", args.surface == "on", None,
@@ -7043,7 +7043,7 @@ async def main_async(args):
     if (photo_pool is None and block_pools and args.near_visual == "detail" and args.imagery and not budget.small()
             and os.environ.get("BNGE_PHOTO_PROC", "1") != "0"):      # 0: photos in the other lane's block process
         photo_pool = poolsmod.RespawningPool(     # detail mode's block photos (blockworker.base_photo)
-            "base photo", 1, mp_context=ctx, initializer=blockworker.init,
+            "base photo", 1, mp_context=ctx, initializer=blockworker.init_photo,
             initargs=(args.cache_dir, args.offline, args.roads == "on",
                       args.grading == "on" and args.roads == "on",
                       args.road_widths == "on" and args.roads == "on", args.surface == "on", ctx.Queue(maxsize=1),
