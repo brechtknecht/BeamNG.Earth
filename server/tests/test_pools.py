@@ -148,6 +148,16 @@ class OrderedPoolTest(unittest.TestCase):
                 futs["behind"].result(5)
             self.assertEqual(order, ["keyless", "near", "far", "behind_keep"])
             self.assertEqual(p.dropped, 1)
+            gate2 = threading.Event()
+            hold = p.submit(gate2.wait)
+            order.clear()
+            full = p.submit_at("near", order.append, "near full", bias=2000.0)
+            quick = p.submit_at("far", order.append, "far quick")
+            gate2.set()
+            hold.result(5)
+            full.result(5)
+            quick.result(5)
+            self.assertEqual(order, ["far quick", "near full"])      # (900 m < 10 m + 2000 m)
         finally:
             inner.shutdown()
 

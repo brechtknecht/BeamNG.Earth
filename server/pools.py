@@ -209,11 +209,12 @@ class OrderedPool:
     def submit(self, fn, *args, **kwargs):
         return self.submit_at(None, fn, *args, **kwargs)
 
-    def submit_at(self, key, fn, *args, droppable=False, **kwargs):
+    def submit_at(self, key, fn, *args, droppable=False, bias=0.0, **kwargs):
+        """bias: added to the job's rank (a less urgent kind of job for the same key)."""
         outer = concurrent.futures.Future()
         with self._cv:
             self._seq += 1
-            self._q.append([self._seq, key, droppable, outer, fn, args, kwargs])
+            self._q.append([self._seq, key, droppable, outer, fn, args, kwargs, bias])
             if self._thread is None:
                 self._thread = threading.Thread(target=self._loop, daemon=True, name=f"{self.pool.name}-order")
                 self._thread.start()
@@ -240,7 +241,7 @@ class OrderedPool:
                     self.dropped += 1
                     outer.set_exception(Dropped(f"{key}: left behind"))
                     continue
-                r = (2, 0.0, seq) if d is None else (1, float(d), seq)
+                r = (2, 0.0, seq) if d is None else (1, float(d) + job[7], seq)
             if best_r is None or r < best_r:
                 best, best_r = job, r
         if best is not None:
@@ -258,7 +259,7 @@ class OrderedPool:
                 if not job[3].set_running_or_notify_cancel():
                     continue
                 self._running += 1
-            _, _, _, outer, fn, args, kwargs = job
+            outer, fn, args, kwargs = job[3:7]
             try:
                 inner = self.pool.submit(fn, *args, **kwargs)
             except BaseException as e:

@@ -332,6 +332,11 @@ PHOTO_PASSED_HALVES = float(os.environ.get("BNGE_PHOTO_PASSED_HALVES", "1") or 1
 # The photo process's jobs nearest the car first, a queued stand-in of a block left behind dropped before it starts
 # (pools.OrderedPool, Server._photo_rank). BNGE_PHOTO_ORDER=0: first come first served.
 PHOTO_ORDER = os.environ.get("BNGE_PHOTO_ORDER", "1") != "0"
+# ... and a full photo (a quality upgrade of ground that has its stand-in) ranked this far behind the stand-ins of a fast
+# player, every stand-in and photo of a block left behind dropped before it starts: in the 3-core drive (2026-11-04) the
+# photo process ran the block in use's 3.7 s full photos first (nearest), stand-ins of the blocks ahead waited 32 s
+# (p50, up to 165 s) and held both of their threads. BNGE_PHOTO_FULL_BIAS_M=0: by distance alone.
+PHOTO_FULL_BIAS_M = float(os.environ.get("BNGE_PHOTO_FULL_BIAS_M", "2000") or 0)
 PASSED_MIN_V = 15.0             # m/s: from here on a stand-in for a block the car has left behind is skipped (_passed)
 QUICK_BASE_PX = 512             # a block's stand-in photo (write_quick_base): the imagery alone, 2 m texels
 BASE_WAIT_S = 2.5               # ... and slower, this long: a slow photo held the heightmap thread and the blocks behind
@@ -2842,6 +2847,8 @@ class Server:
         t1 = time.perf_counter()
         photo = []
         name = self._base_elsewhere(anchor, cx, cy, pool, photo) if pool is not None else None
+        if name is DROPPED:
+            return None, photo, time.perf_counter() - t1      # (left behind: none here either)
         if name is None:
             with self.imagery.urgent() if urgent and hasattr(self.imagery, "urgent") else contextlib.nullcontext():
                 name = self.write_base(anchor, cx, cy, photo=photo, quick=quick)
@@ -2857,13 +2864,18 @@ class Server:
         tex = {"chain": [s.name for s in im.chain], "tone": self.tone, "leaf_on": im.leaf_on,
                "season_mode": im.season_mode}
         try:
-            sub = functools.partial(pool.submit_at, key) if hasattr(pool, "submit_at") else pool.submit
+            bias = PHOTO_FULL_BIAS_M if getattr(self, "fast", False) else 0.0
+            sub = (functools.partial(pool.submit_at, key, droppable=True, bias=bias) if hasattr(pool, "submit_at")
+                   else pool.submit)
             got = sub(blockworker.base_photo, anchor.lat, anchor.lon, cx - size / 2 - BASE_SHIFT_M,
                               cy - size / 2 - BASE_SHIFT_M, size,
                               BASE_RENDER_PX, tex, bool(self.buildings and self.mapdata is not None), anchor.zooms[0],
                               os.path.join(self.out_dir, name),
                               (self.user_dir, f"{self.vfs_dir}/{name}", base_ao_vfs(self.base_px), BASE_AO),
                               fuel_pads=self.block_fuel_pads(anchor, cx, cy, size), out_px=self.base_px).result()
+        except poolsmod.Dropped:
+            log.debug("base photo %s: dropped, the car left it behind", key)
+            return DROPPED
         except Exception as e:
             log.info("base photo %s in the block process: %s", key, e)
             return None
@@ -3090,9 +3102,10 @@ class Server:
     def _stand_in(self, anchor, cx, cy):
         """A requested block's stand-in photo made beside its heights (fast): in the prefetch lane's process, else
         here; its file name or None."""
-        return self._quick_once(anchor, cx, cy, lambda: self._quick_elsewhere(anchor, cx, cy, LANE_PREFETCH,
-                                                                              self.photo_pool)
-                                or self.write_quick_base(anchor, cx, cy))
+        def make():
+            got = self._quick_elsewhere(anchor, cx, cy, LANE_PREFETCH, self.photo_pool, droppable=True)
+            return None if got is DROPPED else (got or self.write_quick_base(anchor, cx, cy))
+        return self._quick_once(anchor, cx, cy, make)
 
     def _quick_once(self, anchor, cx, cy, make):
         """make() (a block's stand-in photo: its file name or None) once per block: a caller while it is being made
@@ -6083,6 +6096,8 @@ class Connection:
             # this interpreter's lock, its BC7 encode queued behind the prefetch lane's block (Munich, 2026-10-26)
             if s.photo_pool is not None and not s.analyses_here(anchor):
                 name = s._base_elsewhere(anchor, key[1], key[2], s.photo_pool, [], rev)
+                if name is DROPPED:
+                    return None
                 if name is not None:
                     return name
             pool = s.block_pools[LANE_PREFETCH][0] if s.block_pools else None     # its BC7 encode
