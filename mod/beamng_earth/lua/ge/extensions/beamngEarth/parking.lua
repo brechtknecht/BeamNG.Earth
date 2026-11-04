@@ -257,6 +257,14 @@ M.REBUILD_ROOM_MS = 4.0
 M.REBUILD_WAIT_FRAMES = 30
 local waited = 0
 
+M.START_MAX_MS = 3
+local function tooFastToStart()
+  if simTimeAuthority and simTimeAuthority.getPause and simTimeAuthority.getPause() then return false end
+  local veh = rawget(_G, 'getPlayerVehicle') and getPlayerVehicle(0)
+  local vel = veh and veh.getVelocity and veh:getVelocity()
+  return vel ~= nil and vel.x * vel.x + vel.y * vel.y > M.START_MAX_MS * M.START_MAX_MS
+end
+
 function M.update(aid, player, blk, gov)
   if aid ~= anchorId then
     anchorId = aid
@@ -285,6 +293,9 @@ function M.update(aid, player, blk, gov)
   -- (with them off and the stock system not loaded nothing reads the sites: loading it, parkingSystem, held a frame for
   -- 1.5-5 s at speed, A13 2026-11-04; the radial menu loads it, then hookSetup rebuilds them first)
   if off and not gpLoaded then return end
+  -- (with them on, the same load and the parked cars' start held a frame for 1.5-2.2 s at 200 mph, A13 2026-11-04: both
+  -- wait for a car that stands, or for a hold)
+  if not off and (not gpLoaded or not started) and tooFastToStart() then return end
   local t = os.clock()
   if t - lastBuild < (off and M.REBUILD_OFF_S or M.REBUILD_S) then return end
   if gov and gov.roomFor and waited < M.REBUILD_WAIT_FRAMES and not gov:roomFor(M.REBUILD_ROOM_MS) then
