@@ -320,6 +320,13 @@ RECENT_FULL = 2                 # full ground photos kept for the stand-ins' ove
 QUICK_MIN_COVER = 0.8          # share of a stand-in's texels real imagery must cover (else no stand-in)
 QUICK_SHARE_WAIT_S = 30.0       # Server._quick_once: a caller waits this long for the stand-in being made
 QUICK_MADE_KEPT = 256           # blocks whose stand-in file names _quick_once remembers
+# Photos (stand-ins, block photos) never in a block build process when a photo process exists, and the prefetch builds
+# spread over all prefetch processes: on the test PC (2 cores, 2026-11-04) the next block's build waited in prefetch
+# process 1 behind a 6.6 s photo of a block 2 km behind the car, and prefetch process 2 built no block at all
+# (every prefetch went to process 1). BNGE_LANE_FIX=0: as before.
+LANE_FIX = os.environ.get("BNGE_LANE_FIX", "1") != "0"
+# a queued stand-in is dropped once the car is this many half blocks past its centre (_quick_later; was 3)
+PHOTO_PASSED_HALVES = float(os.environ.get("BNGE_PHOTO_PASSED_HALVES", "1") or 1)
 PASSED_MIN_V = 15.0             # m/s: from here on a stand-in for a block the car has left behind is skipped (_passed)
 QUICK_BASE_PX = 512             # a block's stand-in photo (write_quick_base): the imagery alone, 2 m texels
 BASE_WAIT_S = 2.5               # ... and slower, this long: a slow photo held the heightmap thread and the blocks behind
@@ -2491,7 +2498,7 @@ class Server:
                 # (its stand-in photo now, beside the heights, in the other lane's process: made after them it took
                 # 1.3-5 s more of every block at 100-200 mph down Manhattan, nyc_speed.py 2026-11-02)
                 self.quick_futs[(anchor.id, cx, cy)] = self.quick_early.submit(self._stand_in, anchor, cx, cy)
-        pool = self.block_pools[lane][0] if self.block_pools and progress is None else None
+        pool = self._build_pool(lane) if self.block_pools and progress is None else None
         try:
             if pool is not None:
                 self.hm_stage[key] = "the block process"
@@ -2801,6 +2808,13 @@ class Server:
         m = ANALYSES_MARGIN_DEG
         lon = anchor.lon - 360.0 if anchor.lon > 0 else anchor.lon     # (the Aleutians reach past 180°)
         return s - m <= anchor.lat <= n + m and w - m <= lon <= e + m
+    def _build_pool(self, lane):
+        """The block process a build in lane goes to: the request lane's own; for the prefetch the least busy of the
+        prefetch processes (LANE_FIX; else always the first: the others built nothing)."""
+        if lane == LANE_REQUEST or not LANE_FIX or len(self.block_pools) <= 2:
+            return self.block_pools[lane][0]
+        return min((bp for bp, _ in self.block_pools[LANE_PREFETCH:]), key=lambda bp: bp.inflight)
+
     def _base_process(self, lane, anchor=None):
         """The block process that renders the base photo of a block built in lane (blockworker.base_photo): the
         other lane's, usually idle while this one builds the heights; None (rendered here) with the imagery
@@ -2810,8 +2824,9 @@ class Server:
         here = self.analyses_here(anchor) if anchor is not None else (self.deshadow is not None or self.colormatch is not None)
         if here and not (URGENT_ELSEWHERE and lane == LANE_REQUEST):
             return None
-        if lane == LANE_REQUEST and getattr(self, "photo_pool", None) is not None and not getattr(self, "fast", False):
-            return self.photo_pool      # (fast: the photo process makes its stand-in first, _stand_in)
+        if getattr(self, "photo_pool", None) is not None and (
+                LANE_FIX or (lane == LANE_REQUEST and not getattr(self, "fast", False))):
+            return self.photo_pool      # (LANE_FIX: never ahead of a block build in a block process)      # (fast: the photo process makes its stand-in first, _stand_in)
         return self.block_pools[LANE_PREFETCH if lane == LANE_REQUEST else LANE_REQUEST][0]
 
     def _base_photo(self, anchor, cx, cy, pool=None, urgent=False, quick=False):
@@ -2966,9 +2981,10 @@ class Server:
         info = self.hm.get(key)
         if info is not None and info.get("base"):
             return                              # (its own photo came while this waited its turn)
-        if self._passed(anchor, cx, cy):
+        if self._passed(anchor, cx, cy, PHOTO_PASSED_HALVES if LANE_FIX else 3):
             return                              # (the car has left it behind: its stand-in would be wasted)
-        name = self._quick_once(anchor, cx, cy, lambda: self._quick_elsewhere(anchor, cx, cy, LANE_PREFETCH)
+        photo = getattr(self, "photo_pool", None) if LANE_FIX else None
+        name = self._quick_once(anchor, cx, cy, lambda: self._quick_elsewhere(anchor, cx, cy, LANE_PREFETCH, photo)
                                 or self.write_quick_base(anchor, cx, cy))
         conns = [c for c in list(self.connections) if getattr(c, "loop", None) is not None]
         if not name or not conns:
@@ -2991,7 +3007,7 @@ class Server:
         except RuntimeError:
             pass                                # (the loop has closed)
 
-    def _passed(self, anchor, cx, cy):
+    def _passed(self, anchor, cx, cy, halves=3):
         """Whether the car (a connection's, on this anchor) moving faster than PASSED_MIN_V has left block (cx, cy)
         behind by more than a block: one queued stand-in after another (quick_pool, one thread) waited for blocks the
         car had passed long ago, 6472 thread-s of queue in a 32 km drive at 168 mph (A13 2026-11-04)."""
@@ -3004,7 +3020,7 @@ class Server:
             if v < PASSED_MIN_V:
                 return False
             along = ((cx - x) * vx + (cy - y) * vy) / v
-            return along < -3 * half
+            return along < -halves * half
         return False
 
     def _base_later(self, key, fut, tries=4):

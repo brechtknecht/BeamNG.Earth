@@ -215,11 +215,23 @@ class BaseRoutingTest(unittest.TestCase):
         self.assertIsNone(S._base_process(SimpleNamespace(**{**vars(s), "block_pools": []}), earthd.LANE_REQUEST))
         # the photo process (PHOTO_PROCESS_MIN_CPUS): a requested block's photo there below FAST_BASE_V; faster, it
         # makes the stand-in first and the photo goes to the other lane as before
+        # (LANE_FIX: every photo there, never ahead of a block build in a block process)
         p = SimpleNamespace(**{**vars(s), "photo_pool": "photo", "fast": False})
         self.assertEqual((S._base_process(p, earthd.LANE_REQUEST), S._base_process(p, earthd.LANE_PREFETCH)),
-                         ("photo", "request"))
+                         ("photo", "photo" if earthd.LANE_FIX else "request"))
         p.fast = True
-        self.assertEqual(S._base_process(p, earthd.LANE_REQUEST), "prefetch")
+        self.assertEqual(S._base_process(p, earthd.LANE_REQUEST), "photo" if earthd.LANE_FIX else "prefetch")
+
+    def test_prefetch_spread(self):
+        """LANE_FIX: a prefetch build goes to the least busy prefetch process (the second one built nothing)."""
+        import earthd
+        S = earthd.Server
+        pools = [SimpleNamespace(inflight=n) for n in (3, 1, 0)]
+        s = SimpleNamespace(block_pools=[(bp, None) for bp in pools])
+        self.assertIs(S._build_pool(s, earthd.LANE_REQUEST), pools[0])
+        self.assertIs(S._build_pool(s, earthd.LANE_PREFETCH), pools[2] if earthd.LANE_FIX else pools[1])
+        pools[2].inflight = 2
+        self.assertIs(S._build_pool(s, earthd.LANE_PREFETCH), pools[1])
         calls = []
 
         def write_base(anchor, cx, cy, photo=None, quick=False):
