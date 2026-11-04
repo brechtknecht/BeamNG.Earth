@@ -347,6 +347,15 @@ LAG_TICK_S, LAG_REPORT_S = 0.1, 0.25     # the event-loop stall report (-v)
 FIN_WORKER_WINDOW, FIN_WORKER_MIN_TRIES, FIN_WORKER_SHARE, FIN_WORKER_PROBE = 40, 10, 0.3, 5   # (fin_worker_worth)
 FIN_WORKER = os.environ.get("BNGE_FIN_WORKER", "1") != "0"     # (A/B: 0 renders them all here, as before)
 LAG_STALL_S = 2.0                     # s: a stall this long is logged without -v (its stack, then its length)
+# A prefetched block's photo in the photo process too, never in the request lane's block process: there a 6.6 s
+# photo of a block 2 km behind the car held up the build of the block the car was about to reach (200 mph, 2 cores,
+# 2026-11-04). BNGE_PHOTOS_OFF_BUILDS=0: in the request lane's block process, as before.
+PHOTOS_OFF_BUILDS = os.environ.get("BNGE_PHOTOS_OFF_BUILDS", "1") != "0"
+# ... and the photo process's jobs nearest the car first, not first come first served (pools.OrderedPool,
+# Server._photo_rank): the photos of blocks the car had passed went last. BNGE_PHOTO_ORDER=0: first come first served.
+PHOTO_ORDER = os.environ.get("BNGE_PHOTO_ORDER", "1") != "0"
+PHOTO_BEHIND_MIN_V = 15.0       # m/s: from here on a block more than PHOTO_BEHIND_HALVES half blocks behind goes last
+PHOTO_BEHIND_HALVES = 1.0
 ROAD_PROCESSES = 2              # road-tile processes (--block-process on, --roads on)
 # s a road tile may take in its worker before it is given up and its workers restarted (build_roads_tile): a first
 # visit's slowest tiles take ~1 min on a busy 6-core laptop and several times that on a Steam Deck, where a tile given
@@ -2888,7 +2897,8 @@ class Server:
         disk (_base_elsewhere), else it is rendered here."""
         if not self.block_pools or self.imagery is None:
             return None
-        if lane == LANE_REQUEST and getattr(self, "photo_pool", None) is not None and not getattr(self, "fast", False):
+        if getattr(self, "photo_pool", None) is not None and (
+                PHOTOS_OFF_BUILDS or (lane == LANE_REQUEST and not getattr(self, "fast", False))):
             return self.photo_pool      # (fast: the photo process makes its stand-in first, _stand_in)
         return self.block_pools[LANE_PREFETCH if lane == LANE_REQUEST else LANE_REQUEST][0]
 
@@ -2931,7 +2941,8 @@ class Server:
         if fin:
             tex["fin"] = fin
         try:
-            got = pool.submit(blockworker.base_photo, anchor.lat, anchor.lon, cx - size / 2 - BASE_SHIFT_M,
+            sub = functools.partial(pool.submit_at, key) if hasattr(pool, "submit_at") else pool.submit
+            got = sub(blockworker.base_photo, anchor.lat, anchor.lon, cx - size / 2 - BASE_SHIFT_M,
                               cy - size / 2 - BASE_SHIFT_M, size,
                               BASE_RENDER_PX, tex, bool(self.buildings and self.mapdata is not None), anchor.zooms[0],
                               os.path.join(self.out_dir, name),
@@ -3167,6 +3178,22 @@ class Server:
                         self.quick_made.clear()
                     self.quick_made[key] = fut.result()
 
+    def _photo_rank(self, key):
+        """OrderedPool's rank of block key's photo: its distance from the car; None (last) when the car moves faster
+        than PHOTO_BEHIND_MIN_V and has left it more than PHOTO_BEHIND_HALVES half blocks behind; 0 without a car on
+        its anchor."""
+        aid, cx, cy = key
+        half = self.layout.block * heightmap.SQUARE / 2
+        for c in list(self.connections):
+            if getattr(c, "active", None) != aid:
+                continue
+            (x, y), (vx, vy) = getattr(c, "focus", (0.0, 0.0)), getattr(c, "vel", (0.0, 0.0))
+            v = math.hypot(vx, vy)
+            if v >= PHOTO_BEHIND_MIN_V and ((cx - x) * vx + (cy - y) * vy) / v < -PHOTO_BEHIND_HALVES * half:
+                return None
+            return math.hypot(cx - x, cy - y)
+        return 0.0
+
     def _quick_elsewhere(self, anchor, cx, cy, lane, pool=None):
         """write_quick_base in the block's own lane process (idle once its heights are built: blockworker.base_photo
         quick), at FAST_BASE_V and over or when no recent full photo overlaps it (those pasted in need this process;
@@ -3187,7 +3214,8 @@ class Server:
                "season_mode": im.season_mode}
         t0 = time.perf_counter()
         try:
-            got = (pool or self.block_pools[lane][0]).submit(
+            p = pool or self.block_pools[lane][0]
+            got = (functools.partial(p.submit_at, key) if hasattr(p, "submit_at") else p.submit)(
                 blockworker.base_photo, anchor.lat, anchor.lon, cx - size / 2 - BASE_SHIFT_M,
                 cy - size / 2 - BASE_SHIFT_M, size, QUICK_BASE_PX, tex, False, anchor.zooms[0],
                 os.path.join(self.out_dir, name), (self.user_dir, f"{self.vfs_dir}/{name}", base_ao_vfs(self.base_px),
@@ -6991,7 +7019,7 @@ async def main_async(args):
         if args.near_visual == "detail" and (os.cpu_count() or 0) >= PHOTO_PROCESS_MIN_CPUS:
             # requested blocks' photos and stand-ins in a process of their own (Server._base_process / _stand_in)
             photo_pool = poolsmod.RespawningPool(
-                "photo", 1, mp_context=ctx, initializer=blockworker.init,
+                "photo", 1, mp_context=ctx, initializer=blockworker.init_photo,
                 initargs=(args.cache_dir, args.offline, args.roads == "on",
                           args.grading == "on" and args.roads == "on",
                           args.road_widths == "on" and args.roads == "on", args.surface == "on", None,
@@ -7083,6 +7111,8 @@ async def main_async(args):
 
     server.game_cpus = getattr(args, "game_cpus", None)    # (cpupin.py: the game pinned at each hello)
     server.server_cpus = getattr(args, "server_cpus", None)
+    if photo_pool is not None and PHOTO_ORDER:
+        photo_pool = poolsmod.OrderedPool(photo_pool, server._photo_rank)
     server.photo_pool = photo_pool
     server.boost_cpus = (cpupin.boosted(server.server_cpus, server.game_cpus)
                          if getattr(args, "load_boost", "on") == "on" else None)

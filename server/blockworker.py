@@ -201,6 +201,16 @@ def init(cache_dir, offline, roads, grading, road_widths, surface, warm_q, log_l
         threading.Thread(target=_read_warm, args=(warm_q,), daemon=True, name="warm-read").start()
         threading.Thread(target=_warm_loop, daemon=True, name="roads-ahead").start()
 
+def init_photo(*args, **kwargs):
+    """init for the photos' process, above the server's other processes (budget.photo_priority)."""
+    import budget
+    try:
+        budget.photo_priority()
+    except (OSError, AttributeError):
+        pass
+    init(*args, **kwargs)
+
+
 
 def _watch_parent(ppid):
     """Exit with the server: a killed server (SIGTERM) left its block processes running. Windows: os.getppid() keeps

@@ -7,6 +7,7 @@ import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 
@@ -213,13 +214,19 @@ class BaseRoutingTest(unittest.TestCase):
             self.assertEqual(S._base_process(SimpleNamespace(**{**vars(s), k: object()}), earthd.LANE_REQUEST),
                              "prefetch", k)
         self.assertIsNone(S._base_process(SimpleNamespace(**{**vars(s), "block_pools": []}), earthd.LANE_REQUEST))
-        # the photo process (PHOTO_PROCESS_MIN_CPUS): a requested block's photo there below FAST_BASE_V; faster, it
-        # makes the stand-in first and the photo goes to the other lane as before
+        # the photo process (PHOTO_PROCESS_MIN_CPUS): every photo there, never in a block build process
+        # (PHOTOS_OFF_BUILDS); off: a requested block's photo there below FAST_BASE_V, else the other lane's
         p = SimpleNamespace(**{**vars(s), "photo_pool": "photo", "fast": False})
         self.assertEqual((S._base_process(p, earthd.LANE_REQUEST), S._base_process(p, earthd.LANE_PREFETCH)),
-                         ("photo", "request"))
+                         ("photo", "photo"))
         p.fast = True
-        self.assertEqual(S._base_process(p, earthd.LANE_REQUEST), "prefetch")
+        self.assertEqual(S._base_process(p, earthd.LANE_REQUEST), "photo")
+        with mock.patch.object(earthd, "PHOTOS_OFF_BUILDS", False):
+            p.fast = False
+            self.assertEqual((S._base_process(p, earthd.LANE_REQUEST), S._base_process(p, earthd.LANE_PREFETCH)),
+                             ("photo", "request"))
+            p.fast = True
+            self.assertEqual(S._base_process(p, earthd.LANE_REQUEST), "prefetch")
         calls = []
 
         def write_base(anchor, cx, cy, photo=None, quick=False):

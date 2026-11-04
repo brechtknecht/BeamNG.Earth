@@ -247,6 +247,7 @@ def trim():
 # far workers got nothing at all (a Windows player, i5-9400F, 1.6.1: "distant land 5/514", only the land near the car
 # loading). os.nice elsewhere only weights the share.
 WIN_BELOW_NORMAL = 0x4000
+WIN_NORMAL = 0x20
 
 
 def lower_priority(nice, worker=False):
@@ -271,6 +272,25 @@ def lower_priority(nice, worker=False):
         raise OSError("SetPriorityClass(below normal) failed")
     return "below normal"
 
+
+
+def photo_priority():
+    """Windows: this process (the photos') in the "normal" class, above the server's other processes on its pinned
+    cores. Each level of a photo's mip chain is a fork and join over its threads, 12 in all: at one priority beside the
+    far, road and tree workers its 0.13 s took 3.2 s (a stand-in 8 s behind the block, 28 of 68 blocks shown without a
+    photo at 200 mph, 2026-11-04); a class above them 0.13 s beside 10 busy processes. BNGE_PHOTO_PRIORITY=0: off.
+    Returns the change or None."""
+    if sys.platform != "win32" or os.environ.get("BNGE_PHOTO_PRIORITY", "1") == "0":
+        return None
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.GetCurrentProcess.restype = wintypes.HANDLE
+    k32.SetPriorityClass.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    k32.SetPriorityClass.restype = wintypes.BOOL
+    if not k32.SetPriorityClass(k32.GetCurrentProcess(), WIN_NORMAL):
+        raise OSError("SetPriorityClass(normal) failed")
+    return "normal"
 
 def road_processes(cpus=None, gb=None):
     """Road-tile processes for a desktop (ROAD_PROCESSES_BY_CPU), 2 below them."""

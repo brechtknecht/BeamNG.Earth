@@ -103,5 +103,13 @@ class PriorityTest(unittest.TestCase):
             self.assertEqual(int(got[0]), min(3, 19 - int(got[1])))
 
 
+class PhotoPriorityTest(unittest.TestCase):
+    def test_off_elsewhere_or_switched_off(self):
+        with mock.patch.dict(os.environ, {"BNGE_PHOTO_PRIORITY": "0"}):
+            self.assertIsNone(budget.photo_priority())
+        if sys.platform != "win32":
+            self.assertIsNone(budget.photo_priority())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -125,5 +125,37 @@ class RespawnTest(unittest.TestCase):
             p.shutdown()
 
 
+class OrderedPoolTest(unittest.TestCase):
+    """OrderedPool: one job at a time to the pool, keyless first, then the lowest rank; a droppable job ranked None
+    is dropped before it starts."""
+
+    def test_order_and_drop(self):
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+        gate, order = threading.Event(), []
+        inner = ThreadPoolExecutor(1)
+        inner.name, inner.workers = "t", 1
+        ranks = {"far": 900.0, "near": 10.0, "behind": None, "behind_keep": None}
+        p = pools.OrderedPool(inner, ranks.get)
+        try:
+            first = p.submit(gate.wait)                     # (holds the one worker while the rest queue)
+            futs = {k: p.submit_at(k, order.append, k, droppable=k == "behind") for k in ranks}
+            keyless = p.submit(order.append, "keyless")
+            self.assertEqual(p.inflight, 6)
+            gate.set()
+            first.result(5)
+            keyless.result(5)
+            for k in ("far", "near", "behind_keep"):
+                futs[k].result(5)
+            with self.assertRaises(pools.Dropped):
+                futs["behind"].result(5)
+            self.assertEqual(order, ["keyless", "near", "far", "behind_keep"])
+            self.assertEqual(p.dropped, 1)
+        finally:
+            inner.shutdown()
+
+
+
+
 if __name__ == "__main__":
     unittest.main()
