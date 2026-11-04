@@ -100,7 +100,9 @@ class _State:
                     self.graders[aid].dem = self.dem          # (its urgent lane: _plan_missing)
                     self.graders[aid].shared = plancache.for_grader(self.cache_dir, self.graders[aid], self.widths,
                                                                    self.graders[aid].wet)
-                for old in sorted(self.chunks)[:-ANCHORS_KEPT]:
+                # (never the one just made: a late block of an older anchor after a teleport evicted its own entry,
+                # KeyError at the return, 2026-11-04)
+                for old in sorted(k for k in self.chunks if k != aid)[:max(0, len(self.chunks) - ANCHORS_KEPT)]:
                     del self.chunks[old], self.graders[old]
             return self.graders[aid], self.chunks[aid]
 
