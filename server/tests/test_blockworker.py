@@ -288,8 +288,8 @@ class BaseElsewhereStaleTest(unittest.TestCase):
             s.analyses_here.return_value = here
             pool = SimpleNamespace(submit=lambda *a, **k: done)
             photo = []
-            name = earthd.Server._base_elsewhere(s, SimpleNamespace(id=1, lat=0.0, lon=0.0, zooms=[15]), 0.0, 0.0, pool,
-                                                 photo, 3)
+            name = earthd.Server._base_in(s, SimpleNamespace(id=1, lat=0.0, lon=0.0, zooms=[15]), 0.0, 0.0, pool,
+                                          photo, None, 3)
             self.assertEqual((name, photo, s.base_stale), ("b.png", ["rgb"], stale))
 
 
