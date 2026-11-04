@@ -2896,9 +2896,11 @@ class Server:
             return None
         rgb, _, pending = got
         self._base_kept(anchor, cx, cy, pending)
-        if self.deshadow is not None or self.colormatch is not None:
+        if self.analyses_here(anchor):
             # (rendered without the imagery analyses, which live in this process: rendered again here with them,
-            # base_refresh, as a photo rendered before they were done)
+            # base_refresh, as a photo rendered before they were done. Only where they change the photo: in Europe
+            # base_refresh came back here and marked it stale again, 323 renders for 88 blocks of a 200 mph drive, a
+            # 100 ms frame at each once the photos were fast, 2026-11-04)
             self.base_stale.add(key)
         photo.append(rgb)
         self.base_worker += 1

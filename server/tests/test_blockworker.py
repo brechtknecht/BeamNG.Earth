@@ -247,6 +247,29 @@ class BaseRoutingTest(unittest.TestCase):
         self.assertEqual((name, photo, calls), ("there.png", ["there"], [(1, 2)]))
 
 
+class BaseElsewhereStaleTest(unittest.TestCase):
+    def test_stale_only_where_the_analyses_change_the_photo(self):
+        """A photo from the photo process goes back to base_refresh only where the imagery analyses change it. In
+        Europe base_refresh rendered it there again and it came back stale: without end, 323 renders for 88 blocks."""
+        import concurrent.futures
+        from unittest import mock
+        import earthd
+        for here, stale in ((False, set()), (True, {(1, 0.0, 0.0)})):
+            done = concurrent.futures.Future()
+            done.set_result(("rgb", {}, set()))
+            s = mock.MagicMock(base_stale=set(), out_dir="o", vfs_dir="v", user_dir="u", base_px=2048, fast=False,
+                               deshadow=object(), colormatch=None, buildings=False, base_worker=0)
+            s.layout.block = 512
+            s.imagery.chain = []
+            s.base_name.return_value = "b.png"
+            s.analyses_here.return_value = here
+            pool = SimpleNamespace(submit=lambda *a, **k: done)
+            photo = []
+            name = earthd.Server._base_elsewhere(s, SimpleNamespace(id=1, lat=0.0, lon=0.0, zooms=[15]), 0.0, 0.0, pool,
+                                                 photo, 3)
+            self.assertEqual((name, photo, s.base_stale), ("b.png", ["rgb"], stale))
+
+
 class PhotoRankTest(unittest.TestCase):
     def test_rank(self):
         import earthd
