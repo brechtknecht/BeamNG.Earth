@@ -136,6 +136,7 @@ M.COLD_SPELLINGS = 2
 -- soon met 60-110 first loads at speed, each holding the frame in createNewItem and the tick, up to 2.7 s (A13 drives,
 -- 2026-11-03: 16 of them over 200 ms took 18.7 s of a run).
 M.WARM_ALL = true
+M.warmWanted = {}       -- base shape -> a tile's groups name it (queueWarm)
 
 local ECA = '/levels/east_coast_usa/art/shapes/'
 local WCA = '/levels/west_coast_usa/art/shapes/'
@@ -692,16 +693,19 @@ local function queueWarmAll()
   local groups = {}
   for g in pairs(M.CATALOG) do groups[#groups + 1] = g end
   table.sort(groups)
-  queueWarm(groups)
+  queueWarm(groups, false)
 end
 
-queueWarm = function(groups)
+-- wanted: a tile named them: they go first (warmFront), spellings too (a shape's other spelling is a load of its own:
+-- 800 ms for sign_logistics, A13 2026-11-04).
+queueWarm = function(groups, wanted)
   for _, g in ipairs(groups or {}) do
     local list = M.CATALOG[g] or {}
     local body = vienna.body(g)
     if body then list = { { body }, unpack(list) } end
     for _, v in ipairs(list) do
       local b = v[1]
+      if wanted then M.warmWanted[b] = true end
       if not warmQueued[b] then
         warmQueued[b] = true
         warmBases[#warmBases + 1] = b
@@ -750,15 +754,26 @@ local function warmShape(shape, player, frame)
   M.warmLoads = M.warmLoads + 1
 end
 
--- One shape loaded ahead (else up to WARM_SPELLINGS spellings of loaded ones).
-local function warmStep(player, frame)
-  local list, n = warmBases, 1
-  while #warmBases > 0 and loadedBase[warmBases[1]] do table.remove(warmBases, 1) end
-  if #warmBases == 0 then
-    while #warmSpells > 0 and loaded[warmSpells[1]] do table.remove(warmSpells, 1) end
-    if #warmSpells == 0 then return end
-    list, n = warmSpells, M.WARM_SPELLINGS
+-- The first of list a tile wants moved to its front; false when there is none. done: those already loaded go.
+local function warmFront(list, done)
+  while #list > 0 and done[list[1]] do table.remove(list, 1) end
+  for i, s in ipairs(list) do
+    if not done[s] and M.warmWanted[M.baseOf(s)] then
+      if i > 1 then table.insert(list, 1, table.remove(list, i)) end
+      return true
+    end
   end
+  return false
+end
+
+-- One shape loaded ahead (else up to WARM_SPELLINGS spellings of loaded ones): those the tiles want, then the rest.
+local function warmStep(player, frame)
+  local list, n
+  if warmFront(warmBases, loadedBase) then list, n = warmBases, 1
+  elseif warmFront(warmSpells, loaded) then list, n = warmSpells, M.WARM_SPELLINGS
+  elseif #warmBases > 0 then list, n = warmBases, 1
+  elseif #warmSpells > 0 then list, n = warmSpells, M.WARM_SPELLINGS
+  else return end
   for _ = 1, n do
     local shape = list[1]
     if not shape or not coldOk(shape) then return end
@@ -870,7 +885,7 @@ local function addTile(anchorId, tileKey, flat, stride, groups, geo)
   end
   tiles[key] = t
   dirty = true
-  queueWarm(t.groups or GROUPS)
+  queueWarm(t.groups or GROUPS, true)
 end
 
 -- Pure-ish: a geotile's centre and half size in the current placement (t.pl), for the distances.
@@ -1289,7 +1304,8 @@ function M.update(anchorId, player, view, frameMs)
   local veh = getPlayerVehicle and getPlayerVehicle(0)
   local vel = veh and veh.getVelocity and veh:getVelocity()
   local sp = vel and math.sqrt(vel.x * vel.x + vel.y * vel.y) or 0
-  slowNow = sp < M.WARM_MAX_MS
+  -- (or the game paused: an edge hold, where a load's stall shows nothing)
+  slowNow = sp < M.WARM_MAX_MS or (simTimeAuthority and simTimeAuthority.getPause and simTimeAuthority.getPause()) or false
   if player and slowNow and M.FIRST_LOADS then warmStep(player, frameN) end
   if not next(tiles) then return end
   -- (the car starting or stopping changes what collides: M.cellMask's corridor from FAST_MS on)
@@ -1578,7 +1594,7 @@ function M.reset()
   tiles, types, ready, pool, forestCount, pop = {}, {}, false, {}, 0, {}
   dirty, lastPass = true, nil
   loaded, loadedBase, warmBases, warmSpells, warmQueued, warmItems, warmForestId = {}, {}, {}, {}, {}, {}, nil
-  M.warmAllQueued = false
+  M.warmAllQueued, M.warmWanted = false, {}
   coldLast, M.coldRecent, clock, M.coldLoads, M.warmLoads = nil, {}, nil, 0, 0
 end
 
