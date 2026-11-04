@@ -2229,6 +2229,7 @@ local function onUpdate(dtReal, dtSim)
       t = mark('sea', t)
       -- the trees' own Lua time a frame (trees.lua FRAME_MS), more while the world loads, none in a heavy frame, the
       -- quiet frames round it or while a heavy op waits for them (governor.lua: a heavy frame stays a lone spike)
+      trees.warmTilesOnly = not M.groundReady()
       trees.update(st.anchorId, st.player, M.viewAway(), (gov.blocked or gov.heavyPending or gov:isHeavyFrame()) and 0
         or (gov.loading and trees.LOADING_FRAME_MS or trees.FRAME_MS))
       t = mark('trees', t)

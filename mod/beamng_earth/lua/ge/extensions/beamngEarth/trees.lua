@@ -137,6 +137,7 @@ M.COLD_SPELLINGS = 2
 -- 2026-11-03: 16 of them over 200 ms took 18.7 s of a run).
 M.WARM_ALL = true
 M.warmWanted = {}       -- base shape -> a tile's groups name it (queueWarm)
+M.warmTilesOnly = false -- core.lua, while the ground under the car loads: only those, the rest of the catalog once it stands
 
 local ECA = '/levels/east_coast_usa/art/shapes/'
 local WCA = '/levels/west_coast_usa/art/shapes/'
@@ -771,6 +772,7 @@ local function warmStep(player, frame)
   local list, n
   if warmFront(warmBases, loadedBase) then list, n = warmBases, 1
   elseif warmFront(warmSpells, loaded) then list, n = warmSpells, M.WARM_SPELLINGS
+  elseif M.warmTilesOnly then return
   elseif #warmBases > 0 then list, n = warmBases, 1
   elseif #warmSpells > 0 then list, n = warmSpells, M.WARM_SPELLINGS
   else return end
