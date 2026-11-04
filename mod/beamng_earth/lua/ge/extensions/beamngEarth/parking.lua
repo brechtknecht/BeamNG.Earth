@@ -279,8 +279,12 @@ function M.update(aid, player, blk, gov)
   -- no parked cars (the player's choice, or removed): the sites only every REBUILD_OFF_S (a rebuild cost 24 ms every
   -- few seconds while driving, used by nobody, up to 88 ms on a Steam Deck); turning them on (the radial menu: the
   -- stock setupVehicles) rebuilds them first (hookSetup)
-  local gpOn = gameplay_parking and gameplay_parking.getState and gameplay_parking.getState()
+  local gpLoaded = rawget(_G, 'gameplay_parking')
+  local gpOn = gpLoaded and gpLoaded.getState and gpLoaded.getState()
   local off = not gpOn and (started or not require('beamngEarth/navgraph').choice.parked)
+  -- (with them off and the stock system not loaded nothing reads the sites: loading it, parkingSystem, held a frame for
+  -- 1.5-5 s at speed, A13 2026-11-04; the radial menu loads it, then hookSetup rebuilds them first)
+  if off and not gpLoaded then return end
   local t = os.clock()
   if t - lastBuild < (off and M.REBUILD_OFF_S or M.REBUILD_S) then return end
   if gov and gov.roomFor and waited < M.REBUILD_WAIT_FRAMES and not gov:roomFor(M.REBUILD_ROOM_MS) then
