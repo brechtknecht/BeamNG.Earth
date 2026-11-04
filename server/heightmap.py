@@ -130,24 +130,56 @@ class ChunkCache:
     with the last; computing all of them every move took 2-10 s, more than the 2.2 s between moves at
     58 m/s, 2026-10-12). Exact: the heights are elementwise (surface_u). LRU, thread-safe."""
 
-    def __init__(self, cap=CHUNK_CACHE):
+    def __init__(self, cap=CHUNK_CACHE, disk=None):
         self.cap = cap
         self.chunks = OrderedDict()             # (kx, ky) lattice chunk -> (CHUNK, CHUNK) float64 [j, i]
         self.lock = threading.Lock()
+        # disk: a folder the block processes of one server run share (blockworker: the same anchor's): a chunk one of
+        # them computed is read there by the others. Per process, the prefetch's second process and the request
+        # process computed every sample of most blocks (newShare 1.0, ~4.9 s a block against ~3.1 s in the first
+        # prefetch process, the test PC 2026-11-04)
+        self.disk = disk
+
+    def _path(self, k):
+        return os.path.join(self.disk, f"{k[0]}_{k[1]}.f8")
 
     def get(self, k):
         with self.lock:
             got = self.chunks.get(k)
             if got is not None:
                 self.chunks.move_to_end(k)
-            return got
+                return got
+        if self.disk is None:
+            return None
+        try:
+            got = np.fromfile(self._path(k), "<f8")
+        except OSError:
+            return None
+        if got.size != CHUNK * CHUNK:
+            return None                         # (one being written: os.replace makes that rare)
+        got = got.reshape(CHUNK, CHUNK)
+        self._keep(k, got)
+        return got
 
-    def put(self, k, u):
+    def _keep(self, k, u):
         with self.lock:
             self.chunks[k] = u
             self.chunks.move_to_end(k)
             while len(self.chunks) > self.cap:
                 self.chunks.popitem(last=False)
+
+    def put(self, k, u):
+        self._keep(k, u)
+        if self.disk is None:
+            return
+        try:
+            os.makedirs(self.disk, exist_ok=True)
+            path = self._path(k)
+            tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+            np.ascontiguousarray(u, "<f8").tofile(tmp)
+            os.replace(tmp, path)
+        except OSError:
+            pass                                # (only the sharing lost)
 
     def drop(self, keys):
         """Forget these chunks (graded from plans that turned out different: blockworker._resolve_regions)."""

@@ -60,6 +60,7 @@ os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 import argparse  # noqa: E402
 import asyncio  # noqa: E402
 import contextlib  # noqa: E402
+import functools  # noqa: E402
 import glob  # noqa: E402
 import itertools  # noqa: E402
 import json  # noqa: E402
@@ -324,9 +325,13 @@ QUICK_MADE_KEPT = 256           # blocks whose stand-in file names _quick_once r
 # spread over all prefetch processes: on the test PC (2 cores, 2026-11-04) the next block's build waited in prefetch
 # process 1 behind a 6.6 s photo of a block 2 km behind the car, and prefetch process 2 built no block at all
 # (every prefetch went to process 1). BNGE_LANE_FIX=0: as before.
+DROPPED = object()      # Server._quick_elsewhere: its stand-in dropped (pools.Dropped), none made here either
 LANE_FIX = os.environ.get("BNGE_LANE_FIX", "1") != "0"
 # a queued stand-in is dropped once the car is this many half blocks past its centre (_quick_later; was 3)
 PHOTO_PASSED_HALVES = float(os.environ.get("BNGE_PHOTO_PASSED_HALVES", "1") or 1)
+# The photo process's jobs nearest the car first, a queued stand-in of a block left behind dropped before it starts
+# (pools.OrderedPool, Server._photo_rank). BNGE_PHOTO_ORDER=0: first come first served.
+PHOTO_ORDER = os.environ.get("BNGE_PHOTO_ORDER", "1") != "0"
 PASSED_MIN_V = 15.0             # m/s: from here on a stand-in for a block the car has left behind is skipped (_passed)
 QUICK_BASE_PX = 512             # a block's stand-in photo (write_quick_base): the imagery alone, 2 m texels
 BASE_WAIT_S = 2.5               # ... and slower, this long: a slow photo held the heightmap thread and the blocks behind
@@ -2852,7 +2857,8 @@ class Server:
         tex = {"chain": [s.name for s in im.chain], "tone": self.tone, "leaf_on": im.leaf_on,
                "season_mode": im.season_mode}
         try:
-            got = pool.submit(blockworker.base_photo, anchor.lat, anchor.lon, cx - size / 2 - BASE_SHIFT_M,
+            sub = functools.partial(pool.submit_at, key) if hasattr(pool, "submit_at") else pool.submit
+            got = sub(blockworker.base_photo, anchor.lat, anchor.lon, cx - size / 2 - BASE_SHIFT_M,
                               cy - size / 2 - BASE_SHIFT_M, size,
                               BASE_RENDER_PX, tex, bool(self.buildings and self.mapdata is not None), anchor.zooms[0],
                               os.path.join(self.out_dir, name),
@@ -2984,8 +2990,11 @@ class Server:
         if self._passed(anchor, cx, cy, PHOTO_PASSED_HALVES if LANE_FIX else 3):
             return                              # (the car has left it behind: its stand-in would be wasted)
         photo = getattr(self, "photo_pool", None) if LANE_FIX else None
-        name = self._quick_once(anchor, cx, cy, lambda: self._quick_elsewhere(anchor, cx, cy, LANE_PREFETCH, photo)
-                                or self.write_quick_base(anchor, cx, cy))
+
+        def make():
+            got = self._quick_elsewhere(anchor, cx, cy, LANE_PREFETCH, photo, droppable=True)
+            return None if got is DROPPED else (got or self.write_quick_base(anchor, cx, cy))
+        name = self._quick_once(anchor, cx, cy, make)
         conns = [c for c in list(self.connections) if getattr(c, "loop", None) is not None]
         if not name or not conns:
             return
@@ -3006,6 +3015,22 @@ class Server:
             conns[0].loop.call_soon_threadsafe(apply)
         except RuntimeError:
             pass                                # (the loop has closed)
+
+    def _photo_rank(self, key):
+        """OrderedPool's rank of block key's photo: its distance from the car (ahead of it as it is; behind it by more
+        than PHOTO_PASSED_HALVES half blocks, moving: None, left behind); 0 without a car on its anchor."""
+        aid, cx, cy = key
+        half = self.layout.block * heightmap.SQUARE / 2
+        for c in list(self.connections):
+            if getattr(c, "active", None) != aid:
+                continue
+            (x, y), (vx, vy) = getattr(c, "focus", (0.0, 0.0)), getattr(c, "vel", (0.0, 0.0))
+            v = math.hypot(vx, vy)
+            d = math.hypot(cx - x, cy - y)
+            if v >= PASSED_MIN_V and ((cx - x) * vx + (cy - y) * vy) / v < -PHOTO_PASSED_HALVES * half:
+                return None
+            return d
+        return 0.0
 
     def _passed(self, anchor, cx, cy, halves=3):
         """Whether the car (a connection's, on this anchor) moving faster than PASSED_MIN_V has left block (cx, cy)
@@ -3104,7 +3129,7 @@ class Server:
                         self.quick_made.clear()
                     self.quick_made[key] = fut.result()
 
-    def _quick_elsewhere(self, anchor, cx, cy, lane, pool=None):
+    def _quick_elsewhere(self, anchor, cx, cy, lane, pool=None, droppable=False):
         """write_quick_base in the block's own lane process (idle once its heights are built: blockworker.base_photo
         quick), at FAST_BASE_V and over or when no recent full photo overlaps it (those pasted in need this process;
         at speed every block overlaps the last and the stand-in here took 5-7 s): the file name, or None
@@ -3124,11 +3149,16 @@ class Server:
                "season_mode": im.season_mode}
         t0 = time.perf_counter()
         try:
-            got = (pool or self.block_pools[lane][0]).submit(
+            p = pool or self.block_pools[lane][0]
+            sub = (functools.partial(p.submit_at, key, droppable=droppable) if hasattr(p, "submit_at") else p.submit)
+            got = sub(
                 blockworker.base_photo, anchor.lat, anchor.lon, cx - size / 2 - BASE_SHIFT_M,
                 cy - size / 2 - BASE_SHIFT_M, size, QUICK_BASE_PX, tex, False, anchor.zooms[0],
                 os.path.join(self.out_dir, name), (self.user_dir, f"{self.vfs_dir}/{name}", base_ao_vfs(self.base_px),
                                                    BASE_AO), out_px=self.base_px, quick=True).result()
+        except poolsmod.Dropped:
+            log.debug("quick base photo %s: dropped, the car left it behind", key)
+            return DROPPED
         except Exception as e:
             log.info("quick base photo %s in the block process: %s", key, e)
             return None
@@ -7041,6 +7071,8 @@ async def main_async(args):
 
     server.game_cpus = getattr(args, "game_cpus", None)    # (cpupin.py: the game pinned at each hello)
     server.server_cpus = getattr(args, "server_cpus", None)
+    if photo_pool is not None and PHOTO_ORDER:
+        photo_pool = poolsmod.OrderedPool(photo_pool, server._photo_rank)
     server.photo_pool = photo_pool
     if block_pools and STAND_IN_PROCESS and args.grading == "on" and args.roads == "on":
         # follow blocks' provisional stand-ins (make_provisional_follow), never behind a graded build or a photo

@@ -53,6 +53,19 @@ class ChunkCacheTest(unittest.TestCase):
         heightmap.grid_u_chunked(self.frame, self.elev, 0.0, 0.0, 1024, cache)
         self.assertEqual(len(cache.chunks), 10)
 
+    def test_disk_shared_between_caches(self):
+        """Two caches on one folder (two block processes of a run): the second reads the first's chunks, exactly."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            a, b = heightmap.ChunkCache(disk=d), heightmap.ChunkCache(disk=d)
+            want, _ = heightmap.grid_u_chunked(self.frame, self.elev, 0.0, 0.0, 1024, a)
+            self.calls.clear()
+            got, share = heightmap.grid_u_chunked(self.frame, self.elev, 0.0, 0.0, 1024, b)
+            self.assertEqual((share, self.calls), (0.0, []))
+            self.assertTrue(np.array_equal(got, want))
+            open(os.path.join(d, "0_0.f8"), "wb").write(b"short")       # (a torn file: computed again)
+            self.assertIsNone(heightmap.ChunkCache(disk=d).get((0, 0)))
+
     def test_keep_matches_unchunked(self):
         k1, k2 = {}, {}
         heightmap.grid_u_chunked(self.frame, elev, 0.0, 0.0, 1024, heightmap.ChunkCache(), k1)

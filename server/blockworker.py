@@ -85,7 +85,7 @@ class _State:
         with self.lock:
             if aid not in self.chunks:
                 frame = geodesy.EnuFrame(lat, lon)
-                self.chunks[aid] = heightmap.ChunkCache()
+                self.chunks[aid] = heightmap.ChunkCache(disk=plancache.chunks_dir(self.cache_dir, aid, lat, lon))
                 if self.grading and getattr(self, "plan_store", None) is None:
                     # (one store for every anchor: the plans are the planning regions', whatever the anchor)
                     self.plan_store = gradingmod.PlanStore(

@@ -247,5 +247,20 @@ class BaseRoutingTest(unittest.TestCase):
         self.assertEqual((name, photo, calls), ("there.png", ["there"], [(1, 2)]))
 
 
+class PhotoRankTest(unittest.TestCase):
+    def test_rank(self):
+        import earthd
+        car = SimpleNamespace(active=1, focus=(0.0, 0.0), vel=(50.0, 0.0))
+        s = SimpleNamespace(connections=[car], layout=SimpleNamespace(block=512))
+        half = 512 * earthd.heightmap.SQUARE / 2
+        rank = lambda cx: earthd.Server._photo_rank(s, (1, cx, 0.0))      # noqa: E731
+        self.assertEqual(rank(1000.0), 1000.0)
+        self.assertLess(rank(100.0), rank(1000.0))
+        self.assertIsNone(rank(-(earthd.PHOTO_PASSED_HALVES + 0.5) * half))
+        self.assertEqual(earthd.Server._photo_rank(s, (2, 5.0, 0.0)), 0.0)     # (no car on that anchor)
+        car.vel = (0.0, 0.0)
+        self.assertEqual(rank(-5000.0), 5000.0)
+
+
 if __name__ == "__main__":
     unittest.main()

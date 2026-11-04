@@ -55,6 +55,24 @@ def start_run(cache_dir):
         os.environ.pop(RUN_ENV, None)
         return
     os.environ[RUN_ENV] = f"{os.getpid()}_{int(time.time())}"
+    # the block processes' shared heights (heightmap.ChunkCache disk, blockworker): a run's own; the last runs' go
+    try:
+        for name in os.listdir(os.path.join(cache_dir, HCHUNKS)):
+            shutil.rmtree(os.path.join(cache_dir, HCHUNKS, name), ignore_errors=True)
+    except OSError:
+        pass
+
+
+HCHUNKS = "hchunks"
+
+
+def chunks_dir(cache_dir, aid, lat, lon):
+    """This run's folder of an anchor's shared block heights (heightmap.ChunkCache disk), or None outside a server
+    run or with BNGE_SHARED_CHUNKS=0."""
+    run = os.environ.get(RUN_ENV)
+    if not run or os.environ.get("BNGE_SHARED_CHUNKS", "1") == "0":
+        return None
+    return os.path.join(cache_dir, HCHUNKS, run, f"{aid}_{lat:.7f}_{lon:.7f}")
 
 
 # The plans' output format for baked packs (bakepack.py: read without the code hash). Bump it whenever a change makes

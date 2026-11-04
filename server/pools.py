@@ -176,3 +176,105 @@ class RespawningPool:
         with self._lock:
             pool = self._pool
         return pool.shutdown(*args, **kwargs)
+
+
+class Dropped(Exception):
+    """OrderedPool: a droppable job whose rank came back None (its block left behind) before it started."""
+
+
+class OrderedPool:
+    """pool's jobs handed over at most `workers` at a time, the most urgent first instead of first come first served:
+    rank(key) -> a number (lower first) or None (left behind: a droppable job is dropped with Dropped, another goes
+    last). Jobs without a key (submit) go first, in order. The one photo process of a server at 200 mph: its stand-in
+    photos waited 12-17 s (p50, up to 27 s) behind the photos of blocks the car had passed, first come first served
+    (the test PC, 2026-11-04). Other attributes are the pool's."""
+
+    def __init__(self, pool, rank):
+        self.pool, self.rank = pool, rank
+        self._q = []                    # [seq, key, droppable, outer future, fn, args, kwargs]
+        self._seq = 0
+        self._running = 0
+        self._cv = threading.Condition()
+        self._thread = None
+        self.dropped = 0
+
+    def __getattr__(self, name):        # (name, workers, prestart, recycle, shutdown, respawns ...)
+        return getattr(self.pool, name)
+
+    @property
+    def inflight(self):
+        with self._cv:
+            return len(self._q) + self._running
+
+    def submit(self, fn, *args, **kwargs):
+        return self.submit_at(None, fn, *args, **kwargs)
+
+    def submit_at(self, key, fn, *args, droppable=False, **kwargs):
+        outer = concurrent.futures.Future()
+        with self._cv:
+            self._seq += 1
+            self._q.append([self._seq, key, droppable, outer, fn, args, kwargs])
+            if self._thread is None:
+                self._thread = threading.Thread(target=self._loop, daemon=True, name=f"{self.pool.name}-order")
+                self._thread.start()
+            self._cv.notify()
+        return outer
+
+    def _pick(self):
+        """The next job (under _cv), dropping the left-behind droppable ones; None if none is left."""
+        best, best_r = None, None
+        for job in list(self._q):
+            seq, key, droppable, outer = job[:4]
+            if outer.cancelled():
+                self._q.remove(job)
+                continue
+            if key is None:
+                r = (0, 0.0, seq)
+            else:
+                try:
+                    d = self.rank(key)
+                except Exception:
+                    d = 0.0
+                if d is None and droppable:
+                    self._q.remove(job)
+                    self.dropped += 1
+                    outer.set_exception(Dropped(f"{key}: left behind"))
+                    continue
+                r = (2, 0.0, seq) if d is None else (1, float(d), seq)
+            if best_r is None or r < best_r:
+                best, best_r = job, r
+        if best is not None:
+            self._q.remove(best)
+        return best
+
+    def _loop(self):
+        while True:
+            with self._cv:
+                while True:
+                    job = self._pick() if self._running < max(1, getattr(self.pool, "workers", 1) or 1) else None
+                    if job is not None:
+                        break
+                    self._cv.wait(timeout=1.0)
+                if not job[3].set_running_or_notify_cancel():
+                    continue
+                self._running += 1
+            _, _, _, outer, fn, args, kwargs = job
+            try:
+                inner = self.pool.submit(fn, *args, **kwargs)
+            except BaseException as e:
+                with self._cv:
+                    self._running -= 1
+                outer.set_exception(e)
+                continue
+            inner.add_done_callback(lambda f, o=outer: self._done(f, o))
+
+    def _done(self, inner, outer):
+        with self._cv:
+            self._running -= 1
+            self._cv.notify()
+        if inner.cancelled():
+            outer.set_exception(concurrent.futures.CancelledError())
+        elif inner.exception() is not None:
+            outer.set_exception(inner.exception())
+        else:
+            outer.set_result(inner.result())
