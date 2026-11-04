@@ -30,6 +30,10 @@ function quat(x, y, z, w)
   return { x = x or 0, y = y or 0, z = z or 0, w = w or 1 }
 end
 function quatFromDir() return quat(0, 0, 0, 1) end
+-- (trees.lua's warm items: a matrix that takes a position; test_trees.lua sets its own counting one)
+if MatrixF == nil then
+  MatrixF = function() local m = { pos = vec3() }; function m:setPosition(p) self.pos = p end; return m end
+end
 
 function log() end
 function dumps(v) return tostring(v) end
@@ -42,6 +46,12 @@ function S.newObject(class)
   function o:registerObject(n) self.name = n or self.name; S.objects[self.id] = self end
   function o:setField(k, _, v) self.fields[k] = v end
   function o:getField(k) return self.fields[k] end
+  if class == 'Forest' then        -- (trees.lua's warm forest: items made and removed)
+    local fd = { items = {} }
+    function fd:createNewItem() local it = {}; self.items[it] = true; return it end
+    function fd:removeItem(it) self.items[it] = nil end
+    function o:getData() return fd end
+  end
   function o:flush() S.count('flush_' .. class) end
   function o:reload() S.count('reload_' .. class) end
   function o:setPosition(p) self.pos = vec3(p.x, p.y, p.z) end
