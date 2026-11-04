@@ -48,6 +48,7 @@ class Shards:
         self.built = None           # the manifest's build in use
         self.checked = 0.0
         self.shards = {}            # (x, y) -> dict
+        self._loading = {}          # (x, y) -> the lock its one reader holds (shard)
         self.down_at = 0.0
 
     def known(self):
@@ -99,8 +100,21 @@ class Shards:
             return None
         with self.lock:
             got = self.shards.get((x, y))
+            if got is None:
+                one = self._loading.setdefault((x, y), threading.Lock())
         if got is not None:
             return got
+        # one thread of the process reads (or fetches) a shard, the others wait for it: a fresh place's map layer
+        # threads all asked at once and each parsed the same shard again (~88 parses of two 0.13 s shards in a cold
+        # 10 km drive, 11 CPU-s on 2 cores, 2026-11-04)
+        with one:
+            with self.lock:
+                got = self.shards.get((x, y))
+            if got is not None:
+                return got
+            return self._load_shard(built, x, y)
+
+    def _load_shard(self, built, x, y):
         d = os.path.join(self.dir, re.sub(r"[^0-9A-Za-z]+", "_", built)) if self.dir else None
         path = os.path.join(d, f"{x}_{y}.json.gz") if d else None
         got = None

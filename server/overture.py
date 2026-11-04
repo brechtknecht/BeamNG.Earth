@@ -48,7 +48,11 @@ log = logging.getLogger("earthd.mapdata")
 # pinned release that is gone raises ReleaseGone for cells not cached yet.
 RELEASE = "2026-09-23.1"
 STAC_ROOT = "https://stac.overturemaps.org"
-DUCKDB_THREADS = int(os.environ.get("BNGE_DUCKDB_THREADS", "2"))   # DuckDB worker threads per query (the server is niced; the game comes first)
+# DuckDB worker threads per query (the server is niced; the game comes first). 1: the server runs many queries side by
+# side on its few cores, where a query's second thread only cost CPU: a fresh place's 60 road cells, one core, 7.0 ->
+# 4.8 CPU-s (buildings 2.4 -> 1.8); on two idle cores 4.6 vs 5.1 s wall for 6.6 vs 5.0 CPU-s (2026-11-04).
+DUCKDB_THREADS = int(os.environ.get("BNGE_DUCKDB_THREADS", "1"))
+DEDUP_IF_REPEATED = os.environ.get("BNGE_OVERTURE_DEDUP_ALWAYS", "0") == "0"    # Reader._run's dedup only where ids repeat
 REMOTE_FILES = 32               # open RemoteFiles kept (their blocks share rangeread's memory LRU)
 # DuckDB's own prefetching reads whole row groups one after the other; Reader._plan fetches what the
 # query needs in parallel first, so DuckDB reads lazily from the block cache
@@ -752,10 +756,17 @@ class Reader:
                          (bbox.xmin + bbox.xmax) / 2 AS cx, (bbox.ymin + bbox.ymax) / 2 AS cy,
                          sources{extra}
                   FROM {src} WHERE ({only}) AND {bbox}""")
-        con.execute("""CREATE TEMP TABLE t AS
-            SELECT row_number() OVER (ORDER BY id) - 1 AS fi, * FROM (
-              SELECT * EXCLUDE (version) FROM s
-              QUALIFY row_number() OVER (PARTITION BY id ORDER BY version DESC, wkb) = 1)""")
+        # (the dedup only where an id repeats: none did in a fresh place's 60 road cells, and its window was ~3/4 of
+        # the statement's ~33 ms a cell, ~16 % of a road cell's query CPU, 2026-11-04)
+        n, u = con.execute("SELECT count(*), count(DISTINCT id) FROM s").fetchone() if DEDUP_IF_REPEATED else (1, 0)
+        if n == u:
+            con.execute("""CREATE TEMP TABLE t AS
+                SELECT row_number() OVER (ORDER BY id) - 1 AS fi, * EXCLUDE (version) FROM s""")
+        else:
+            con.execute("""CREATE TEMP TABLE t AS
+                SELECT row_number() OVER (ORDER BY id) - 1 AS fi, * FROM (
+                  SELECT * EXCLUDE (version) FROM s
+                  QUALIFY row_number() OVER (PARTITION BY id ORDER BY version DESC, wkb) = 1)""")
         names = ["id", "wkb", "cx", "cy"] + [c for k in ("text", "float", "bool") for c in spec.get(k, ())]
         rows = con.execute(f"SELECT {', '.join(names)} FROM t ORDER BY fi").fetchall()
         at = {c: i for i, c in enumerate(names)}
