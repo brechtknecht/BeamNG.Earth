@@ -448,7 +448,7 @@ def _run_facts_store(path, data):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = staging.tmp_for(path)
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f)
+            f.write(json.dumps(data))   # (dumps: the C encoder; overture._meta_save)
         staging.replace(tmp, path)
     except OSError as e:
         log.debug("cell facts %s not kept for the run: %s", path, e)

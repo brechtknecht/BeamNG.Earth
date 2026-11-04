@@ -249,7 +249,7 @@ class OsmTags:
             os.makedirs(remote.cache_dir, exist_ok=True)
             tmp = f"{saved}.{os.getpid()}.{threading.get_ident()}.tmp"
             with open(tmp, "w", encoding="utf-8") as f:
-                json.dump({str(rg): g for rg, g in groups.items()}, f)
+                f.write(json.dumps({str(rg): g for rg, g in groups.items()}))    # (dumps: the C encoder; overture._meta_save)
             os.replace(tmp, saved)
         except (OSError, TypeError, ValueError) as e:
             log.debug("osmtags: row groups not saved: %s", e)

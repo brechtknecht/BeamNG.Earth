@@ -370,7 +370,8 @@ class Reader:
             path = os.path.join(remote.cache_dir, META_FILE)
             tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
             with open(tmp, "w", encoding="utf-8") as f:
-                json.dump({str(rg): g for rg, g in pg.items()}, f)
+                # (dumps, not dump: json.dump to a file runs the pure Python encoder, 2.8 million calls in a cold profile)
+                f.write(json.dumps({str(rg): g for rg, g in pg.items()}))
             os.replace(tmp, path)
         except (OSError, TypeError, ValueError, AttributeError) as e:
             log.debug("overture: row groups not saved: %s", e)
