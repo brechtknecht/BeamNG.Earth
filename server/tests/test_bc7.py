@@ -50,6 +50,25 @@ class Bc7Test(unittest.TestCase):
         self.assertEqual(len(d), 148 + body)
 
 
+class PhotoEncoderTest(unittest.TestCase):
+    def test_cpu_by_default_and_the_switch(self):
+        """The photos' encode: the CPU unless BNGE_BC7_GPU=1, in the calling process either way (never queued behind a
+        block process's block)."""
+        from unittest import mock
+        chain = [np.zeros((4, 4, 4), np.uint8)]
+        with mock.patch.object(bc7, "GPU_PHOTOS", False), mock.patch.object(bc7.fast, "gpu", return_value="Test GPU"), \
+                mock.patch.object(bc7.fast, "_ef", create=True) as ef:
+            self.assertIsNone(bc7._encode_gpu(chain))
+            ef.bc7_encode_gpu.assert_not_called()
+            self.assertTrue(bc7.gpu_ok())
+        with mock.patch.object(bc7, "GPU_PHOTOS", True), mock.patch.object(bc7, "_GPU_FAILED", False), \
+                mock.patch.object(bc7.fast, "gpu", return_value=None):
+            self.assertFalse(bc7.gpu_ok())
+        with mock.patch.object(bc7, "GPU_PHOTOS", True), mock.patch.object(bc7, "_GPU_FAILED", False), \
+                mock.patch.object(bc7.fast, "gpu", return_value="Test GPU"):
+            self.assertTrue(bc7.gpu_ok())
+
+
 class TerrainCacheKeyTest(unittest.TestCase):
     def test_xxh64_and_the_games_key(self):
         import terraincache

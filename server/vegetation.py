@@ -30,6 +30,7 @@ import fast
 import mapcells
 import pacer
 import staging
+import xproc
 
 log = logging.getLogger("earthd.vegetation")
 
@@ -74,6 +75,7 @@ EDGE_M = 7.0
 EDGE_CELL_M = 3.0
 EDGE_P = 0.4
 MEM_CELLS = 16
+BUILD_WAIT_S = 60.0         # s a cell another process is building is waited for (xproc.once), then built here too
 WARM_M = 1200.0              # cells within this of the player are built ahead (warm_around)
 WC = {"tree": 10, "shrub": 20, "grass": 30, "crop": 40, "built": 50, "bare": 60, "snow": 70,
       "water": 80, "wetland": 90, "mangrove": 95, "moss": 100}
@@ -250,21 +252,37 @@ class Vegetation:
     def _load(self, x, y):
         p = self._path(x, y)
         fields = ("lon", "lat", "height", "radius", "kind", "group", "rank", "yaw", "scale")
-        if p and os.path.exists(p):
+
+        def read():
+            if not p or not os.path.exists(p):
+                return None
             with np.load(p, allow_pickle=False) as f:
                 return Items(*(f[n] for n in fields))
-        self._tl.dem_failed = False
-        items = self._build(x, y)
-        # (a cell built while the DEM could not answer, offline or no tile, lacks its slope rocks: it serves this
-        # session but is not kept, so the next one builds it whole. From cristivasile's PR #295. No DEM at all,
-        # self.dem None, is a setting, not a failure)
-        if p and not self._tl.dem_failed:
+        got = read()
+        if got is not None:
+            return got
+        # (several processes build trees: the tiles of one cell come together, and each built it for itself otherwise)
+        mine = False
+        if p:
             os.makedirs(os.path.dirname(p), exist_ok=True)
-            tmp = f"{p}.{os.getpid()}.{threading.get_ident()}.tmp"
-            with open(tmp, "wb") as fh:
-                np.savez_compressed(fh, **{n: getattr(items, n) for n in fields})
-            staging.replace_cached(tmp, p)
-        return items
+            got, mine = xproc.once(p + ".lock", read, BUILD_WAIT_S)
+            if got is not None:
+                return got
+        try:
+            self._tl.dem_failed = False
+            items = self._build(x, y)
+            # (a cell built while the DEM could not answer, offline or no tile, lacks its slope rocks: it serves this
+            # session but is not kept, so the next one builds it whole. From cristivasile's PR #295. No DEM at all,
+            # self.dem None, is a setting, not a failure)
+            if p and not self._tl.dem_failed:
+                tmp = f"{p}.{os.getpid()}.{threading.get_ident()}.tmp"
+                with open(tmp, "wb") as fh:
+                    np.savez_compressed(fh, **{n: getattr(items, n) for n in fields})
+                staging.replace_cached(tmp, p)
+            return items
+        finally:
+            if mine:
+                xproc.release(p + ".lock")
 
     # --- the build ------------------------------------------------------------------------------
     def _specs(self, f):

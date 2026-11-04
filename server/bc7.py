@@ -14,6 +14,7 @@ two-colour edges blur a little within a block). ~0.14 s for a 2048² image.
 encode(rgb) -> bytes (blocks, row-major), decode(blocks, w, h) -> rgb (tests); dds(rgb) -> a DDS file's bytes
 (DX10 header, BC7_UNORM_SRGB, full mip chain, box-filtered mips).
 """
+import os
 import struct
 
 import numpy as np
@@ -74,21 +75,25 @@ def mips(img):
 
 
 _GPU_FAILED = False
+# The photos' encode on the CPU by default (BNGE_BC7_GPU=1: on the GPU). Alone the GPU's took 0.02-0.05 s of a 2048² chain
+# and the CPU's 0.07-0.10 s, but in a drive the "cache" stage around it took 0.9-5.4 s of a photo's 3.9 s at 0.44 CPU-s:
+# the suspicion is the wait behind the game's own frames on that GPU, measured by the next drive (2026-11-04).
+GPU_PHOTOS = os.environ.get("BNGE_BC7_GPU", "0") == "1"
 
 
 def gpu_ok():
-    """True when this process encodes on the GPU (fast.gpu(), not failed yet): then a photo's encode costs ~0.05
-    CPU-s here, and sending it to a busy block process only queued it behind that process's block (a stand-in's
-    "cache" stage 3-8 s of its 9, nyc_speed.py --cold 2026-11-02)."""
-    return not _GPU_FAILED and fast.gpu()
+    """True when a photo's encode belongs in the calling process: on the GPU (~0.05 CPU-s) or, by default, on the CPU's
+    Rust encoder, which runs without the interpreter's lock. Sending it to a busy block process only queued it behind
+    that process's block (a stand-in's "cache" stage 3-8 s of its 9, nyc_speed.py --cold 2026-11-02)."""
+    return not GPU_PHOTOS or (not _GPU_FAILED and bool(fast.gpu()))
 
 
 def _encode_gpu(chain):
     """The chain's BC7 blocks encoded on the GPU (earthfast.bc7_encode_gpu: a 4096² photo's ~0.7 CPU-s on 8 threads ->
-    ~0.05 CPU-s, the same quality), or None: no GPU (fast.gpu()), not RGBA, or it failed (then the
-    CPU from there on)."""
+    ~0.05 CPU-s, the same quality), or None: not asked for (GPU_PHOTOS), no GPU (fast.gpu()), not RGBA, or it failed
+    (then the CPU from there on)."""
     global _GPU_FAILED
-    if _GPU_FAILED or not fast.gpu() or any(np.ndim(m) != 3 or np.shape(m)[2] != 4 for m in chain):
+    if not GPU_PHOTOS or _GPU_FAILED or not fast.gpu() or any(np.ndim(m) != 3 or np.shape(m)[2] != 4 for m in chain):
         return None
     try:
         return b"".join(bytes(b) for b in fast._ef.bc7_encode_gpu([np.ascontiguousarray(m, np.uint8) for m in chain]))

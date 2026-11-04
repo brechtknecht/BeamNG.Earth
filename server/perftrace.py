@@ -242,6 +242,21 @@ PATCHES = [
                                                                                                 "region": box is not None}),
     ("grading", "Grader", "region", "road plan (region)", "plan", None),
     ("xproc", "", "once", "xproc.once", "wait", lambda lock, *a, **k: {"lock": os.path.basename(str(lock))}),
+    # (the spans the 2026-11-04 profile lacked: a map layer's, a photo's and a trees tile's time was three quarters
+    # unnamed)
+    ("overture", "Reader", "query", "overture query", "mapdata",
+     lambda self, layer, cell, kind="demand": {"layer": layer, "key": str(cell), "kind": kind}),
+    ("overture", "Reader", "fetch_only", "overture fetch", "mapdata",
+     lambda self, layer, cell, kind="prefetch": {"layer": layer, "key": str(cell)}),
+    ("terraincache", "", "base_entry", "photo cache entry", "photo", None),
+    ("bc7", "", "dds", "photo encode", "photo", None),
+    ("imagery", "Imagery", "render", "imagery render", "photo", None),
+    ("surface", "", "paint_square", "photo roads", "photo", None),
+    ("surface", "", "enlarge", "photo enlarge", "photo", None),
+    ("vegetation", "", "geo_tile_items", "trees items", "trees", None),
+    ("vegetation", "", "write_tile", "trees write", "trees", None),
+    ("vegetation", "Vegetation", "_load", "trees cell", "trees", lambda self, x, y: {"x": x, "y": y}),
+    ("staging", "", "warm", "warm read", "io", lambda path: {"file": os.path.basename(str(path))}),
 ]
 
 

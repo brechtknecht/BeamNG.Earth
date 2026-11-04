@@ -263,6 +263,12 @@ AHEAD_LAYERS = ("roads", "buildings", "building_parts", "infrastructure", "water
 # mapdata.WARM_THREADS and FETCH_AHEAD_THREADS are 0). BNGE_MAP_AHEAD=0 off.
 MAP_AHEAD = os.environ.get("BNGE_MAP_AHEAD", "1") != "0"
 VEG_PROCESS = os.environ.get("BNGE_VEG_PROCESS", "1") != "0"   # trees geotiles in a process of their own
+# trees geotiles 0.40 s from order to done at 0.05 s of work, the rest the one process's queue (11-15 s on 2 cores;
+# 2026-11-04): two; a small machine stays at one (budget.small)
+VEG_PROCESSES = max(1, int(os.environ.get("BNGE_VEG_PROCESSES", "2") or 2))
+# map cells ahead one after another in one process: the block processes built 380 of a drive's 620 thread-s of map
+# layers themselves, not ahead (2026-11-04; only ~10 % of the layers were asked by two processes at all): two
+MAP_AHEAD_PROCESSES = max(1, int(os.environ.get("BNGE_MAP_AHEAD_PROCESSES", "2") or 2))
 MAP_AHEAD_S = 120.0
 MAP_AHEAD_MIN_M = 1500.0
 MAP_AHEAD_MAX_M = 10000.0
@@ -2380,9 +2386,11 @@ class Server:
             self.map_ahead_want = want
             self.map_ahead_plans = plans
             if self.map_ahead_thread is None:
-                self.map_ahead_thread = threading.Thread(target=self._map_ahead_loop, daemon=True, name="map-ahead")
-                self.map_ahead_thread.start()
-            self.map_ahead_cv.notify()
+                self.map_ahead_thread = [threading.Thread(target=self._map_ahead_loop, daemon=True, name=f"map-ahead-{i}")
+                                         for i in range(getattr(self.map_ahead_pool, "workers", 1))]
+                for t in self.map_ahead_thread:
+                    t.start()
+            self.map_ahead_cv.notify_all()
 
     def _map_ahead_loop(self):
         while True:
@@ -7109,14 +7117,16 @@ async def main_async(args):
             server.stand_in_pool.prestart(blockworker.ready)
     if VEG_PROCESS and server.road_pool is not None and server.veg is not None:
         server.veg_pool = poolsmod.RespawningPool(
-            "trees", 1, mp_context=ctx, initializer=blockworker.init,
+            "trees", 1 if budget.small() else VEG_PROCESSES, mp_context=ctx, initializer=blockworker.init,
             initargs=(args.cache_dir, args.offline, args.roads == "on", args.grading == "on",
                       args.road_widths == "on", args.surface == "on", None, logging.getLogger().level,
                       args.airports == "on", args.sea == "on", NICE_ROADS, roadsmod.ROADS_IN_GROUND))
+        if POOL_PRESTART:       # (a place's first tiles not behind these processes' imports)
+            server.veg_pool.prestart(blockworker.ready)
     if MAP_AHEAD and args.block_process == "on" and server.mapdata is not None:
         # map data cells ahead (Server.map_ahead): below the road tiles, like them
         server.map_ahead_pool = poolsmod.RespawningPool(
-            "map ahead", 1, mp_context=ctx, initializer=blockworker.init,
+            "map ahead", 1 if budget.small() else MAP_AHEAD_PROCESSES, mp_context=ctx, initializer=blockworker.init,
             initargs=(args.cache_dir, args.offline, args.roads == "on", args.grading == "on",
                       args.road_widths == "on", args.surface == "on", None, logging.getLogger().level,
                       args.airports == "on", args.sea == "on", NICE_ROADS + 1, roadsmod.ROADS_IN_GROUND))
