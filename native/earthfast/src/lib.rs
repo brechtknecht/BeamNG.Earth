@@ -1,6 +1,8 @@
 //! Geometry kernels for the world server (server/fast.py wraps them, with the Python versions as the fallback).
 //! All coordinates are metres in the anchor's local frame, f64.
 mod cdaez;
+mod clearance;
+mod f32z;
 mod gpu;
 mod traffic;
 mod dsm;
@@ -24,6 +26,8 @@ mod ribbons;
 mod groundpaint;
 mod medians;
 mod speedsigns;
+mod dirsigns;
+mod dirsigns_face;
 mod cachemap;
 mod areacover;
 mod geotiles;
@@ -5295,6 +5299,10 @@ pub(crate) fn rtin_core(hv: &[f64], n: usize, max_err: f64) -> (Vec<[i64; 3]>, V
 
 #[pymodule]
 fn earthfast(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(dirsigns::dirsign_place, m)?)?;
+    m.add_function(wrap_pyfunction!(dirsigns::dirsign_mesh, m)?)?;
+    m.add_function(wrap_pyfunction!(dirsigns_face::dirsign_set_fonts, m)?)?;
+    m.add_function(wrap_pyfunction!(dirsigns_face::dirsign_face, m)?)?;
     m.add_function(wrap_pyfunction!(island_ring_rays, m)?)?;
     m.add_function(wrap_pyfunction!(dsm::dsm_ground, m)?)?;
     m.add_function(wrap_pyfunction!(dsm::fill_holes, m)?)?;
@@ -5458,6 +5466,8 @@ fn earthfast(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(farglobal::far_clip_mesh, m)?)?;
     m.add_function(wrap_pyfunction!(geocontent::geo_owns, m)?)?;
     m.add_function(wrap_pyfunction!(geocontent::clip_tris_convex, m)?)?;
+    m.add_function(wrap_pyfunction!(f32z::f32_pack, m)?)?;
+    m.add_function(wrap_pyfunction!(f32z::f32_unpack, m)?)?;
     m.add_function(wrap_pyfunction!(cdaez::cdae_pack, m)?)?;
     m.add_function(wrap_pyfunction!(cdaez::cdae_unpack, m)?)?;
     m.add_function(wrap_pyfunction!(geocontent::cdae_zstats, m)?)?;
@@ -5470,6 +5480,8 @@ fn earthfast(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(fartex::dds_levels, m)?)?;
     m.add_function(wrap_pyfunction!(fartex::jpeg_rgb, m)?)?;
     m.add_class::<traffic::Routes>()?;
-    m.add("VERSION", 145)?;
+    m.add_class::<clearance::Clearance>()?;
+    m.add_class::<clearance::DeckLevels>()?;
+    m.add("VERSION", 148)?;
     Ok(())
 }

@@ -5,10 +5,11 @@ every later submit raises BrokenProcessPool. The road pool broken that way left 
 tile while the terrain and the far buildings went on loading. RespawningPool makes the pool again at the next submit
 (at most every RESPAWN_S: a pool whose processes cannot even start does not spawn without end) and logs it.
 """
-import functools
 import collections
 import concurrent.futures
+import functools
 import logging
+import sys
 import runtimeprofiler
 import threading
 import time
@@ -40,6 +41,25 @@ def result_running(fut, timeout, waited=None):
     return fut.result(timeout=timeout)
 
 
+def proc_name(name):
+    """The worker's short process name ("bnge:roadtile"; Linux /proc/<pid>/comm, 15 bytes at most): top, htop and the
+    whole-system samplers tell the pools apart (every spawned worker's command line is the same multiprocessing one).
+    Nothing matches processes by this name (pgrep -f and the launcher read command lines)."""
+    return ("bnge:" + name.replace(" ", ""))[:15]
+
+
+def _named_init(name, init, *initargs):
+    """A pool's initializer, after naming its process (proc_name)."""
+    if sys.platform.startswith("linux"):
+        try:
+            import ctypes
+            ctypes.CDLL(None, use_errno=True).prctl(15, proc_name(name).encode(), 0, 0, 0)     # PR_SET_NAME
+        except (OSError, AttributeError):
+            pass
+    if init is not None:
+        init(*initargs)
+
+
 def _call(fn, args, kwargs):
     """A job in the worker, then its memory ceiling (budget.maybe_shed: on a small machine a worker over it drops its
     caches between jobs)."""
@@ -64,6 +84,8 @@ class RespawningPool:
     def __init__(self, name, *args, **kwargs):
         if perftrace.ON:           # (BNGE_TRACE: each process traced under the pool's name)
             kwargs["initializer"] = functools.partial(perftrace.worker_init, name, kwargs.get("initializer"))
+        kwargs = dict(kwargs, initializer=functools.partial(_named_init, name, kwargs.get("initializer")),
+                      initargs=tuple(kwargs.get("initargs", ())))         # (its processes named: proc_name)
         self.name, self._args, self._kwargs = name, args, kwargs
         self._lock = threading.Lock()
         self._pool = ProcessPoolExecutor(*args, **kwargs)
