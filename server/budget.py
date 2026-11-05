@@ -250,7 +250,7 @@ def trim():
 # far workers got nothing at all (a Windows player, i5-9400F, 1.6.1: "distant land 5/514", only the land near the car
 # loading). os.nice elsewhere only weights the share.
 WIN_BELOW_NORMAL = 0x4000
-WIN_NORMAL = 0x20
+WIN_NORMAL = 0x20               # (photo_priority: the photos' process)
 
 
 def lower_priority(nice, worker=False):
@@ -276,7 +276,6 @@ def lower_priority(nice, worker=False):
     return "below normal"
 
 
-
 def photo_priority():
     """Windows: this process (the photos') in the "normal" class, above the server's other processes on its pinned
     cores. Each level of a photo's mip chain is a fork and join over its threads, 12 in all: at one priority beside the
@@ -294,6 +293,7 @@ def photo_priority():
     if not k32.SetPriorityClass(k32.GetCurrentProcess(), WIN_NORMAL):
         raise OSError("SetPriorityClass(normal) failed")
     return "normal"
+
 
 def road_processes(cpus=None, gb=None):
     """Road-tile processes for a desktop (ROAD_PROCESSES_BY_CPU), 2 below them."""

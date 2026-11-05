@@ -1,8 +1,11 @@
-"""pools.py: a process pool whose worker died is made again (GitHub #76, #91)."""
+"""pools.py: a process pool whose worker died is made again (GitHub #76, #91); OrderedPool hands its jobs over
+most urgent first."""
 import os
 import sys
+import threading
 import unittest
 import unittest.mock
+from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
@@ -154,8 +157,6 @@ class OrderedPoolTest(unittest.TestCase):
     is dropped before it starts."""
 
     def test_order_and_drop(self):
-        import threading
-        from concurrent.futures import ThreadPoolExecutor
         gate, order = threading.Event(), []
         inner = ThreadPoolExecutor(1)
         inner.name, inner.workers = "t", 1
@@ -177,8 +178,6 @@ class OrderedPoolTest(unittest.TestCase):
             self.assertEqual(p.dropped, 1)
         finally:
             inner.shutdown()
-
-
 
 
 if __name__ == "__main__":

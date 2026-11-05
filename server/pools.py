@@ -217,7 +217,7 @@ class OrderedPool:
     rank(key) -> a number (lower first) or None (left behind: a droppable job is dropped with Dropped, another goes
     last). Jobs without a key (submit) go first, in order. The one photo process of a server at 200 mph: its stand-in
     photos waited 12-17 s (p50, up to 27 s) behind the photos of blocks the car had passed, first come first served
-    (the test PC, 2026-11-04). Other attributes are the pool's."""
+    (a Windows test PC, 2026-11-04). Other attributes are the pool's."""
 
     def __init__(self, pool, rank):
         self.pool, self.rank = pool, rank
