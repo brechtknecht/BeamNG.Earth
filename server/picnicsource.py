@@ -26,7 +26,7 @@ URL = "https://data.openstreetmap.us/layercake/pois.parquet"
 PATH = "osm/pois.parquet"
 VERSION_TTL_S = 7 * 86400
 RETRY_S = 3600
-LATER_WAIT_S = 0.5          # a road tile waits this long for a cell's picnic rows (cells(wait=False))
+LATER_WAIT_S = float(os.environ.get("BNGE_PICNIC_WAIT_S", "0.5"))   # a road tile waits this long for a cell's picnic rows (cells(wait=False))
 COLUMNS = ("id", "leisure", "amenity", "tourism")
 TABLES = {"picnic_table"}
 SITES = {"picnic_site"}
