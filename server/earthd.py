@@ -283,8 +283,12 @@ MAP_AHEAD_LAYERS = AHEAD_LAYERS + ("canopy", "landcover", "places")     # (place
 LOAD_MAP_MISSING, LOAD_MAP_QUEUED, LOAD_MAP_LOADING, LOAD_MAP_READY, LOAD_MAP_ON_DISK, LOAD_MAP_FAILED = range(6)
 LOAD_MAP_PAD_M = 1500.0         # m around the path whose cells are shown
 LOAD_MAP_MAX_CELLS = 600
+LOAD_MAP_MAX_BLOCKS = 120
 LOAD_MAP_EVERY_S = 0.5          # s between two messages
 LOAD_MAP_HOLD_S = 3.0           # s the window's last request keeps them coming
+# ... and a terrain block's (Connection.load_map_blocks): predicted but not begun, waiting for its process, built in
+# it, on its base photo, ready, asked for by the game and not ready yet (the car waits), the one in use
+BLOCK_WANTED, BLOCK_QUEUED, BLOCK_BUILDING, BLOCK_PHOTO, BLOCK_READY, BLOCK_ASKED, BLOCK_IN_USE = range(7)
 # route_download: like download_ahead, but along the planned GPS route's own geometry (routeahead.py)
 # instead of the player's current heading, since a road route can wander off that heading entirely.
 ROUTE_AHEAD_ON = True            # --route-prefetch
@@ -7549,7 +7553,9 @@ class Connection:
         if aid == self.active and now < self.load_map_until and now - self.load_map_at >= LOAD_MAP_EVERY_S:
             self.load_map_at = now
             try:
-                self.send(self.s.load_map(self.s.anchors[aid], *self.focus, *self.vel, self.track.turn()))
+                m = self.s.load_map(self.s.anchors[aid], *self.focus, *self.vel, self.track.turn())
+                m["blocks"], m["asked"] = self.load_map_blocks(aid)
+                self.send(m)
             except Exception as e:      # (a debug view: never the pose)
                 log.debug("load map: %s: %s", type(e).__name__, e)
         # (the 3D map's view frame high up, pose.view: no roads, trees, buildings, turbines or traffic round its target,
@@ -8011,6 +8017,44 @@ class Connection:
         if cs != getattr(self, "ready_sent", None):
             self.ready_sent = cs
             self.send({"type": "terrain_ready_set", "anchorId": aid, "centres": [[float(cx), float(cy)] for cx, cy in cs]})
+
+    def load_map_blocks(self, aid):
+        """The loading map's terrain blocks of anchor aid: [[west, south, east, north], BLOCK_* state, s] (s: the build's
+        seconds once built, else since it began or was asked for), and how long the game has waited for the block it
+        asked for (0: none waiting)."""
+        s, now = self.s, time.monotonic()
+        out, seen = {}, set()
+
+        def put(cx, cy, st, sec=0.0):
+            k = (aid, cx, cy)
+            if k in seen and st not in (BLOCK_ASKED, BLOCK_IN_USE):
+                return
+            seen.add(k)
+            h = s.layout.block * heightmap.SQUARE / 2
+            out[k] = [round(cx - h), round(cy - h), round(cx + h), round(cy + h), st, round(sec, 1)]
+        for k, info in list(s.hm.items()):
+            if k[0] == aid:
+                put(k[1], k[2], BLOCK_READY, info.get("seconds", 0.0))
+        for k in list(s.hm_inflight):
+            if k[0] == aid:
+                stage = s.hm_stage.get(k)
+                put(k[1], k[2], BLOCK_PHOTO if stage == "its base photo" else
+                    BLOCK_BUILDING if stage is not None else BLOCK_QUEUED)
+        for b in [self.predicted_block] + list(getattr(self, "predicted_chain", ())):
+            if b is not None:
+                put(b.cx, b.cy, BLOCK_WANTED)
+        asked = 0.0
+        p = self.pending_block
+        if p is not None and (aid, p.cx, p.cy) not in s.hm and self.pending_at is not None:
+            asked = now - self.pending_at
+            out.pop((aid, p.cx, p.cy), None)
+            seen.discard((aid, p.cx, p.cy))
+            put(p.cx, p.cy, BLOCK_ASKED, asked)
+        if self.block is not None and aid == self.active:
+            out.pop((aid, self.block.cx, self.block.cy), None)
+            seen.discard((aid, self.block.cx, self.block.cy))
+            put(self.block.cx, self.block.cy, BLOCK_IN_USE)
+        return list(out.values())[-LOAD_MAP_MAX_BLOCKS:], round(asked, 1)
 
     def maybe_prefetch(self):
         """Speculatively build the terrain the mod is about to ask for: the predicted block, and a fast player's chain
