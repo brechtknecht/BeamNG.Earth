@@ -945,6 +945,9 @@ local function onMessage(msg)
     ambience.clear()
     M._trafficvisuals.session(nil, false)
     setStatus('Disconnected from companion server: ' .. tostring(msg.error))
+  elseif t == 'load_map' then         -- the dev tools' loading map (dev.lua, its 'loadmap' panel asks for it)
+    local dev = rawget(_G, 'beamngEarth_dev')
+    if dev and dev.receiveLoadMap then dev.receiveLoadMap(msg) end
   elseif t == 'runtime_profiler_pong' then
     require('beamngEarth/profiler').pong(msg)
   elseif t == 'runtime_profiler' then

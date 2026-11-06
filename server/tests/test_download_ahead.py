@@ -114,7 +114,7 @@ def map_ahead_server():
     s.map_ahead_pool = FakeMapAheadPool()
     s.map_ahead_last, s.map_ahead_want, s.map_ahead_done = None, [], set()
     s.map_ahead_cv, s.map_ahead_threads = threading.Condition(), None
-    s.map_ahead_stats = {"cells": 0, "s": 0.0}
+    s.map_ahead_stats, s.map_ahead_state = {"cells": 0, "s": 0.0}, {}
     s.veg = None
     s._map_ahead_loop = lambda: earthd.Server._map_ahead_loop(s)
     return s
@@ -155,6 +155,32 @@ class MapAheadTest(unittest.TestCase):
         earthd.Server.map_ahead(s, a, 0.0, 0.0, 0.0, 0.5)
         self.assertEqual(s.map_ahead_pool.keys, [])
         self.assertIsNone(s.map_ahead_threads)
+
+
+
+class LoadMapTest(unittest.TestCase):
+    def test_zone_cells_and_lead(self):
+        s, a = map_ahead_server(), anchor()
+        m = earthd.Server.load_map(s, a, 0.0, 0.0, 0.0, 40.0)
+        self.assertEqual(m["type"], "load_map")
+        self.assertGreater(len(m["zone"]), 2)
+        self.assertTrue(m["cells"])
+        self.assertTrue(all(c[4] == earthd.LOAD_MAP_MISSING for c in m["cells"]))
+        self.assertEqual(m["lead"], 0)
+        for c in m["cells"]:            # (west < east, south < north in the anchor frame)
+            self.assertLess(c[0], c[2])
+            self.assertLess(c[1], c[3])
+        # every cell ready: the lead reaches the end of the path
+        import mapcells
+        for k in mapcells.cells_for_bbox(36.0, -115.4, 36.4, -114.9):
+            s.map_ahead_state[(k.z, k.x, k.y)] = (earthd.LOAD_MAP_READY, 2.0)
+        m = earthd.Server.load_map(s, a, 0.0, 0.0, 0.0, 40.0)
+        self.assertAlmostEqual(m["lead"], 40.0 * earthd.MAP_AHEAD_S, delta=50)
+
+    def test_standing_is_a_circle(self):
+        s, a = map_ahead_server(), anchor()
+        m = earthd.Server.load_map(s, a, 0.0, 0.0, 0.0, 0.0)
+        self.assertEqual(m["zone"], [[0, 0, round(earthd.WARM_AROUND)]])
 
 
 if __name__ == "__main__":
