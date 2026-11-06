@@ -936,7 +936,7 @@ local function drawLoadMap()
     if bcounts[st] then parts[#parts + 1] = string.format('%s %d', M.LOADMAP_BLOCK_NAMES[st], bcounts[st]) end
   end
   text('blocks: ' .. (#parts > 0 and table.concat(parts, '   ') or 'none'))
-  if (m.asked or 0) > 0 then text(string.format('THE CAR WAITS: next block asked %.1f s ago, not ready', m.asked)) end
+  if (m.asked or 0) > 0 then text(string.format('next block asked %.1f s ago, not ready yet', m.asked)) end
   local stt = m.stats or {}
   if (stt.cells or 0) > 0 then
     text(string.format('built ahead: %d cells, %.1f s each on average', stt.cells, (stt.s or 0) / stt.cells))

@@ -407,7 +407,7 @@ for _ = 1, 3 do dev.onUpdate(DT, DT) end
 local lm = table.concat(imText, '\n')
 T.check(lm:match('ready ahead 1%.2 km') and lm:match('queued 3') and lm:match('loading 1') and lm:match('missing 1'),
   'loading map: lead, queue and cell states drawn')
-T.check(lm:match('in use 1') and lm:match('ASKED 1') and lm:match('queued 1') and lm:match('THE CAR WAITS'),
+T.check(lm:match('in use 1') and lm:match('ASKED 1') and lm:match('queued 1') and lm:match('not ready yet'),
   'loading map: blocks and the wait drawn')
 dev.preset('off')
 for _ = 1, 20 do dev.onUpdate(DT, DT) end

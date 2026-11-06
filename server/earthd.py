@@ -458,10 +458,10 @@ FOLLOW_RULES = {
 }
 BLOCK_SIZES = tuple(int(m / heightmap.SQUARE) for m in sorted(FOLLOW_RULES))    # samples per edge (1024, 2048)
 TERRAIN_BLOCK = farfield.TERRAIN_BLOCK     # terrain mode's frozen 2 km block
-BLOCK_DEFAULT = 1024        # Server()'s block (test_v131_default.py pins the library default)
+BLOCK_DEFAULT = heightmap.SIZE  # (1024 at 1 m, 512 with BNGE_SQUARE=2) Server()'s block (test_v131_default.py pins the library default)
 # The command line's block in mesh mode: 1 km (M4: in-game 2026-10-10, the 512² block at 2 m; since 2026-11-01 the
 # same kilometre at 1 m, 1024² samples: the stock maps' resolution, a .ter swap of ~29 ms on the Stelvio)
-CLI_BLOCK_MESH = 1024
+CLI_BLOCK_MESH = heightmap.SIZE   # (1 km: 1024 at 1 m, 512 with BNGE_SQUARE=2)
 # |cx|,|cy| of an anchor's first terrain. A rebase hint stays within ~512 m of the new origin, but
 # a resync (same origin, after a server restart) asks for the block around the player, which can be
 # up to the mod's maximum rebase distance (16 km) away, plus however far the player got past it.
@@ -1401,7 +1401,7 @@ class Server:
 
     def new_anchor(self, lat, lon):
         a = Anchor(self._next_anchor, lat, lon, geodesy.EnuFrame(lat, lon))
-        a.hm_zoom = demmod.zoom_for(lat, 1.25, demmod.FINE_ZOOM)    # ~1 m pixels where the data exists (dem.FINE_ZOOM)
+        a.hm_zoom = demmod.terrain_zoom(lat)        # pixels of about the terrain's squares where the data exists
         a.zooms = {lvl: self.layout.dem_zoom(lat, lvl) for lvl in range(1, farfield.HORIZON_MAX_LEVEL + 1)}
         a.zooms[0] = a.hm_zoom                      # L0 shares the terrain's DEM (§1.4)
         a.zf = farfield.global_zoom(lat)            # the global far tiles' finest zoom (geotiles phase 3b)
@@ -2045,7 +2045,7 @@ class Server:
             got = (bool(navgraphmod.road_rules(c)["rightHandDrive"]), bool(navgraphmod.road_rules(c)["mph"]),
                    furnituremod.buried_share(c),
                    furnituremod.lamp_region(c, navgraphmod.region_near(self.airports_db, la, lo)),
-                   c if self.airports_db else None, demmod.zoom_for(la, 1.25, demmod.FINE_ZOOM))
+                   c if self.airports_db else None, demmod.terrain_zoom(la))
             if len(cache) > 20000:
                 cache.clear()
             cache[(gx, gy, z)] = got

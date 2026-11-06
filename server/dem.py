@@ -161,6 +161,14 @@ def zoom_for(lat, pixel_m, max_zoom=MAX_ZOOM):
     return int(min(max_zoom, max(0, math.ceil(math.log2(c / (TILE * pixel_m))))))
 
 
+def terrain_zoom(lat):
+    """The near terrain's DEM zoom: pixels of about its squares (heightmap.SQUARE). 2 m squares at z16's 0.75 m took four
+    times the tiles of z15's 1.5 m for detail the terrain drops: on the A13 (2026-11-03) 5145 of a drive's 7026 tile
+    loads, 2043 of its 3454 DEM downloads (110 of 193 MB) and 1 MB of decoded mirror per tile."""
+    import heightmap
+    return zoom_for(lat, 1.25 * heightmap.SQUARE, FINE_ZOOM)
+
+
 def decode_terrarium(data, size):
     """float32 heights of a Terrarium tile (Rust: no RGB copy, no float temporaries; ~2/3 of a tile's decode, and
     the worker processes each decode the DEM tiles they read)."""

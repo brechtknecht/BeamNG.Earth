@@ -96,7 +96,13 @@ VERTEX_STEP = 4.0           # m between the plan's vertices (segments for the gr
 BUCKET = 32.0               # m, query-point buckets
 ROAD_LIFT = 0.04            # m the physics ground is raised under roads (see Grader.apply)
 BLEND_R = 4.0               # m: roads near each other blend their targets by 1 / (1 + (d / BLEND_R)^2)
-PROFILE_ZOOM = int(os.environ.get("BNE_DEM_ZOOM", "16"))   # DEM zoom of the profiles (one zoom for every caller)
+# DEM zoom of the profiles (one zoom for every caller). With 2 m terrain squares (BNGE_SQUARE=2, whose terrain reads z15:
+# dem.terrain_zoom) z15 too: the profiles at z16 were 1237 of a cold 10 km drive's DEM tiles at 48 N, z16 tiles all of
+# them (4 for each z15 one), for 0.8 m pixels under 4 m vertices smoothed over tens of metres (2026-11-04).
+# BNE_DEM_ZOOM sets it; BNGE_PROFILE_Z16=1: z16 with 2 m squares as before.
+_SQUARE2 = os.environ.get("BNGE_SQUARE", "1").strip() in ("2", "2.0")
+PROFILE_ZOOM = int(os.environ.get("BNE_DEM_ZOOM") or (15 if _SQUARE2 and os.environ.get("BNGE_PROFILE_Z16") != "1"
+                                                      else 16))
 WALL_CUT_M = 2.0            # a road cut deeper than this into the ground: a retaining wall at the core's edge
 WALL_T_M = 0.8              # (roadmesh.retaining_walls) and the ground at its natural height right behind it, over
                             # this; on a 1:2 slope Central Park's sunken transverse was a grassy ditch between its
