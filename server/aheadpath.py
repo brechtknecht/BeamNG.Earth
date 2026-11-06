@@ -78,3 +78,19 @@ class Track:
             return 0.0
         dh = (h1 - h0 + math.pi) % (2 * math.pi) - math.pi
         return max(-TURN_MAX, min(TURN_MAX, dh / (t1 - t0)))
+
+    def steady_turn(self):
+        """turn() when the player turned about as much in each third of the window (a bend going on), else 0: a corner
+        (the whole turn in one moment) is driven straight on from, not taken as a bend that goes on."""
+        w = self.turn()
+        if w == 0.0 or len(self.poses) < 4:
+            return 0.0
+        t0, t1 = self.poses[0][0], self.poses[-1][0]
+        cuts = [next(p for p in self.poses if p[0] >= t0 + (t1 - t0) * k / 3) for k in (0, 1, 2)] + [self.poses[-1]]
+        for a, b in zip(cuts, cuts[1:]):
+            if b[0] - a[0] <= 0:
+                return 0.0
+            rate = ((b[3] - a[3] + math.pi) % (2 * math.pi) - math.pi) / (b[0] - a[0])
+            if rate * w <= 0 or abs(rate) < 0.5 * abs(w) or abs(rate) > 2 * abs(w):
+                return 0.0
+        return w
