@@ -183,5 +183,38 @@ class LoadMapTest(unittest.TestCase):
         self.assertEqual(m["zone"], [[0, 0, round(earthd.WARM_AROUND)]])
 
 
+
+class LoadMapBlocksTest(unittest.TestCase):
+    def test_block_states(self):
+        from collections import OrderedDict
+        import farfield
+        lay = types.SimpleNamespace(block=512)
+        srv = types.SimpleNamespace(layout=lay, hm=OrderedDict({(1, 0.0, 0.0): {"seconds": 4.2},
+                                                               (1, 384.0, 0.0): {"seconds": 6.0}}),
+                                    hm_inflight={(1, 768.0, 0.0): None, (1, 1152.0, 0.0): None,
+                                                 (1, 1536.0, 0.0): None},
+                                    hm_stage={(1, 768.0, 0.0): "the block process",
+                                              (1, 1152.0, 0.0): "its base photo"})
+        c = types.SimpleNamespace(s=srv, active=1, block=farfield.Block(0.0, 0.0, 512),
+                                  pending_block=farfield.Block(384.0, 0.0, 512), pending_at=None,
+                                  predicted_block=farfield.Block(1920.0, 0.0, 512), predicted_chain=[])
+        blocks, asked = earthd.Connection.load_map_blocks(c, 1)
+        st = {(b[0] + b[2]) / 2: b[4] for b in blocks}
+        self.assertEqual(st[0.0], earthd.BLOCK_IN_USE)
+        self.assertEqual(st[384.0], earthd.BLOCK_READY)     # asked for, but built: no wait
+        self.assertEqual(st[768.0], earthd.BLOCK_BUILDING)
+        self.assertEqual(st[1152.0], earthd.BLOCK_PHOTO)
+        self.assertEqual(st[1536.0], earthd.BLOCK_QUEUED)
+        self.assertEqual(st[1920.0], earthd.BLOCK_WANTED)
+        self.assertEqual(asked, 0.0)
+        # asked for and not built: the game waits on it
+        import time
+        c.pending_block, c.pending_at = farfield.Block(768.0, 0.0, 512), time.monotonic() - 2.5
+        blocks, asked = earthd.Connection.load_map_blocks(c, 1)
+        st = {(b[0] + b[2]) / 2: b[4] for b in blocks}
+        self.assertEqual(st[768.0], earthd.BLOCK_ASKED)
+        self.assertGreaterEqual(asked, 2.5)
+
+
 if __name__ == "__main__":
     unittest.main()

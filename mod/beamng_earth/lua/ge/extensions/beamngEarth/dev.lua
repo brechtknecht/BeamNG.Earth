@@ -110,6 +110,13 @@ M.LOADMAP_RGB = {
   [4] = { 0.1, 0.5, 0.2 }, [5] = { 0.9, 0.2, 0.8 },
 }
 M.LOADMAP_NAMES = { [0] = 'missing', 'queued', 'loading', 'ready', 'on disk', 'failed' }
+-- a terrain block's outline by the server's state (earthd BLOCK_*): predicted, queued, building, base photo, ready,
+-- asked for and not ready (the car waits), in use
+M.LOADMAP_BLOCK_RGB = {
+  [0] = { 0.6, 0.6, 0.6 }, [1] = { 1, 0.85, 0.1 }, [2] = { 0.25, 0.6, 1 }, [3] = { 0.75, 0.4, 1 },
+  [4] = { 0.25, 0.95, 0.35 }, [5] = { 1, 0.15, 0.1 }, [6] = { 1, 1, 1 },
+}
+M.LOADMAP_BLOCK_NAMES = { [0] = 'predicted', 'queued', 'building', 'photo', 'ready', 'ASKED', 'in use' }
 M.STATE_RGB = {
   hidden = { 0.6, 0.6, 0.6 }, crossover = { 1, 1, 0 }, old = { 0.9, 0.2, 0.75 }, doomed = { 1, 0, 0 },
   queued = { 1, 0.55, 0 }, queued2 = { 1, 1, 1 },
@@ -880,6 +887,16 @@ local function drawLoadMap()
     counts[c[5]] = (counts[c[5]] or 0) + 1
     if mouse and mouse.x >= a.x and mouse.x < b.x and mouse.y >= a.y and mouse.y < b.y then hover = c end
   end
+  -- the terrain blocks over the cells: outlines by state (a block asked for and not ready thick and filled red)
+  local bcounts = {}
+  for _, b in ipairs(m.blocks or {}) do
+    local a, c = im.ImVec2(sx(b[1]) + 1, sy(b[4]) + 1), im.ImVec2(sx(b[3]) - 1, sy(b[2]) - 1)
+    local rgb = M.LOADMAP_BLOCK_RGB[b[5]] or M.LOADMAP_BLOCK_RGB[0]
+    if b[5] == 5 then im.ImDrawList_AddRectFilled(dl, a, c, u32(rgb, 0.5)) end
+    im.ImDrawList_AddRect(dl, a, c, u32(rgb, 1), 0, 0, (b[5] == 5 or b[5] == 6) and 3 or 1.5)
+    bcounts[b[5]] = (bcounts[b[5]] or 0) + 1
+    if mouse and mouse.x >= a.x and mouse.x < c.x and mouse.y >= a.y and mouse.y < c.y then hover = { block = b } end
+  end
   -- the zone: the path, and each point's reach to its sides
   local zone, amber = m.zone or {}, u32({ 1, 0.65, 0.1 }, 1)
   for i, z in ipairs(zone) do
@@ -913,16 +930,27 @@ local function drawLoadMap()
   for st = 0, 5 do
     if counts[st] then parts[#parts + 1] = string.format('%s %d', M.LOADMAP_NAMES[st], counts[st]) end
   end
-  text(table.concat(parts, '   '))
+  text('map cells: ' .. table.concat(parts, '   '))
+  parts = {}
+  for st = 0, 6 do
+    if bcounts[st] then parts[#parts + 1] = string.format('%s %d', M.LOADMAP_BLOCK_NAMES[st], bcounts[st]) end
+  end
+  text('blocks: ' .. (#parts > 0 and table.concat(parts, '   ') or 'none'))
+  if (m.asked or 0) > 0 then text(string.format('THE CAR WAITS: next block asked %.1f s ago, not ready', m.asked)) end
   local stt = m.stats or {}
   if (stt.cells or 0) > 0 then
     text(string.format('built ahead: %d cells, %.1f s each on average', stt.cells, (stt.s or 0) / stt.cells))
   end
-  if hover then
+  if hover and hover.block then
+    local b = hover.block
+    text(string.format('block: %s%s', M.LOADMAP_BLOCK_NAMES[b[5]] or '?',
+      (b[6] or 0) > 0 and string.format(', %.1f s', b[6]) or ''))
+  elseif hover then
     text(string.format('cell: %s%s', M.LOADMAP_NAMES[hover[5]] or '?',
       (hover[6] or 0) > 0 and string.format(', %.1f s', hover[6]) or ''))
   else
-    text('Hover a cell for its state. Amber: the zone the server predicts; white ring: ready up to here.')
+    text('Hover a cell or block. Amber: the zone; white ring: map data ready up to here. Block outlines: grey predicted,')
+    text('yellow queued, blue building, purple photo, green ready, red asked and not ready, white in use.')
   end
   if loadMap.at and now - loadMap.at > 3 then text(string.format('(last update %.0f s ago)', now - loadMap.at)) end
 end
