@@ -119,6 +119,7 @@ import dirsigns as dirsignsmod  # noqa: E402
 import mapdata as mapdatamod  # noqa: E402
 import dem as demmod  # noqa: E402
 import mapcells  # noqa: E402
+import aheadpath  # noqa: E402
 import pacer  # noqa: E402
 import peerwork as peerworkmod  # noqa: E402
 import deshadow as deshadowmod  # noqa: E402
@@ -265,6 +266,18 @@ AHEAD_MARGIN_M = 250.0          # m around the block's half width at each point
 # cover on) and water, which a road tile otherwise fetched itself when it needed it (from KyzoFox's 1.5.4, PR #64)
 AHEAD_CELLS = 4                 # map cells download_ahead fetches at once
 AHEAD_LAYERS = ("roads", "buildings", "building_parts", "infrastructure", "water", "land_use")
+# map_ahead: the map data cells along the way ahead (aheadpath.points: MAP_AHEAD_S of driving, bending with the turn)
+# built into the caches in processes of their own ("map ahead"), nearest first, with their vegetation cells. Without it
+# nothing decoded a cell's map data before its first road or trees tile asked for it, ~200 m before the car at 175 mph:
+# trees geotiles p50 9 s / p90 50 s, most done behind the car. With it, of a 32 km first-visit motorway drive's road
+# tiles 93 % were ready before the car (73 % without), its trees 96 % (75 %). Map data only: road plans made this far
+# ahead took the CPU the road tiles near the car needed (37 road tiles sent against 118).
+MAP_AHEAD_PROCESSES = 2         # two: one after another the block processes still built most of a drive's map layers
+MAP_AHEAD_S = 120.0
+MAP_AHEAD_MIN_M = 1500.0
+MAP_AHEAD_MAX_M = 10000.0
+MAP_AHEAD_MOVE_M = 200.0        # m the player moves before the list is made again
+MAP_AHEAD_LAYERS = AHEAD_LAYERS + ("canopy", "landcover", "places")     # (places: the road tiles' gas stations)
 # route_download: like download_ahead, but along the planned GPS route's own geometry (routeahead.py)
 # instead of the player's current heading, since a road route can wander off that heading entirely.
 ROUTE_AHEAD_ON = True            # --route-prefetch
@@ -1108,6 +1121,13 @@ class Server:
         self.ahead_busy = False
         self.ahead_last = None          # (anchor id, x, y) of the last round
         self.ahead_stats = {"dem": 0, "cells": 0, "deferred": 0}
+        self.map_ahead_pool = None      # map_ahead's processes (main_async), None: download_ahead fetches the cells
+        self.map_ahead_last = None      # (anchor id, x, y) of the last list
+        self.map_ahead_want = []        # [cell key] nearest first (the last list's)
+        self.map_ahead_done = set()
+        self.map_ahead_cv = threading.Condition()
+        self.map_ahead_threads = None
+        self.map_ahead_stats = {"cells": 0, "s": 0.0}
         self.route_pool = ThreadPoolExecutor(1, thread_name_prefix="route-download")   # Connection.route_download
         self.horizon_grids = {}             # anchorId -> farfield.HorizonGrid
         self.horizon_inflight = {}          # anchorId -> (future, half-size)
@@ -2939,6 +2959,8 @@ class Server:
         reach = self.layout.block * heightmap.SQUARE / 2 + AHEAD_MARGIN_M
         zoom = anchor.hm_zoom
         layers = (AHEAD_LAYERS if self.buildings else ("roads",)) if self.mapdata is not None else ()
+        if getattr(self, "map_ahead_pool", None) is not None:
+            layers = ()         # (the map cells: map_ahead's processes, along the bending path)
         self.ahead_busy = True
 
         def run():
@@ -2975,6 +2997,69 @@ class Server:
             finally:
                 self.ahead_busy = False
         self.ahead_pool.submit(run)
+
+    def map_ahead(self, anchor, x, y, vx, vy, turn=0.0):
+        """The map data cells along the way ahead (aheadpath.points: MAP_AHEAD_S of driving, bending with turn; the
+        block's half width + AHEAD_MARGIN_M beside it) handed to the map ahead processes (blockworker.warm_map),
+        nearest first; each cell once a session."""
+        if self.map_ahead_pool is None or self.mapdata is None:
+            return
+        last = self.map_ahead_last
+        if last is not None and last[0] == anchor.id and math.hypot(x - last[1], y - last[2]) < MAP_AHEAD_MOVE_M:
+            return
+        v = math.hypot(vx, vy)
+        path = aheadpath.points(x, y, vx, vy, turn, lead_s=MAP_AHEAD_S, min_m=MAP_AHEAD_MIN_M,
+                                max_m=max(MAP_AHEAD_MIN_M, min(MAP_AHEAD_MAX_M, v * MAP_AHEAD_S)))
+        if not path:
+            return
+        self.map_ahead_last = (anchor.id, x, y)
+        reach = self.layout.block * heightmap.SQUARE / 2 + AHEAD_MARGIN_M
+        want, seen = [], set()
+        for _t, px, py, _sp in path:
+            la, lo, _ = anchor.frame.enu_to_geodetic(px, py, 0.0)
+            la, lo = float(la), float(lo)
+            dlat = reach / 111320.0
+            dlon = reach / (111320.0 * max(0.05, math.cos(math.radians(la))))
+            try:
+                keys = mapcells.cells_for_bbox(la - dlat, lo - dlon, la + dlat, lo + dlon)
+            except ValueError:
+                continue
+            for k in keys:
+                kk = (int(k.z), int(k.x), int(k.y))
+                if kk not in seen and kk not in self.map_ahead_done:
+                    seen.add(kk)
+                    want.append(kk)
+        with self.map_ahead_cv:
+            self.map_ahead_want = want      # (the last list's cells not begun yet: behind the car or off the path)
+            if self.map_ahead_threads is None:
+                self.map_ahead_threads = [threading.Thread(target=self._map_ahead_loop, daemon=True,
+                                                           name=f"map-ahead-{i}")
+                                          for i in range(getattr(self.map_ahead_pool, "workers", 1))]
+                for t in self.map_ahead_threads:
+                    t.start()
+            self.map_ahead_cv.notify_all()
+
+    def _map_ahead_loop(self):
+        while True:
+            with self.map_ahead_cv:
+                while not self.map_ahead_want:
+                    self.map_ahead_cv.wait()
+                key = self.map_ahead_want.pop(0)
+                if key in self.map_ahead_done:
+                    continue
+                self.map_ahead_done.add(key)
+                if len(self.map_ahead_done) > 50000:
+                    self.map_ahead_done.clear()
+            try:
+                dt = self.map_ahead_pool.submit(blockworker.warm_map, key, MAP_AHEAD_LAYERS,
+                                                self.veg is not None).result()
+                self.map_ahead_stats["cells"] += 1
+                self.map_ahead_stats["s"] += dt or 0.0
+                if dt and dt > 1.0:
+                    log.info("map ahead: cell %d_%d in %.1f s (%d queued; session %s)", key[1], key[2], dt,
+                             len(self.map_ahead_want), self.map_ahead_stats)
+            except Exception as e:      # only costs the lookahead
+                log.debug("map ahead %s: %s: %s", key, type(e).__name__, e)
 
     def warm_imagery(self, anchor, x, y, vx, vy):
         """The lazy imagery sources (NAIP) along the player's straight path (WARM_STEPS_S), over the block's
@@ -5250,6 +5335,7 @@ class Connection:
         self.caught_up_at = None
         self.predicted_block = None     # the terrain the prefetch expects next
         self.predicted_chain = []       # ... and after it, a fast player's (PREFETCH_CHAIN; blocks)
+        self.track = aheadpath.Track()  # the player's recent headings (its turn: map_ahead's path)
         self.focus = (0.0, 0.0)         # player x, y in the active frame
         self.view_at = None             # the camera's x, y there when it is VIEW_AWAY_M or more from the car, else None
         self.foci = ()                  # other vehicles' collision foci there ((x, y, r, trees), parse_foci)
@@ -7368,10 +7454,13 @@ class Connection:
             self.refresh_status()
             return
         self.maybe_prefetch()
+        if aid == self.active:
+            self.track.add(time.monotonic(), *self.focus, *self.vel)
         self.send_ready_set()
         if aid == self.active and self.following:
             self.s.warm_roads(self.s.anchors[aid], *self.focus, *self.vel)
             self.s.warm_imagery(self.s.anchors[aid], *self.focus, *self.vel)
+            self.s.map_ahead(self.s.anchors[aid], *self.focus, *self.vel, self.track.turn())
             self.s.download_ahead(self.s.anchors[aid], *self.focus, *self.vel)
             self.s.bake_sync(self.s.anchors[aid], *self.focus)
             self.base_refresh(aid)
@@ -8550,6 +8639,14 @@ async def main_async(args):
     server.game_cpus = getattr(args, "game_cpus", None)    # (cpupin.py: the game pinned at each hello)
     server.server_cpus = getattr(args, "server_cpus", None)
     server.photo_pool = photo_pool
+    if args.block_process == "on" and server.mapdata is not None:
+        # map data cells ahead (Server.map_ahead): below the road tiles, like them
+        import budget
+        server.map_ahead_pool = poolsmod.RespawningPool(
+            "map ahead", 1 if budget.small() else MAP_AHEAD_PROCESSES, mp_context=ctx, initializer=blockworker.init,
+            initargs=(args.cache_dir, args.offline, args.roads == "on", args.grading == "on",
+                      args.road_widths == "on", args.surface == "on", None, logging.getLogger().level,
+                      args.airports == "on", args.sea == "on", NICE_ROADS + 1, roadsmod.ROADS_IN_GROUND))
     server.boost_cpus = (cpupin.boosted(server.server_cpus, server.game_cpus)
                          if getattr(args, "load_boost", "on") == "on" else None)
     # (a driving player's catch-up lends less: half the game's cores for the whole of a 150 mph drive took its frame

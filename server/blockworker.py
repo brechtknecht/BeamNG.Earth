@@ -331,6 +331,45 @@ def ground(frame, la, lo, z):
     return z
 
 
+def warm_map(key, layers, veg=True):
+    """Map data cell key ((z, x, y)) built into the disk caches ahead of the car (earthd.Server.map_ahead): its
+    layers (MapData.cell) and its vegetation cell (Vegetation.cell, which reads its 3 x 3 neighbours' roads,
+    buildings and water). On a first visit a trees geotile spent ~56 s on its cell's map data and 0.01 s on its
+    trees, and the tiles asked for it only ~200 m before the car at 175 mph. Seconds."""
+    import vegetation as vegetationmod
+    if _s.md is None:
+        return 0.0
+    from concurrent.futures import ThreadPoolExecutor
+    t0 = time.perf_counter()
+    z, x, y = (int(v) for v in key)
+
+    def one(k, lys):
+        try:
+            _s.md.cell(k, layers=tuple(lys), kind="background")
+        except Exception as e:      # (the tile asks again, on demand)
+            log.debug("warm map %s: %s: %s", k, type(e).__name__, e)
+    # the cell's layers and its 8 neighbours' roads, buildings and water (what Vegetation.cell reads) at once: mostly
+    # downloads; one after another a first-visit cell took 101 s on 2 cores
+    jobs = [(key, layers)] if layers else []
+    if veg:
+        jobs += [((z, x + dx, y + dy), ("buildings", "roads", "water")) for dy in (-1, 0, 1) for dx in (-1, 0, 1)
+                 if (dx, dy) != (0, 0)]
+    if jobs:
+        with ThreadPoolExecutor(min(9, len(jobs)), thread_name_prefix="warm-map") as ex:
+            list(ex.map(lambda j: one(*j), jobs))
+    if veg:
+        try:
+            if getattr(_s, "veg", None) is None:
+                v = vegetationmod.Vegetation(_s.md, _s.cache_dir)
+                v.dem = _s.dem
+                v.surface, v.widths = _s.surface, _s.widths
+                _s.veg = v
+            _s.veg.cell(key)
+        except Exception as e:
+            log.debug("warm veg %s: %s: %s", key, type(e).__name__, e)
+    return time.perf_counter() - t0
+
+
 def veg_geo(aid, lat, lon, zoom, gx, gy, out_dir, vfs_dir, flat=False):
     """earthd.Server.build_veg_geo in this process (the road tiles' processes): geotile (gx, gy)'s trees, bushes and
     rocks written to out_dir: (vfs path, n, frame (lat, lon), pivot) or None. In the server's process they were ~35

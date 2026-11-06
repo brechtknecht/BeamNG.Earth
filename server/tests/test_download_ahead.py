@@ -88,5 +88,74 @@ class DownloadAheadTest(unittest.TestCase):
         self.assertTrue(s.mapdata.cells and all(layers == ("roads",) for _, layers, _ in s.mapdata.cells))
 
 
+
+class FakeFuture:
+    def result(self):
+        return 0.0
+
+
+class FakeMapAheadPool:
+    workers = 1
+
+    def __init__(self):
+        import threading
+        self.keys = []
+        self.lock = threading.Lock()
+
+    def submit(self, fn, key, layers, veg):
+        with self.lock:
+            self.keys.append(key)
+        return FakeFuture()
+
+
+def map_ahead_server():
+    import threading
+    s = server()
+    s.map_ahead_pool = FakeMapAheadPool()
+    s.map_ahead_last, s.map_ahead_want, s.map_ahead_done = None, [], set()
+    s.map_ahead_cv, s.map_ahead_threads = threading.Condition(), None
+    s.map_ahead_stats = {"cells": 0, "s": 0.0}
+    s.veg = None
+    s._map_ahead_loop = lambda: earthd.Server._map_ahead_loop(s)
+    return s
+
+
+class MapAheadTest(unittest.TestCase):
+    def wait_for(self, pool, n):
+        import time
+        t0 = time.monotonic()
+        while len(pool.keys) < n and time.monotonic() - t0 < 5.0:
+            time.sleep(0.01)
+
+    def test_download_ahead_leaves_the_cells_to_it(self):
+        s, a = map_ahead_server(), anchor()
+        earthd.Server.download_ahead(s, a, 0.0, 0.0, 0.0, 40.0)
+        self.assertTrue(s.dem.asked)
+        self.assertEqual(s.mapdata.cells, [])
+
+    def test_cells_along_the_path_nearest_first_once(self):
+        s, a = map_ahead_server(), anchor()
+        earthd.Server.map_ahead(s, a, 0.0, 0.0, 0.0, 40.0)      # 40 m/s north: 4.8 km ahead
+        n = len(s.map_ahead_done) + len(s.map_ahead_want)
+        self.wait_for(s.map_ahead_pool, n)
+        keys = s.map_ahead_pool.keys
+        self.assertGreater(len(keys), 2)
+        self.assertEqual(len(keys), len(set(keys)))
+        ys = [k[2] for k in keys]       # (tile rows count southwards)
+        self.assertGreaterEqual(ys[0], max(ys) - 1, "the cells around the car first")
+        self.assertEqual(ys[-1], min(ys), "the farthest north last")
+        earthd.Server.map_ahead(s, a, 50.0, 0.0, 0.0, 40.0)     # less than MAP_AHEAD_MOVE_M later: no new list
+        self.assertEqual(s.map_ahead_last[1], 0.0)
+        earthd.Server.map_ahead(s, a, 0.0, 300.0, 0.0, 40.0)    # further on: only new cells
+        self.wait_for(s.map_ahead_pool, len(keys) + 1)
+        self.assertEqual(len(s.map_ahead_pool.keys), len(set(s.map_ahead_pool.keys)))
+
+    def test_standing_asks_nothing(self):
+        s, a = map_ahead_server(), anchor()
+        earthd.Server.map_ahead(s, a, 0.0, 0.0, 0.0, 0.5)
+        self.assertEqual(s.map_ahead_pool.keys, [])
+        self.assertIsNone(s.map_ahead_threads)
+
+
 if __name__ == "__main__":
     unittest.main()
