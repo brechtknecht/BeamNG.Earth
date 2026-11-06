@@ -32,7 +32,10 @@
 --   probe     a vertical line at the car: the physics ground, the tile under the car (level, its
 --             crossover offset); red when the tile is not the exact level or more than PROBE_TOL off.
 -- Panels (one imgui window "BeamNG.Earth Dev"): stats, graphs (60 s), mini-map (click a tile to
--- inspect it), controls (overlays, presets, freeze LOD, force rebase, budget, sky), log (events).
+-- inspect it), controls (overlays, presets, freeze LOD, force rebase, budget, sky), log (events),
+-- loadmap (the server's work ahead from above: the zone it predicts, its map cells ready / loading /
+-- queued / missing, and how far ahead of the car they are ready; the server sends it only while
+-- this panel asks, every LOADMAP_ASK_S).
 --
 -- Cost: tiles come from a spatial index (tileindex.lua) that farfield keeps current through
 -- farfield.setWatcher only while the dev tools are on; the lists to draw are rebuilt every
@@ -54,14 +57,15 @@ local stopwatch = require('beamngEarth/stopwatch')
 local floor, min, max, abs, sqrt, huge = math.floor, math.min, math.max, math.abs, math.sqrt, math.huge
 
 M.OVERLAYS = { 'tint', 'outlines', 'loading', 'physics', 'physicsTerrain', 'rings', 'probe', 'wireframe' }
-M.PANELS = { 'stats', 'graphs', 'map', 'controls', 'log' }
+M.PANELS = { 'stats', 'graphs', 'map', 'controls', 'log', 'loadmap' }
 M.PRESETS = {
   off = {},
   lod = { tint = true, outlines = true, probe = true, stats = true, map = true, controls = true },
-  loading = { loading = true, outlines = true, stats = true, graphs = true, map = true, log = true, controls = true },
+  loading = { loading = true, outlines = true, stats = true, graphs = true, map = true, log = true, controls = true,
+    loadmap = true },
   physics = { physics = true, rings = true, probe = true, stats = true, controls = true },
   all = { tint = true, outlines = true, loading = true, physics = true, rings = true, probe = true, stats = true,
-    graphs = true, map = true, controls = true, log = true },
+    graphs = true, map = true, controls = true, log = true, loadmap = true },
 }
 M.PRESET_ORDER = { 'off', 'lod', 'loading', 'physics', 'all' }
 
@@ -98,6 +102,14 @@ M.LEVEL_RGB = {
   [0] = { 0.1, 0.9, 0.95 }, [1] = { 0.2, 0.45, 1 }, [2] = { 0.7, 0.3, 1 }, [3] = { 1, 0.65, 0.1 },
   [4] = { 1, 0.45, 0.1 }, coarse = { 1, 0.15, 0.1 },
 }
+M.LOADMAP_ASK_S = 1.0    -- the panel asks the server for its loading map this often (it holds 3 s)
+M.LOADMAP_PX = 360
+-- a map cell's colour by the server's state (earthd LOAD_MAP_*: missing, queued, loading, ready, on disk, failed)
+M.LOADMAP_RGB = {
+  [0] = { 0.85, 0.2, 0.15 }, [1] = { 0.55, 0.6, 0.7 }, [2] = { 0.2, 0.5, 1 }, [3] = { 0.2, 0.8, 0.3 },
+  [4] = { 0.1, 0.5, 0.2 }, [5] = { 0.9, 0.2, 0.8 },
+}
+M.LOADMAP_NAMES = { [0] = 'missing', 'queued', 'loading', 'ready', 'on disk', 'failed' }
 M.STATE_RGB = {
   hidden = { 0.6, 0.6, 0.6 }, crossover = { 1, 1, 0 }, old = { 0.9, 0.2, 0.75 }, doomed = { 1, 0, 0 },
   queued = { 1, 0.55, 0 }, queued2 = { 1, 1, 1 },
@@ -138,6 +150,7 @@ local cost = { ema = 0, last = 0 }
 local selected = nil       -- mini-map pick
 local mapLevelMin = nil    -- finest level the mini-map draws at its zoom
 local drawn = 0            -- debug lines drawn this frame
+local loadMap = { msg = nil, at = nil, askedAt = -huge }    -- the server's last loading map (M.receiveLoadMap)
 
 ------------------------------------------------------------------------------------------
 -- small helpers
@@ -328,6 +341,7 @@ function M.set(name, value)
   local prev = on[name] == true
   if value == prev then return value end
   on[name] = value or nil
+  if name == 'loadmap' and not value then loadMap.msg, loadMap.at = nil, nil end
   updateActive()
   refreshT, physT, ringKey, stats.acc = huge, huge, nil, huge -- rebuild what is drawn next frame
   if name == 'tint' then
@@ -828,6 +842,104 @@ local function drawMap(st)
   end
 end
 
+-- The server's loading map, north up, the car in the middle: the zone (its path, with each point's lateral reach), the
+-- map cells coloured by state, and how far along the path they are ready.
+local function drawLoadMap()
+  local m = loadMap.msg
+  if not m then
+    text(require('beamngEarth/net').isConnected() and 'Waiting for the server (drive to see the zone)...'
+      or 'Not connected to the server.')
+    return
+  end
+  if not m.on then text('The server builds no map data ahead (no worker processes).') end
+  local px, py = m.x or 0, m.y or 0
+  local R = 2000
+  for _, z in ipairs(m.zone or {}) do
+    R = max(R, sqrt((z[1] - px) ^ 2 + (z[2] - py) ^ 2) + (z[3] or 0) + 500)
+  end
+  local size = M.LOADMAP_PX
+  local s = (size / 2) / R
+  local p0 = im.GetCursorScreenPos()
+  im.InvisibleButton('##bngEarthLoadMap', im.ImVec2(size, size))
+  local hovered = im.IsItemHovered()
+  local dl = im.GetWindowDrawList()
+  local x0, y0 = p0.x, p0.y
+  local cx, cy = x0 + size / 2, y0 + size / 2
+  local function sx(x) return cx + (x - px) * s end
+  local function sy(y) return cy - (y - py) * s end
+  local mouse = hovered and im.GetMousePos() or nil
+  local hover = nil
+  im.ImDrawList_PushClipRect(dl, im.ImVec2(x0, y0), im.ImVec2(x0 + size, y0 + size), true)
+  im.ImDrawList_AddRectFilled(dl, im.ImVec2(x0, y0), im.ImVec2(x0 + size, y0 + size), u32({ 0.05, 0.05, 0.06 }, 0.9))
+  local counts = {}
+  for _, c in ipairs(m.cells or {}) do
+    local a, b = im.ImVec2(sx(c[1]), sy(c[4])), im.ImVec2(sx(c[3]), sy(c[2]))
+    local rgb = M.LOADMAP_RGB[c[5]] or M.LOADMAP_RGB[0]
+    im.ImDrawList_AddRectFilled(dl, a, b, u32(rgb, 0.45))
+    im.ImDrawList_AddRect(dl, a, b, u32(rgb, 0.9))
+    counts[c[5]] = (counts[c[5]] or 0) + 1
+    if mouse and mouse.x >= a.x and mouse.x < b.x and mouse.y >= a.y and mouse.y < b.y then hover = c end
+  end
+  -- the zone: the path, and each point's reach to its sides
+  local zone, amber = m.zone or {}, u32({ 1, 0.65, 0.1 }, 1)
+  for i, z in ipairs(zone) do
+    if (z[3] or 0) > 0 then im.ImDrawList_AddCircle(dl, im.ImVec2(sx(z[1]), sy(z[2])), z[3] * s, u32({ 1, 0.65, 0.1 }, 0.35), 32, 1) end
+    local n = zone[i + 1]
+    if n then im.ImDrawList_AddLine(dl, im.ImVec2(sx(z[1]), sy(z[2])), im.ImVec2(sx(n[1]), sy(n[2])), amber, 2) end
+  end
+  -- how far ahead the map data is ready: a white mark on the path
+  local lead, walked = m.lead or 0, 0
+  for i = 2, #zone do
+    local a, b = zone[i - 1], zone[i]
+    local d = sqrt((b[1] - a[1]) ^ 2 + (b[2] - a[2]) ^ 2)
+    if walked + d >= lead and d > 0 then
+      local f = (lead - walked) / d
+      im.ImDrawList_AddCircle(dl, im.ImVec2(sx(a[1] + (b[1] - a[1]) * f), sy(a[2] + (b[2] - a[2]) * f)), 5,
+        u32({ 1, 1, 1 }, 1), 16, 2)
+      break
+    end
+    walked = walked + d
+  end
+  -- the car: an arrow along its velocity
+  local v = sqrt((m.vx or 0) ^ 2 + (m.vy or 0) ^ 2)
+  local hx, hy = 0, 1
+  if v > 0.5 then hx, hy = m.vx / v, m.vy / v end
+  local function pt(f, sd) return im.ImVec2(cx + hx * f + hy * sd, cy - (hy * f - hx * sd)) end
+  im.ImDrawList_AddTriangleFilled(dl, pt(9, 0), pt(-6, 5), pt(-6, -5), u32({ 1, 1, 1 }, 1))
+  im.ImDrawList_PopClipRect(dl)
+  text(string.format('%.0f km/h   ready ahead %.1f km   queued %d   %.1f km across', v * 3.6, (m.lead or 0) / 1000,
+    m.queued or 0, 2 * R / 1000))
+  local parts = {}
+  for st = 0, 5 do
+    if counts[st] then parts[#parts + 1] = string.format('%s %d', M.LOADMAP_NAMES[st], counts[st]) end
+  end
+  text(table.concat(parts, '   '))
+  local stt = m.stats or {}
+  if (stt.cells or 0) > 0 then
+    text(string.format('built ahead: %d cells, %.1f s each on average', stt.cells, (stt.s or 0) / stt.cells))
+  end
+  if hover then
+    text(string.format('cell: %s%s', M.LOADMAP_NAMES[hover[5]] or '?',
+      (hover[6] or 0) > 0 and string.format(', %.1f s', hover[6]) or ''))
+  else
+    text('Hover a cell for its state. Amber: the zone the server predicts; white ring: ready up to here.')
+  end
+  if loadMap.at and now - loadMap.at > 3 then text(string.format('(last update %.0f s ago)', now - loadMap.at)) end
+end
+
+-- The server's loading map (core.lua: the "load_map" message), kept while the panel is on.
+function M.receiveLoadMap(msg)
+  if not on.loadmap or type(msg) ~= 'table' then return end
+  loadMap.msg, loadMap.at = msg, now
+end
+
+local function askLoadMap()
+  if now - loadMap.askedAt < M.LOADMAP_ASK_S then return end
+  loadMap.askedAt = now
+  local net = require('beamngEarth/net')
+  if net.isConnected() then net.send({ type = 'load_map', on = true }) end
+end
+
 local function drawGraphs()
   local n = graphs.n
   local off = n < M.GRAPH_N and 0 or graphs.off
@@ -941,6 +1053,7 @@ local function drawPanels(st)
     if on.graphs and im.CollapsingHeader1('Graphs (60 s)', im.TreeNodeFlags_DefaultOpen) then drawGraphs() end
     if on.map and im.CollapsingHeader1('Mini-map', im.TreeNodeFlags_DefaultOpen) then drawMap(st) end
     if on.log and im.CollapsingHeader1('Log', im.TreeNodeFlags_DefaultOpen) then drawLog() end
+    if on.loadmap and im.CollapsingHeader1('Loading map (work ahead)', im.TreeNodeFlags_DefaultOpen) then drawLoadMap() end
   end
   im.End()
   if not winOpen[0] then
@@ -1001,7 +1114,8 @@ function M.frame(dtReal, dtSim, st, gov)
     graphs.t = graphs.t + dtReal
     if graphs.t >= M.GRAPH_S then graphs.t = 0; sampleGraphs(st) end
   end
-  if on.stats or on.graphs or on.map or on.controls or on.log then drawPanels(st) end
+  if on.loadmap then askLoadMap() end
+  if on.stats or on.graphs or on.map or on.controls or on.log or on.loadmap then drawPanels(st) end
 
   cost.last = clock() - t0
   cost.ema = cost.ema + 0.05 * (cost.last - cost.ema)
