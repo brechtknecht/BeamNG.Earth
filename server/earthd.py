@@ -115,6 +115,7 @@ import mapdata as mapdatamod  # noqa: E402
 import dem as demmod  # noqa: E402
 import mapcells  # noqa: E402
 import aheadpath  # noqa: E402
+import roadahead  # noqa: E402
 import pacer  # noqa: E402
 import peerwork as peerworkmod  # noqa: E402
 import deshadow as deshadowmod  # noqa: E402
@@ -682,9 +683,17 @@ ROUTE_ALIGN = 0.7           # ... and heading along it (cos of the angle) is on 
 ROUTE_STEP_M = 16.0         # m between the route points the mod's follow rule is tried at
 ROUTE_AHEAD_S = 20.0        # s of driving along the route looked at, at most ...
 ROUTE_AHEAD_MAX_M = 3000.0  # ... and this far
+# Off a GPS route, on a known road: the chain along the road the player drives on (roadahead.py), longer than the
+# straight one: following the road it is right far ahead, where the straight chain at a curving motorway's speed was
+# wrong after a block or two (a third of the blocks built never asked for, the right one ordered late; 2026-11-07)
+ROAD_CHAIN = 8              # blocks
+ROAD_AHEAD_S = 40.0         # s of driving along the road looked at, at most ...
+ROAD_AHEAD_MAX_M = 5000.0   # ... and this far
+ROAD_MOVE_M = 20.0          # m the player moves before its road ahead is followed again
 
 
-def predict_route_chain(xy, px, py, vx, vy, cx, cy, rule, n, at=None):
+def predict_route_chain(xy, px, py, vx, vy, cx, cy, rule, n, at=None, ahead_s=ROUTE_AHEAD_S,
+                        max_m=ROUTE_AHEAD_MAX_M):
     """The next n centres the mod will ask for while the player at (px, py) moving (vx, vy) drives along the route
     polyline xy ((k, 2) in the anchor frame), or None when the player is not on it (ROUTE_NEAR_M, ROUTE_ALIGN). The
     mod's rule (predict_request) tried every ROUTE_STEP_M along the route with the route's own heading there."""
@@ -701,7 +710,7 @@ def predict_route_chain(xy, px, py, vx, vy, cx, cy, rule, n, at=None):
     seg = float(np.sqrt(ln2[j]))
     if dist[j] > ROUTE_NEAR_M or ((d[j, 0] * vx + d[j, 1] * vy) / (seg * sp)) < ROUTE_ALIGN:
         return None
-    reach = min(ROUTE_AHEAD_MAX_M, sp * ROUTE_AHEAD_S)
+    reach = min(max_m, sp * ahead_s)
     out, gone, x, y, k = [], 0.0, float(q[j, 0]), float(q[j, 1]), j
     while gone < reach and k < len(d) and len(out) < n:
         ux, uy = d[k, 0] / math.sqrt(ln2[k]), d[k, 1] / math.sqrt(ln2[k])
@@ -1081,6 +1090,8 @@ class Server:
         if surface is not None and self.airports is not None:      # the runways painted in (GitHub #337)
             surface.extra_pads = self.airports.runway_pads
         self.mapdata = mapdata      # mapdata.MapData for the roads (--roads on), else None
+        # the road a fast player drives on, followed ahead (roadahead.py): the terrain prefetch's chain along it
+        self.road_ahead = roadahead.RoadAhead(mapdata) if mapdata is not None else None
         if mapdata is not None and getattr(mapdata, "dem", 0) is None:
             mapdata.dem = self.dem  # (gradesep's ground)
         self.grading = bool(grading) and mapdata is not None   # ground graded under roads (grading.py)
@@ -6502,10 +6513,17 @@ class Connection:
                     self.predicted_block = self.s.layout.block_at(*c)
                     at[c] = where[0]
             self.predicted_chain = []
+            self.predicted_by = "straight"
             if math.hypot(*self.vel) > FAST_BASE_V:
                 route_at = {}
                 cs = predict_route_chain(self.route_xy(aid), px, py, *self.vel, base.cx, base.cy, rule,
                                          PREFETCH_CHAIN + 1, route_at)
+                self.predicted_by = "route" if cs else "straight"
+                if not cs:          # no route: along the road the player drives on, further ahead
+                    cs = predict_route_chain(self.road_xy(aid, px, py), px, py, *self.vel, base.cx, base.cy, rule,
+                                             ROAD_CHAIN + 1, route_at, ROAD_AHEAD_S, ROAD_AHEAD_MAX_M)
+                    if cs:
+                        self.predicted_by = "road"
                 if cs:              # (on the GPS route: along it; its first is the next block, as predicted_block)
                     at.update(route_at)
                     if self.predicted_block is not None:
@@ -6626,6 +6644,23 @@ class Connection:
                 del self.nav_wait[k]
         done, wanted = self.roads.progress() if self.roads is not None else (0, 0)
         return (wanted > 0 and done * 2 >= wanted) or time.monotonic() - t0 >= NAV_WAIT_S
+
+    def road_xy(self, aid, x, y):
+        """The road the player drives on ahead ((k, 2) in anchor aid's frame, roadahead.py), or None; followed again
+        once the player moved ROAD_MOVE_M."""
+        ra, anchor = getattr(self.s, "road_ahead", None), self.s.anchors.get(aid)
+        if ra is None or anchor is None:
+            return None
+        got = getattr(self, "_road_xy", None)
+        if got is not None and got[0] == aid and math.hypot(x - got[1], y - got[2]) < ROAD_MOVE_M and got[4] is ra.net:
+            return got[3]
+        try:
+            xy = ra.follow(anchor, x, y, *self.vel, ROAD_AHEAD_MAX_M)
+        except Exception:
+            log.exception("road ahead failed")
+            xy = None
+        self._road_xy = (aid, x, y, xy, ra.net)
+        return xy
 
     def route_xy(self, aid):
         """The last planned GPS route's line in anchor aid's frame ((k, 2), kept per route and anchor), or None."""
@@ -7037,10 +7072,10 @@ class Connection:
             busy.add(key)
             self.prefetching = True
 
-            async def run(cx=b.cx, cy=b.cy, key=key):
+            async def run(cx=b.cx, cy=b.cy, key=key, by=getattr(self, "predicted_by", "straight")):
                 try:
                     await self.s.terrain(anchor, cx, cy, lane=LANE_PREFETCH)
-                    log.debug("prefetched terrain (%d, %.0f, %.0f)", anchor.id, cx, cy)
+                    log.info("prefetched terrain (%d, %.0f, %.0f) predicted %s", anchor.id, cx, cy, by)
                 except Exception:
                     log.exception("terrain prefetch failed")
                 finally:
