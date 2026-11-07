@@ -41,19 +41,6 @@ class PrefetchChainTest(unittest.TestCase):
         self.assertIsNone(earthd.predict_route_chain(route, 0.0, 0.0, -v, 0.0, 0.0, 0.0, rule, 5), "the other way")
         self.assertIsNone(earthd.predict_route_chain(None, 0.0, 0.0, v, 0.0, 0.0, 0.0, rule, 5), "no route")
 
-    def test_along_the_bend(self):
-        """Off a route, turning: the chain follows the bend (bend_xy); straight or standing: no bend path."""
-        rule = earthd.FOLLOW_RULES[1024.0]
-        v = 80.0                                    # ~180 mph east, turning left 0.05 rad/s (a 1.6 km radius)
-        xy = earthd.bend_xy(0.0, 0.0, v, 0.0, 0.05)
-        self.assertIsNotNone(xy)
-        chain = earthd.predict_route_chain(xy, 0.0, 0.0, v, 0.0, 0.0, 0.0, rule, 5)
-        self.assertGreaterEqual(len(chain), 2, chain)
-        self.assertEqual(chain[0], earthd.predict_request(0.0, 0.0, v, 0.0, 0.0, 0.0, rule), "the first as before")
-        self.assertGreater(chain[-1][1], 100.0, "bending north")
-        self.assertIsNone(earthd.bend_xy(0.0, 0.0, v, 0.0, 0.005), "nearly straight")
-        self.assertIsNone(earthd.bend_xy(0.0, 0.0, 0.0, 0.0, 0.1), "standing")
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -722,21 +722,6 @@ def predict_route_chain(xy, px, py, vx, vy, cx, cy, rule, n, at=None):
     return out
 
 
-# Off a GPS route in a bend: the chain along the bend (bend_xy), not the straight line. On a curving road at 185 mph
-# a third of the blocks built were never asked for, each 384 m beside one that was (2 m blocks, 2026-11-07).
-BEND_MIN_TURN = 0.02        # rad/s: a gentler turn is driven as straight (predict_chain)
-
-
-def bend_xy(px, py, vx, vy, turn):
-    """The player's path ahead ((k, 2), aheadpath.points over ROUTE_AHEAD_S, at most ROUTE_AHEAD_MAX_M) when it is
-    turning (BEND_MIN_TURN), for predict_route_chain; None when straight or standing."""
-    if abs(turn) < BEND_MIN_TURN:
-        return None
-    pts = aheadpath.points(px, py, vx, vy, turn, lead_s=ROUTE_AHEAD_S, min_m=0.0, max_m=ROUTE_AHEAD_MAX_M,
-                           step_m=ROUTE_STEP_M * 4)
-    return np.array([(x, y) for _t, x, y, _s in pts], np.float64) if len(pts) >= 2 else None
-
-
 def _num(msg, name, default=None):
     v = msg.get(name, default)
     if v is None:
@@ -6514,17 +6499,10 @@ class Connection:
                     self.predicted_block = self.s.layout.block_at(*c)
                     at[c] = where[0]
             self.predicted_chain = []
-            self.predicted_by = "straight"
             if math.hypot(*self.vel) > FAST_BASE_V:
                 route_at = {}
                 cs = predict_route_chain(self.route_xy(aid), px, py, *self.vel, base.cx, base.cy, rule,
                                          PREFETCH_CHAIN + 1, route_at)
-                self.predicted_by = "route" if cs else "straight"
-                if not cs:          # no route: along the bend the player is in (aheadpath), as along a route
-                    cs = predict_route_chain(bend_xy(px, py, *self.vel, self.track.steady_turn()), px, py, *self.vel,
-                                             base.cx, base.cy, rule, PREFETCH_CHAIN + 1, route_at)
-                    if cs:
-                        self.predicted_by = "bend"
                 if cs:              # (on the GPS route: along it; its first is the next block, as predicted_block)
                     at.update(route_at)
                     if self.predicted_block is not None:
@@ -7056,10 +7034,10 @@ class Connection:
             busy.add(key)
             self.prefetching = True
 
-            async def run(cx=b.cx, cy=b.cy, key=key, by=getattr(self, "predicted_by", "straight")):
+            async def run(cx=b.cx, cy=b.cy, key=key):
                 try:
                     await self.s.terrain(anchor, cx, cy, lane=LANE_PREFETCH)
-                    log.info("prefetched terrain (%d, %.0f, %.0f) predicted %s", anchor.id, cx, cy, by)
+                    log.debug("prefetched terrain (%d, %.0f, %.0f)", anchor.id, cx, cy)
                 except Exception:
                     log.exception("terrain prefetch failed")
                 finally:

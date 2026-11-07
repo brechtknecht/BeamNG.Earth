@@ -72,19 +72,3 @@ class TrackTest(unittest.TestCase):
         self.assertEqual(t.turn(), 0.0)
         t.add(3.0, 2030.0, 0.0, 0.0, 0.0)               # stopped
         self.assertEqual(len(t.poses), 0)
-
-    def test_steady_turn(self):
-        """A bend going on: its turn; a corner taken (straight since): none."""
-        tr = aheadpath.Track()
-        for i in range(31):
-            t = i * 0.1
-            h = 0.05 * t
-            tr.add(t, 0.0, 0.0, 50 * math.cos(h), 50 * math.sin(h))
-        self.assertAlmostEqual(tr.steady_turn(), 0.05, places=2)
-        tr = aheadpath.Track()
-        for i in range(31):
-            t = i * 0.1
-            h = 0.5 * min(t, 1.0)
-            tr.add(t, 0.0, 0.0, 50 * math.cos(h), 50 * math.sin(h))
-        self.assertNotEqual(tr.turn(), 0.0)
-        self.assertEqual(tr.steady_turn(), 0.0)
