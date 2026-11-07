@@ -406,7 +406,10 @@ PREFETCH_START = 200.0      # m (Chebyshev) from the block centre before prefetc
 # 500 mph the next block was asked for ~1.3 s before it was needed and took 0.5-3 s, so the game held its car for its
 # ground half the time (Indianapolis 2026-10-30); one predicted block was not enough
 PREFETCH_CHAIN = 4
-READY_STEPS = 2             # grid steps a built block may be from the mod's target and still be taken (follow.lua)
+# grid steps a built block may be from the mod's target and still be taken (follow.lua; the player within reach of it):
+# 3 since 2026-11-07, at 2 a third of a 185 mph drive's prefetched blocks (2 m squares) were never taken, nearly all of
+# them 3 steps (384 m) from the one asked for
+READY_STEPS = 3
 PREFETCH_PARALLEL = 2
 READY_SET_M = 3000.0        # m: the built blocks round the player the mod is told of (terrain_ready_set)
 # The mod's terrain-follow rule (mod follow.lua): it asks once the player is more than

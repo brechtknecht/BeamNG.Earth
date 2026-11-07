@@ -281,7 +281,7 @@ end
 -- next request missed by a grid step or two half the time, and the block asked for was built from scratch (the game
 -- held the car for its ground, Indianapolis 2026-10-30).
 M.ready = {}
-M.READY_STEPS = 2       -- grid steps a ready block may be from the target (Chebyshev)
+M.READY_STEPS = 3       -- grid steps a ready block may be from the target (Chebyshev; 2 until 2026-11-07)
 function M.setReady(list)
   local r = {}
   for _, c in ipairs(list or {}) do
