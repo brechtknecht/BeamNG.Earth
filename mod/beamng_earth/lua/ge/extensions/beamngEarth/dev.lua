@@ -32,7 +32,10 @@
 --   probe     a vertical line at the car: the physics ground, the tile under the car (level, its
 --             crossover offset); red when the tile is not the exact level or more than PROBE_TOL off.
 -- Panels (one imgui window "BeamNG.Earth Dev"): stats, graphs (60 s), mini-map (click a tile to
--- inspect it), controls (overlays, presets, freeze LOD, force rebase, budget, sky), log (events).
+-- inspect it; its "Work ahead" layer: what the server builds ahead of the car, the zone it predicts,
+-- its map cells ready / loading / queued / missing, its terrain blocks by state; the server sends it
+-- only while the layer asks, every LOADMAP_ASK_S), controls (overlays, presets, freeze LOD, force
+-- rebase, budget, sky), log (events).
 --
 -- Cost: tiles come from a spatial index (tileindex.lua) that farfield keeps current through
 -- farfield.setWatcher only while the dev tools are on; the lists to draw are rebuilt every
@@ -98,6 +101,21 @@ M.LEVEL_RGB = {
   [0] = { 0.1, 0.9, 0.95 }, [1] = { 0.2, 0.45, 1 }, [2] = { 0.7, 0.3, 1 }, [3] = { 1, 0.65, 0.1 },
   [4] = { 1, 0.45, 0.1 }, coarse = { 1, 0.15, 0.1 },
 }
+M.LOADMAP_ASK_S = 1.0    -- the mini-map's work-ahead layer asks the server for it this often (it holds 3 s)
+M.LOADMAP_KM = 3         -- km: the mini-map's radius when the work-ahead layer is turned on (its blocks visible)
+-- a map cell's colour by the server's state (earthd LOAD_MAP_*: missing, queued, loading, ready, on disk, failed)
+M.LOADMAP_RGB = {
+  [0] = { 0.85, 0.2, 0.15 }, [1] = { 0.55, 0.6, 0.7 }, [2] = { 0.2, 0.5, 1 }, [3] = { 0.2, 0.8, 0.3 },
+  [4] = { 0.1, 0.5, 0.2 }, [5] = { 0.9, 0.2, 0.8 },
+}
+M.LOADMAP_NAMES = { [0] = 'missing', 'queued', 'loading', 'ready', 'on disk', 'failed' }
+-- a terrain block's outline by the server's state (earthd BLOCK_*): predicted, queued, building, base photo, ready,
+-- asked for and not ready (the car waits), in use
+M.LOADMAP_BLOCK_RGB = {
+  [0] = { 0.6, 0.6, 0.6 }, [1] = { 1, 0.85, 0.1 }, [2] = { 0.25, 0.6, 1 }, [3] = { 0.75, 0.4, 1 },
+  [4] = { 0.25, 0.95, 0.35 }, [5] = { 1, 0.15, 0.1 }, [6] = { 1, 1, 1 },
+}
+M.LOADMAP_BLOCK_NAMES = { [0] = 'predicted', 'queued', 'building', 'photo', 'ready', 'ASKED', 'in use' }
 M.STATE_RGB = {
   hidden = { 0.6, 0.6, 0.6 }, crossover = { 1, 1, 0 }, old = { 0.9, 0.2, 0.75 }, doomed = { 1, 0, 0 },
   queued = { 1, 0.55, 0 }, queued2 = { 1, 1, 1 },
@@ -138,6 +156,8 @@ local cost = { ema = 0, last = 0 }
 local selected = nil       -- mini-map pick
 local mapLevelMin = nil    -- finest level the mini-map draws at its zoom
 local drawn = 0            -- debug lines drawn this frame
+local loadMap = { msg = nil, at = nil, askedAt = -huge }    -- the server's last work ahead (M.receiveLoadMap)
+local workAhead = false    -- the mini-map's work-ahead layer on
 
 ------------------------------------------------------------------------------------------
 -- small helpers
@@ -328,6 +348,7 @@ function M.set(name, value)
   local prev = on[name] == true
   if value == prev then return value end
   on[name] = value or nil
+  if name == 'map' and not value then loadMap.msg, loadMap.at = nil, nil end
   updateActive()
   refreshT, physT, ringKey, stats.acc = huge, huge, nil, huge -- rebuild what is drawn next frame
   if name == 'tint' then
@@ -388,11 +409,19 @@ function M.setParam(name, v)
   return v
 end
 
+-- The mini-map's work-ahead layer on or off (on zooms the mini-map in to LOADMAP_KM, its blocks visible).
+function M.setWorkAhead(v)
+  workAhead = v and true or false
+  if not workAhead then loadMap.msg, loadMap.at = nil, nil
+  elseif params.mapKm > M.LOADMAP_KM then M.setParam('mapKm', M.LOADMAP_KM) end
+  return workAhead
+end
+
 function M.state()
   local t = {}
   for n in pairs(known) do t[n] = on[n] == true end
   return { on = t, overlays = M.OVERLAYS, panels = M.PANELS, presets = M.PRESET_ORDER, lastPreset = lastPreset,
-    params = { outlineKm = params.outlineKm, mapKm = params.mapKm }, frozen = farfield.isFrozen(),
+    params = { outlineKm = params.outlineKm, mapKm = params.mapKm }, workAhead = workAhead, frozen = farfield.isFrozen(),
     costMs = cost.ema, active = active }
 end
 
@@ -761,6 +790,104 @@ local function describe(inst)
     inst.anchor ~= anchor and ('  anchor #' .. tostring(inst.anchor)) or '')
 end
 
+-- The server's work ahead (the mini-map's layer), in the mini-map's frame: its map cells coloured by state, its terrain
+-- blocks outlined by state (asked for and not ready: thick and filled red), the zone it predicts (the path, each
+-- point's lateral reach) and a white ring where the map data stops being ready along the path. Gives what the mouse
+-- is over (a cell or { block = b }) and the counts by state.
+local function drawWorkAhead(dl, sx, sy, s, mouse)
+  local m = loadMap.msg
+  local hover, counts, bcounts = nil, {}, {}
+  for _, c in ipairs(m.cells or {}) do
+    local a, b = im.ImVec2(sx(c[1]), sy(c[4])), im.ImVec2(sx(c[3]), sy(c[2]))
+    local rgb = M.LOADMAP_RGB[c[5]] or M.LOADMAP_RGB[0]
+    im.ImDrawList_AddRectFilled(dl, a, b, u32(rgb, 0.3))
+    im.ImDrawList_AddRect(dl, a, b, u32(rgb, 0.9))
+    counts[c[5]] = (counts[c[5]] or 0) + 1
+    if mouse and mouse.x >= a.x and mouse.x < b.x and mouse.y >= a.y and mouse.y < b.y then hover = c end
+  end
+  for _, b in ipairs(m.blocks or {}) do
+    local a, c = im.ImVec2(sx(b[1]) + 1, sy(b[4]) + 1), im.ImVec2(sx(b[3]) - 1, sy(b[2]) - 1)
+    local rgb = M.LOADMAP_BLOCK_RGB[b[5]] or M.LOADMAP_BLOCK_RGB[0]
+    if b[5] == 5 then im.ImDrawList_AddRectFilled(dl, a, c, u32(rgb, 0.5)) end
+    im.ImDrawList_AddRect(dl, a, c, u32(rgb, 1), 0, 0, (b[5] == 5 or b[5] == 6) and 3 or 1.5)
+    bcounts[b[5]] = (bcounts[b[5]] or 0) + 1
+    if mouse and mouse.x >= a.x and mouse.x < c.x and mouse.y >= a.y and mouse.y < c.y then hover = { block = b } end
+  end
+  local zone, amber = m.zone or {}, u32({ 1, 0.65, 0.1 }, 1)
+  for i, z in ipairs(zone) do
+    if (z[3] or 0) > 0 then im.ImDrawList_AddCircle(dl, im.ImVec2(sx(z[1]), sy(z[2])), z[3] * s, u32({ 1, 0.65, 0.1 }, 0.35), 32, 1) end
+    local n = zone[i + 1]
+    if n then im.ImDrawList_AddLine(dl, im.ImVec2(sx(z[1]), sy(z[2])), im.ImVec2(sx(n[1]), sy(n[2])), amber, 2) end
+  end
+  local lead, walked = m.lead or 0, 0
+  for i = 2, #zone do
+    local a, b = zone[i - 1], zone[i]
+    local d = sqrt((b[1] - a[1]) ^ 2 + (b[2] - a[2]) ^ 2)
+    if walked + d >= lead and d > 0 then
+      local f = (lead - walked) / d
+      im.ImDrawList_AddCircle(dl, im.ImVec2(sx(a[1] + (b[1] - a[1]) * f), sy(a[2] + (b[2] - a[2]) * f)), 5,
+        u32({ 1, 1, 1 }, 1), 16, 2)
+      break
+    end
+    walked = walked + d
+  end
+  return hover, counts, bcounts
+end
+
+-- The work-ahead layer's lines under the mini-map.
+local function workAheadText(hover, counts, bcounts)
+  local m = loadMap.msg
+  if not m then
+    text(require('beamngEarth/net').isConnected() and 'Work ahead: waiting for the server (drive to see the zone)...'
+      or 'Work ahead: not connected to the server.')
+    return
+  end
+  if not m.on then text('The server builds no map data ahead (no worker processes).') end
+  text(string.format('ready ahead %.1f km   queued %d', (m.lead or 0) / 1000, m.queued or 0))
+  local parts = {}
+  for st = 0, 5 do
+    if counts[st] then parts[#parts + 1] = string.format('%s %d', M.LOADMAP_NAMES[st], counts[st]) end
+  end
+  text('map cells: ' .. (#parts > 0 and table.concat(parts, '   ') or 'none'))
+  parts = {}
+  for st = 0, 6 do
+    if bcounts[st] then parts[#parts + 1] = string.format('%s %d', M.LOADMAP_BLOCK_NAMES[st], bcounts[st]) end
+  end
+  text('blocks: ' .. (#parts > 0 and table.concat(parts, '   ') or 'none'))
+  if (m.asked or 0) > 0 then text(string.format('next block asked %.1f s ago, not ready yet', m.asked)) end
+  local stt = m.stats or {}
+  if (stt.cells or 0) > 0 then
+    text(string.format('built ahead: %d cells, %.1f s each on average', stt.cells, (stt.s or 0) / stt.cells))
+  end
+  if hover and hover.block then
+    local b = hover.block
+    text(string.format('block: %s%s', M.LOADMAP_BLOCK_NAMES[b[5]] or '?',
+      (b[6] or 0) > 0 and string.format(', %.1f s', b[6]) or ''))
+  elseif hover then
+    text(string.format('cell: %s%s', M.LOADMAP_NAMES[hover[5]] or '?',
+      (hover[6] or 0) > 0 and string.format(', %.1f s', hover[6]) or ''))
+  else
+    im.PushTextWrapPos(0)
+    text('Amber: the zone; white ring: map data ready up to here. Block outlines: grey predicted, yellow queued, '
+      .. 'blue building, purple photo, green ready, red asked and not ready, white in use. Hover one for its state.')
+    im.PopTextWrapPos()
+  end
+  if loadMap.at and now - loadMap.at > 3 then text(string.format('(last update %.0f s ago)', now - loadMap.at)) end
+end
+
+-- The server's work ahead (core.lua: the "load_map" message), kept while the mini-map's layer is on.
+function M.receiveLoadMap(msg)
+  if not (on.map and workAhead) or type(msg) ~= 'table' then return end
+  loadMap.msg, loadMap.at = msg, now
+end
+
+local function askLoadMap()
+  if now - loadMap.askedAt < M.LOADMAP_ASK_S then return end
+  loadMap.askedAt = now
+  local net = require('beamngEarth/net')
+  if net.isConnected() then net.send({ type = 'load_map', on = true }) end
+end
+
 local function drawMap(st)
   local pl = st and st.player
   local cam = st and st.cam
@@ -771,9 +898,16 @@ local function drawMap(st)
   local kmPtr = floatPtr('mapKm', params.mapKm)
   if im.SliderFloat('Map radius (km)', kmPtr, 1, 80, '%.0f km') then M.setParam('mapKm', kmPtr[0])
   elseif not im.IsItemActive() then kmPtr[0] = params.mapKm end
+  local wa = boolPtr('workAhead', workAhead)
+  if im.Checkbox('Work ahead (what the server builds ahead of the car)', wa) then
+    M.setWorkAhead(wa[0])
+    R = params.mapKm * 1000
+    s = (size / 2) / R
+  end
   local p0 = im.GetCursorScreenPos()
   im.InvisibleButton('##bngEarthDevMap', im.ImVec2(size, size))
   local clicked = im.IsItemClicked(0)
+  local mouse = im.IsItemHovered() and im.GetMousePos() or nil
   local dl = im.GetWindowDrawList()
   local x0, y0 = p0.x, p0.y
   local cx, cy = x0 + size / 2, y0 + size / 2
@@ -791,6 +925,8 @@ local function drawMap(st)
     im.ImDrawList_AddRect(dl, im.ImVec2(sx(inst.x0), sy(inst.y1)), im.ImVec2(sx(inst.x1), sy(inst.y0)),
       u32(M.STATE_RGB.queued, 1), 0, 0, 2)
   end
+  local hover, counts, bcounts
+  if workAhead and loadMap.msg then hover, counts, bcounts = drawWorkAhead(dl, sx, sy, s, mouse) end
   local b = st and st.block
   if b then
     local bx0, by0, bx1, by1 = lattice.groundBox(b.cx, b.cy)
@@ -826,6 +962,7 @@ local function drawMap(st)
   else
     text('Click a tile to inspect it.')
   end
+  if workAhead then workAheadText(hover, counts or {}, bcounts or {}) end
 end
 
 local function drawGraphs()
@@ -1001,6 +1138,7 @@ function M.frame(dtReal, dtSim, st, gov)
     graphs.t = graphs.t + dtReal
     if graphs.t >= M.GRAPH_S then graphs.t = 0; sampleGraphs(st) end
   end
+  if on.map and workAhead then askLoadMap() end
   if on.stats or on.graphs or on.map or on.controls or on.log then drawPanels(st) end
 
   cost.last = clock() - t0

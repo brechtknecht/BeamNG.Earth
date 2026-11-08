@@ -279,6 +279,16 @@ MAP_AHEAD_MIN_M = 1500.0
 MAP_AHEAD_MAX_M = 10000.0
 MAP_AHEAD_MOVE_M = 200.0        # m the player moves before the list is made again
 MAP_AHEAD_LAYERS = AHEAD_LAYERS + ("canopy", "landcover", "places")     # (places: the road tiles' gas stations)
+# the loading map (Server.load_map; the mod's debug window loadmap.lua, opened by its setting): a map cell's state
+LOAD_MAP_MISSING, LOAD_MAP_QUEUED, LOAD_MAP_LOADING, LOAD_MAP_READY, LOAD_MAP_ON_DISK, LOAD_MAP_FAILED = range(6)
+LOAD_MAP_PAD_M = 1500.0         # m around the path whose cells are shown
+LOAD_MAP_MAX_CELLS = 600
+LOAD_MAP_MAX_BLOCKS = 120
+LOAD_MAP_EVERY_S = 0.5          # s between two messages
+LOAD_MAP_HOLD_S = 3.0           # s the window's last request keeps them coming
+# ... and a terrain block's (Connection.load_map_blocks): predicted but not begun, waiting for its process, built in
+# it, on its base photo, ready, asked for by the game and not ready yet (the car waits), the one in use
+BLOCK_WANTED, BLOCK_QUEUED, BLOCK_BUILDING, BLOCK_PHOTO, BLOCK_READY, BLOCK_ASKED, BLOCK_IN_USE = range(7)
 # route_download: like download_ahead, but along the planned GPS route's own geometry (routeahead.py)
 # instead of the player's current heading, since a road route can wander off that heading entirely.
 ROUTE_AHEAD_ON = True            # --route-prefetch
@@ -1137,6 +1147,7 @@ class Server:
         self.map_ahead_cv = threading.Condition()
         self.map_ahead_threads = None
         self.map_ahead_stats = {"cells": 0, "s": 0.0}
+        self.map_ahead_state = {}       # cell key -> (LOAD_MAP_* state, s): the loading map's colours
         self.route_pool = ThreadPoolExecutor(1, thread_name_prefix="route-download")   # Connection.route_download
         self.horizon_grids = {}             # anchorId -> farfield.HorizonGrid
         self.horizon_inflight = {}          # anchorId -> (future, half-size)
@@ -3061,16 +3072,66 @@ class Server:
                 self.map_ahead_done.add(key)
                 if len(self.map_ahead_done) > 50000:
                     self.map_ahead_done.clear()
+                    self.map_ahead_state.clear()
+                self.map_ahead_state[key] = (LOAD_MAP_LOADING, 0.0)
             try:
                 dt = self.map_ahead_pool.submit(blockworker.warm_map, key, MAP_AHEAD_LAYERS,
                                                 self.veg is not None).result()
                 self.map_ahead_stats["cells"] += 1
                 self.map_ahead_stats["s"] += dt or 0.0
+                self.map_ahead_state[key] = (LOAD_MAP_READY, dt or 0.0)
                 if dt and dt > 1.0:
                     log.info("map ahead: cell %d_%d in %.1f s (%d queued; session %s)", key[1], key[2], dt,
                              len(self.map_ahead_want), self.map_ahead_stats)
             except Exception as e:      # only costs the lookahead
+                self.map_ahead_state[key] = (LOAD_MAP_FAILED, 0.0)
                 log.debug("map ahead %s: %s: %s", key, type(e).__name__, e)
+
+    def load_map(self, anchor, x, y, vx, vy, turn=0.0):
+        """The loading map's message (the mod's debug window, loadmap.lua): map_ahead's path (the zone: [x, y,
+        spread m]) and the map cells around it ([west, south, east, north] in the anchor frame, LOAD_MAP_* state, s it
+        took), all in the anchor frame; lead: m along the path before its first cell not ready."""
+        v = math.hypot(vx, vy)
+        path = aheadpath.points(x, y, vx, vy, turn, lead_s=MAP_AHEAD_S, min_m=MAP_AHEAD_MIN_M,
+                                max_m=max(MAP_AHEAD_MIN_M, min(MAP_AHEAD_MAX_M, v * MAP_AHEAD_S))) \
+            or [(0.0, x, y, WARM_AROUND)]
+        frame = anchor.frame
+        lls = []
+        for _t, px, py, _sp in path:
+            la, lo, _ = frame.enu_to_geodetic(px, py, 0.0)
+            lls.append((float(la), float(lo)))
+        pad = LOAD_MAP_PAD_M / 111320.0
+        lat0, lat1 = min(a for a, _ in lls) - pad, max(a for a, _ in lls) + pad
+        padlon = pad / max(0.05, math.cos(math.radians(lls[0][0])))
+        lon0, lon1 = min(b for _, b in lls) - padlon, max(b for _, b in lls) + padlon
+        try:
+            keys = mapcells.cells_for_bbox(lat0, lon0, lat1, lon1, max_cells=LOAD_MAP_MAX_CELLS)
+        except ValueError:
+            keys = []
+        want = set(self.map_ahead_want)
+        state = {}
+        cells = []
+        for k in keys:
+            kk = (int(k.z), int(k.x), int(k.y))
+            st, dt = self.map_ahead_state.get(kk, (None, 0.0))
+            if st is None:
+                st = LOAD_MAP_QUEUED if kk in want else \
+                    LOAD_MAP_ON_DISK if self.mapdata is not None and self.mapdata.has(k, "roads") else LOAD_MAP_MISSING
+            state[kk] = st
+            w, so, e, n = k.bounds()
+            x0, y0, _ = frame.geodetic_to_enu(so, w, 0.0)
+            x1, y1, _ = frame.geodetic_to_enu(n, e, 0.0)
+            cells.append([round(float(x0)), round(float(y0)), round(float(x1)), round(float(y1)), st, round(dt, 1)])
+        lead = 0.0
+        for (t, _px, _py, _sp), (la, lo) in zip(path, lls):
+            c = mapcells.cell_of(la, lo)
+            if state.get((int(c.z), int(c.x), int(c.y))) not in (LOAD_MAP_READY, LOAD_MAP_ON_DISK):
+                break
+            lead = t * v
+        return {"type": "load_map", "x": round(x, 1), "y": round(y, 1), "vx": round(vx, 2), "vy": round(vy, 2),
+                "zone": [[round(px), round(py), round(sp)] for _t, px, py, sp in path], "cells": cells,
+                "lead": round(lead), "queued": len(want), "stats": dict(self.map_ahead_stats),
+                "on": self.map_ahead_pool is not None}
 
     def warm_imagery(self, anchor, x, y, vx, vy):
         """The lazy imagery sources (NAIP) along the player's straight path (WARM_STEPS_S), over the block's
@@ -5347,6 +5408,8 @@ class Connection:
         self.predicted_block = None     # the terrain the prefetch expects next
         self.predicted_chain = []       # ... and after it, a fast player's (PREFETCH_CHAIN; blocks)
         self.track = aheadpath.Track()  # the player's recent headings (its turn: map_ahead's path)
+        self.load_map_until = 0.0       # the loading map's window asked until (monotonic)
+        self.load_map_at = 0.0
         self.focus = (0.0, 0.0)         # player x, y in the active frame
         self.view_at = None             # the camera's x, y there when it is VIEW_AWAY_M or more from the car, else None
         self.foci = ()                  # other vehicles' collision foci there ((x, y, r, trees), parse_foci)
@@ -6562,6 +6625,8 @@ class Connection:
             self.on_cache(msg)
         elif kind == "app_path":                # the settings page's folders: the cache's, the BeamMP launcher's
             self.spawn(self.app_path(msg))
+        elif kind == "load_map":                # the loading map's debug window is open (loadmap.lua; every second)
+            self.load_map_until = time.monotonic() + LOAD_MAP_HOLD_S if msg.get("on") is True else 0.0
         elif kind == "runtime_profiler":
             mode = msg.get("mode", "full")
             if mode not in ("essential", "full"):
@@ -7484,6 +7549,15 @@ class Connection:
             self.base_refresh(aid)
             self.pads_refresh(aid)
             self.roads_refresh(aid)
+        now = time.monotonic()
+        if aid == self.active and now < self.load_map_until and now - self.load_map_at >= LOAD_MAP_EVERY_S:
+            self.load_map_at = now
+            try:
+                m = self.s.load_map(self.s.anchors[aid], *self.focus, *self.vel, self.track.turn())
+                m["blocks"], m["asked"] = self.load_map_blocks(aid)
+                self.send(m)
+            except Exception as e:      # (a debug view: never the pose)
+                log.debug("load map: %s: %s", type(e).__name__, e)
         # (the 3D map's view frame high up, pose.view: no roads, trees, buildings, turbines or traffic round its target,
         # built as round a car: none of them shows from there, and their builds held the far tiles back and stalled the
         # event loop 2.1 s over Turin, 2026-11-07; nearer the ground they come, as what the view shows)
@@ -7943,6 +8017,44 @@ class Connection:
         if cs != getattr(self, "ready_sent", None):
             self.ready_sent = cs
             self.send({"type": "terrain_ready_set", "anchorId": aid, "centres": [[float(cx), float(cy)] for cx, cy in cs]})
+
+    def load_map_blocks(self, aid):
+        """The loading map's terrain blocks of anchor aid: [[west, south, east, north], BLOCK_* state, s] (s: the build's
+        seconds once built, else since it began or was asked for), and how long the game has waited for the block it
+        asked for (0: none waiting)."""
+        s, now = self.s, time.monotonic()
+        out, seen = {}, set()
+
+        def put(cx, cy, st, sec=0.0):
+            k = (aid, cx, cy)
+            if k in seen and st not in (BLOCK_ASKED, BLOCK_IN_USE):
+                return
+            seen.add(k)
+            h = s.layout.block * heightmap.SQUARE / 2
+            out[k] = [round(cx - h), round(cy - h), round(cx + h), round(cy + h), st, round(sec, 1)]
+        for k, info in list(s.hm.items()):
+            if k[0] == aid:
+                put(k[1], k[2], BLOCK_READY, info.get("seconds", 0.0))
+        for k in list(s.hm_inflight):
+            if k[0] == aid:
+                stage = s.hm_stage.get(k)
+                put(k[1], k[2], BLOCK_PHOTO if stage == "its base photo" else
+                    BLOCK_BUILDING if stage is not None else BLOCK_QUEUED)
+        for b in [self.predicted_block] + list(getattr(self, "predicted_chain", ())):
+            if b is not None:
+                put(b.cx, b.cy, BLOCK_WANTED)
+        asked = 0.0
+        p = self.pending_block
+        if p is not None and (aid, p.cx, p.cy) not in s.hm and self.pending_at is not None:
+            asked = now - self.pending_at
+            out.pop((aid, p.cx, p.cy), None)
+            seen.discard((aid, p.cx, p.cy))
+            put(p.cx, p.cy, BLOCK_ASKED, asked)
+        if self.block is not None and aid == self.active:
+            out.pop((aid, self.block.cx, self.block.cy), None)
+            seen.discard((aid, self.block.cx, self.block.cy))
+            put(self.block.cx, self.block.cy, BLOCK_IN_USE)
+        return list(out.values())[-LOAD_MAP_MAX_BLOCKS:], round(asked, 1)
 
     def maybe_prefetch(self):
         """Speculatively build the terrain the mod is about to ask for: the predicted block, and a fast player's chain

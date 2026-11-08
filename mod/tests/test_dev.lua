@@ -396,6 +396,24 @@ T.check(joined:match('fps') and joined:match('governor') and joined:match('impor
   'stats panel lines drawn')
 T.check(clicks > 0 and joined:match('L%-2') ~= nil, 'mini-map: a click inspects the tile under it')
 print(string.format('  dev tools cost with every overlay on, stubbed engine: %.3f ms/frame (EMA)', dev.state().costMs))
+-- the mini-map's work-ahead layer: the server's zone, map cells and blocks, drawn with how far ahead they are ready
+T.check(dev.setWorkAhead(true) == true and dev.state().params.mapKm == dev.LOADMAP_KM, 'work ahead: on, zoomed in')
+for _ = 1, 3 do dev.onUpdate(DT, DT) end
+T.check(table.concat(imText, '\n'):match('not connected') ~= nil, 'work ahead: no message yet, says so')
+dev.receiveLoadMap({ type = 'load_map', x = 0, y = 0, vx = 0, vy = 30, on = true, lead = 1200, queued = 3,
+  zone = { { 0, 0, 0 }, { 0, 300, 30 }, { 0, 600, 60 }, { 0, 3600, 360 } },
+  cells = { { -800, -800, 800, 800, 3, 4.2 }, { -800, 800, 800, 2400, 2, 0 }, { -800, 2400, 800, 4000, 0, 0 } },
+  stats = { cells = 2, s = 8.4 }, asked = 2.4,
+  blocks = { { -256, -256, 256, 256, 6, 0 }, { -256, 128, 256, 640, 5, 2.4 }, { -256, 512, 256, 1024, 1, 0 } } })
+for _ = 1, 3 do dev.onUpdate(DT, DT) end
+local lm = table.concat(imText, '\n')
+T.check(lm:match('ready ahead 1%.2 km') and lm:match('queued 3') and lm:match('loading 1') and lm:match('missing 1'),
+  'work ahead: lead, queue and cell states drawn')
+T.check(lm:match('in use 1') and lm:match('ASKED 1') and lm:match('queued 1') and lm:match('asked 2%.4 s ago'),
+  'work ahead: blocks and the wait drawn')
+dev.setWorkAhead(false)
+for _ = 1, 3 do dev.onUpdate(DT, DT) end
+T.check(not table.concat(imText, '\n'):match('ready ahead'), 'work ahead: off, not drawn')
 dev.preset('off')
 for _ = 1, 20 do dev.onUpdate(DT, DT) end
 T.check(not dev._busy() and dev._index() == nil, 'off at the end')

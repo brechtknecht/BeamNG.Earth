@@ -155,7 +155,7 @@ export const settingsSchema = [
       { id: "probe", type: "dev", name: "Under-car probe", desc: "A line at the car: physics ground vs the visible tile; red when the tile under the car is not the exact level or is more than 5 cm off. Session only." },
       { id: "stats", type: "dev", name: "Stats panel", desc: "Frame times, governor budget, imports and deletes per second, queue, objects, pops, failures, server backlog. Session only." },
       { id: "graphs", type: "dev", name: "Graphs panel", desc: "60 s plots of frame time, queue length, imports per second and speed. Session only." },
-      { id: "map", type: "dev", name: "Mini-map panel", desc: "Top-down map of the tiles around you; click a tile to inspect it. Session only." },
+      { id: "map", type: "dev", name: "Mini-map panel", desc: "Top-down map of the tiles around you; click a tile to inspect it. Its Work ahead box shows what the server builds ahead of you: the zone it predicts, its map cells and terrain blocks by state. Session only." },
       { id: "controls", type: "dev", name: "Controls panel", desc: "Overlay toggles, freeze LOD, force rebase, streaming budget, sky mode. Session only." },
       { id: "log", type: "dev", name: "Event log", desc: "The last 50 mod events (terrain commits, rebases, pops, failures, status). Session only." },
       { id: "devOutlineKm", type: "float", min: 0.5, max: 20, step: 0.5, default: 3, name: "Outline radius (km)", desc: "Tile outlines and loading heat are drawn within this distance of you." },
