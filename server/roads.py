@@ -8008,17 +8008,24 @@ TWIN_STEP_M = 10.0
 def _line_near(xy, other):
     """Per point of xy (k, 2): (distance to the polyline other (m, 2), the nearest point on it, its index t along it
     as a float segment index). Pure."""
+    xy = np.asarray(xy, np.float64).reshape(-1, 2)
     a, b = other[:-1], other[1:]
     d = b - a
     L2 = np.maximum((d * d).sum(1), 1e-12)
     out_d, out_q = np.empty(len(xy)), np.empty((len(xy), 2))
-    for i, p in enumerate(xy):
-        t = np.clip(((p - a) * d).sum(1) / L2, 0.0, 1.0)
-        q = a + t[:, None] * d
-        dd = np.hypot(*(q - p).T)
-        j = int(np.argmin(dd))
-        out_d[i], out_q[i] = dd[j], q[j]
+    step = max(1, LINE_NEAR_BLOCK // max(1, len(a)))   # (points at a time: a point per Python loop took most of a
+    for i0 in range(0, len(xy), step):                  # first visit's tunnel profiles, Innsbruck 2026-11-08)
+        p = xy[i0:i0 + step, None, :]                   # (n, 1, 2) against (1, m, 2)
+        t = np.clip(((p - a) * d).sum(2) / L2, 0.0, 1.0)
+        q = a + t[:, :, None] * d
+        dd = np.hypot(q[:, :, 0] - p[:, :, 0], q[:, :, 1] - p[:, :, 1])
+        j = np.argmin(dd, axis=1)
+        r = np.arange(len(j))
+        out_d[i0:i0 + step], out_q[i0:i0 + step] = dd[r, j], q[r, j]
     return out_d, out_q
+
+
+LINE_NEAR_BLOCK = 1 << 18   # point-segment pairs at a time (_line_near)
 
 
 def twin_tunnels(parts):
@@ -8037,12 +8044,15 @@ def twin_tunnels(parts):
         ss = np.linspace(0.0, sj[-1], max(2, int(sj[-1] / TWIN_STEP_M) + 1))
         P = np.c_[np.interp(ss, sj, xa[:, 0]), np.interp(ss, sj, xa[:, 1])]
         Z = np.interp(ss, sj, np.asarray(za, np.float64))
+        lo_a, hi_a = P.min(0), P.max(0)
         for j in range(i + 1, len(parts)):
             fb, sb, xb, zb, _ = parts[j]
             if j in taken or len(xb) < 2:
                 continue
             xb = np.asarray(xb, np.float64)
             reach = (sa.width + sb.width) / 2 + 2 * roadmesh.TUNNEL_SHOULDER + 1.0      # their tubes would overlap
+            if (xb.min(0) - reach > hi_a).any() or (xb.max(0) + reach < lo_a).any():
+                continue                        # (nowhere near: every point further than reach)
             d, q = _line_near(P, xb)
             near = d < reach
             if near.mean() < TWIN_SHARE:
