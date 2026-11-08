@@ -3528,6 +3528,16 @@ class Server:
                 return name
         return self._base_in(anchor, cx, cy, pool, photo, None, rev)
 
+    def _photo_submit(self, pool, fn, *args, **kwargs):
+        """pool.submit for a photo job (a base photo, a stand-in, a BC7 encode): in a block process it goes after the
+        blocks waiting there (RespawningPool.submit_low: one at a time beside them, never starved). Without a photo
+        process (fewer than PHOTO_PROCESS_MIN_CPUS) the photos run in the block processes, and first come first served
+        the next block the car needed waited 8-13 s behind them: 56 stand-ins in 4 min of a 200 mph drive, the
+        prefetch process half its time on photos, 8 holds of 4-8 s (8 cores, 1 m blocks, 2026-11-08)."""
+        if any(pool is bp for bp, _ in self.block_pools) and hasattr(pool, "submit_low"):
+            return pool.submit_low(fn, *args, **kwargs)
+        return pool.submit(fn, *args, **kwargs)
+
     def _base_in(self, anchor, cx, cy, pool, photo, fin, rev=0):
         size = self.layout.block * heightmap.SQUARE
         key = (anchor.id, cx, cy)
@@ -3538,12 +3548,13 @@ class Server:
         if fin:
             tex["fin"] = fin
         try:
-            got = pool.submit(blockworker.base_photo, anchor.lat, anchor.lon, cx - size / 2 - BASE_SHIFT_M,
-                              cy - size / 2 - BASE_SHIFT_M, size,
-                              BASE_RENDER_PX, tex, bool(self.buildings and self.mapdata is not None), anchor.zooms[0],
-                              os.path.join(self.out_dir, name),
-                              (self.user_dir, f"{self.vfs_dir}/{name}", base_ao_vfs(self.base_px), BASE_AO),
-                              fuel_pads=self.block_fuel_pads(anchor, cx, cy, size), out_px=self.base_px).result()
+            got = self._photo_submit(pool, blockworker.base_photo, anchor.lat, anchor.lon,
+                                     cx - size / 2 - BASE_SHIFT_M, cy - size / 2 - BASE_SHIFT_M, size,
+                                     BASE_RENDER_PX, tex, bool(self.buildings and self.mapdata is not None),
+                                     anchor.zooms[0], os.path.join(self.out_dir, name),
+                                     (self.user_dir, f"{self.vfs_dir}/{name}", base_ao_vfs(self.base_px), BASE_AO),
+                                     fuel_pads=self.block_fuel_pads(anchor, cx, cy, size),
+                                     out_px=self.base_px).result()
         except Exception as e:
             log.info("base photo %s in the block process: %s", key, e)
             return None
@@ -3794,9 +3805,9 @@ class Server:
                "season_mode": im.season_mode}
         t0 = time.perf_counter()
         try:
-            got = (pool or self.block_pools[lane][0]).submit(
-                blockworker.base_photo, anchor.lat, anchor.lon, cx - size / 2 - BASE_SHIFT_M,
-                cy - size / 2 - BASE_SHIFT_M, size, QUICK_BASE_PX, tex, False, anchor.zooms[0],
+            got = self._photo_submit(
+                pool or self.block_pools[lane][0], blockworker.base_photo, anchor.lat, anchor.lon,
+                cx - size / 2 - BASE_SHIFT_M, cy - size / 2 - BASE_SHIFT_M, size, QUICK_BASE_PX, tex, False, anchor.zooms[0],
                 os.path.join(self.out_dir, name), (self.user_dir, f"{self.vfs_dir}/{name}", base_ao_vfs(self.base_px),
                                                    BASE_AO), out_px=self.base_px, quick=True).result()
         except Exception as e:
@@ -3874,7 +3885,7 @@ class Server:
             pool = self.block_pools[LANE_PREFETCH][0] if (URGENT_ELSEWHERE and self.block_pools and
                                                           not bc7.gpu_ok()) else None
             if pool is not None:        # (the CPU's BC7 encode on a block process's core: ~1 s here beside the rest)
-                pool.submit(blockworker.base_entry, *args).result()
+                self._photo_submit(pool, blockworker.base_entry, *args).result()
             else:
                 terraincache.base_entry(*args)
             tq.append(("cache", time.perf_counter()))
@@ -3962,7 +3973,7 @@ class Server:
         try:            # after the photo: the cache entry must be the newer file
             args = (self.user_dir, f"{self.vfs_dir}/{name}", base_ao_vfs(self.base_px), rgb, BASE_AO)
             if pool is not None and not bc7.gpu_ok():   # the CPU's BC7 encode on the block process's core
-                pool.submit(blockworker.base_entry, *args).result()
+                self._photo_submit(pool, blockworker.base_entry, *args).result()
             else:
                 terraincache.base_entry(*args)
         except OSError as e:
