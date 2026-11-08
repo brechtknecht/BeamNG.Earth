@@ -47,5 +47,25 @@ class QuickOnceTest(unittest.TestCase):
         self.assertEqual(s.quick_running, {})
 
 
+class PhotoSubmitTest(unittest.TestCase):
+    def test_photos_after_the_blocks_in_a_block_process(self):
+        """_photo_submit: a photo job in a block process waits for the blocks there (submit_low); elsewhere (the photo
+        process) as any job (2026-11-08: blocks the car needed waited 8-13 s behind the photos)."""
+        class Pool:
+            def __init__(self):
+                self.calls = []
+
+            def submit(self, fn, *a):
+                self.calls.append("submit")
+
+            def submit_low(self, fn, *a):
+                self.calls.append("low")
+        req, pre, photo = Pool(), Pool(), Pool()
+        s = types.SimpleNamespace(block_pools=[(req, None), (pre, None)])
+        for pool in (req, pre, photo):
+            earthd.Server._photo_submit(s, pool, abs, -1)
+        self.assertEqual((req.calls, pre.calls, photo.calls), (["low"], ["low"], ["submit"]))
+
+
 if __name__ == "__main__":
     unittest.main()
